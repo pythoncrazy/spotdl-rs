@@ -1,16 +1,8 @@
-# spotdl-rs
+# spotDL-RS
 
-Use spotdl to download audio for Spotify tracks, albums, playlists, and artists.
+Use this program to get audio for Spotify songs, albums, playlists, and artists.
 
-Install Python 3.10 or later. Python 3.11 or later is recommended.
-
-Install or update yt-dlp with `python -m pip install -U "yt-dlp[default]"`.
-Install Deno from https://deno.land. yt-dlp can use Deno to solve YouTube JavaScript checks.
-Keep yt-dlp and Deno up to date.
-
-Install ffmpeg. Add yt-dlp and ffmpeg to `PATH`.
-
-If YouTube asks you to sign in, pass a cookies file with `--cookie-file`.
+The program needs `yt-dlp` and FFmpeg. Put both tools in `PATH`.
 
 ```sh
 spotdl <Spotify URL>
@@ -20,6 +12,22 @@ spotdl url "Daft Punk - Get Lucky"
 spotdl meta ~/Music
 ```
 
-Use `download`, `save`, `sync`, `url`, or `meta` before a query to select a command.
+Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an action.
 
-The program does not include a web interface, Piped, Slider.kz, Bandcamp, profiles, or update checks.
+Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`.
+
+Use `--download-ffmpeg` or `--download-deno` to install a local tool in `~/.spotdl`. The program uses the local FFmpeg file when you do not set `--ffmpeg`. It uses the local Deno file for YouTube work.
+
+Use `--check-for-updates` to check the latest release. Use `--max-retries 3` to set the number of retries after a failed request.
+
+Use `--user-auth` to sign in to Spotify. Set `client_id` and `client_secret` in the config file. Use `--headless` to print the sign-in URL instead of opening a browser. The callback uses `127.0.0.1:9900`.
+
+Use `--use-official-api` to use Spotify's Web API. Use `--use-cache-file` to save track data between runs. Use `--no-cache` to turn off local caches.
+
+Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` to add all songs from each album. Use `--ytm-data` to use the title and artist from a YouTube Music page.
+
+Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover.
+
+Use `--print-errors` to print all errors at the end. Use `--save-errors errors.txt` to save them to a file. Set `--log-level` and `--log-format` to change log output.
+
+You can use `--redownload` with `meta` to save the local songs again in the selected format. Use `--sync-remove-lrc` to remove or rename lyric files when `sync` changes files. Use `--add-unavailable` to add songs without a download to the archive and playlists.
