@@ -113,22 +113,6 @@ fn lyrics(s: &Song, cfg: &Settings) -> Option<String> {
     })
 }
 
-fn insert_text(tag: &mut Tag, key: ItemKey, value: String) {
-    if !value.is_empty() {
-        tag.insert_text(key, value);
-    }
-}
-
-fn insert_values(tag: &mut Tag, key: ItemKey, values: impl Iterator<Item = String>) {
-    values.filter(|value| !value.is_empty()).for_each(|value| {
-        tag.push(TagItem::new(key.clone(), ItemValue::Text(value)));
-    });
-}
-
-fn insert_locator(tag: &mut Tag, key: ItemKey, value: &str) {
-    tag.insert(TagItem::new(key, ItemValue::Locator(value.into())));
-}
-
 fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
     let mut f = lofty::read_from_path(file)?;
     let format = f.primary_tag_type();
@@ -154,35 +138,42 @@ fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
     let bpm_key = if format == TagType::Id3v2 { ItemKey::IntegerBpm } else { ItemKey::Bpm };
     let gain = if s.gain != 0.0 { format!("{} dB", s.gain) } else { String::new() };
     let compilation = if s.album_type == "compilation" { "1".into() } else { String::new() };
-    [
-        (ItemKey::AlbumArtist, s.album_artist.clone()),
-        (ItemKey::RecordingDate, s.date.clone()),
-        (ItemKey::ReleaseDate, s.date.clone()),
-        (ItemKey::OriginalReleaseDate, s.original_date.clone()),
-        (ItemKey::Year, year),
-        (ItemKey::Isrc, s.isrc.clone().unwrap_or_default()),
-        (ItemKey::Label, s.publisher.clone()),
-        (ItemKey::CopyrightMessage, s.copyright_text.clone().unwrap_or_default()),
-        (ItemKey::Lyrics, s.lyrics.clone().unwrap_or_default()),
-        (bpm_key, bpm),
-        (ItemKey::Barcode, s.upc.clone()),
-        (ItemKey::ReplayGainTrackGain, gain),
-        (ItemKey::FlagCompilation, compilation),
-        (ItemKey::ParentalAdvisory, if s.explicit { "1" } else { "0" }.into()),
-    ]
-    .into_iter()
-    .for_each(|(key, value)| insert_text(&mut t, key, value));
-    if format == TagType::Id3v2 {
-        insert_text(&mut t, ItemKey::TrackArtists, s.artists.join("\0"));
-    } else {
-        insert_values(&mut t, ItemKey::TrackArtists, s.artists.iter().cloned());
-    }
-    insert_values(&mut t, ItemKey::Genre, s.genres.iter().cloned());
-    if !s.album_type.is_empty() {
-        t.insert_unchecked(TagItem::new(ItemKey::Unknown("RELEASETYPE".into()), ItemValue::Text(s.album_type.clone())));
-    }
-    [ItemKey::AudioFileUrl, ItemKey::AudioSourceUrl].into_iter().for_each(|k| {
-        insert_locator(&mut t, k, &s.url);
+    let artists = if format == TagType::Id3v2 { vec![s.artists.join("\0")] } else { s.artists.clone() };
+    let tags = vec![
+        (ItemKey::AlbumArtist, vec![s.album_artist.clone()]),
+        (ItemKey::RecordingDate, vec![s.date.clone()]),
+        (ItemKey::ReleaseDate, vec![s.date.clone()]),
+        (ItemKey::OriginalReleaseDate, vec![s.original_date.clone()]),
+        (ItemKey::Year, vec![year]),
+        (ItemKey::Isrc, vec![s.isrc.clone().unwrap_or_default()]),
+        (ItemKey::Label, vec![s.publisher.clone()]),
+        (ItemKey::CopyrightMessage, vec![s.copyright_text.clone().unwrap_or_default()]),
+        (ItemKey::Lyrics, vec![s.lyrics.clone().unwrap_or_default()]),
+        (bpm_key, vec![bpm]),
+        (ItemKey::Barcode, vec![s.upc.clone()]),
+        (ItemKey::ReplayGainTrackGain, vec![gain]),
+        (ItemKey::FlagCompilation, vec![compilation]),
+        (ItemKey::ParentalAdvisory, vec![if s.explicit { "1" } else { "0" }.into()]),
+        (ItemKey::TrackArtists, artists),
+        (ItemKey::Genre, s.genres.clone()),
+        (ItemKey::Unknown("RELEASETYPE".into()), vec![s.album_type.clone()]),
+        (ItemKey::AudioFileUrl, vec![s.url.clone()]),
+        (ItemKey::AudioSourceUrl, vec![s.url.clone()]),
+    ];
+    tags.into_iter().for_each(|(key, values)| {
+        values.into_iter().filter(|value| !value.is_empty()).for_each(|value| {
+            let item_value = if key == ItemKey::AudioFileUrl || key == ItemKey::AudioSourceUrl {
+                ItemValue::Locator(value)
+            } else {
+                ItemValue::Text(value)
+            };
+            let item = TagItem::new(key.clone(), item_value);
+            if key == ItemKey::Unknown("RELEASETYPE".into()) {
+                t.insert_unchecked(item);
+            } else {
+                t.push(item);
+            }
+        });
     });
     let art = s
         .cover_url

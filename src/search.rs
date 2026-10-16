@@ -24,24 +24,6 @@ static YT_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
 static YT_ANNOUNCED: AtomicU64 = AtomicU64::new(0);
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
-fn wait_youtube() {
-    loop {
-        let deadline = YT_BLOCKED.load(Ordering::Relaxed);
-        let seconds = deadline.saturating_sub(now());
-        if seconds == 0 {
-            return;
-        }
-        if YT_ANNOUNCED.swap(deadline, Ordering::Relaxed) != deadline {
-            eprintln!("YouTube blocked downloads. Waiting {seconds} s.");
-        }
-        std::thread::sleep(Duration::from_secs(seconds));
-    }
-}
-
 fn blocked(output: &Output) -> bool {
     let error = String::from_utf8_lossy(&output.stderr);
     error.contains("Sign in to confirm")
@@ -50,21 +32,32 @@ fn blocked(output: &Output) -> bool {
         || error.contains("Too Many Requests")
 }
 
-fn backoff(retry: usize) {
-    let seconds =
-        std::env::var("SPOTDL_TEST_BACKOFF_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or([30, 60, 120][retry]);
-    YT_BLOCKED.fetch_max(now() + seconds, Ordering::Relaxed);
-}
-
 pub fn yt_output(cmd: &mut Command) -> R<Output> {
     crate::retry(
         4,
         |_| {
-            wait_youtube();
-            Ok(cmd.output()?)
+            let deadline = YT_BLOCKED.load(Ordering::Relaxed);
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let seconds = deadline.saturating_sub(now);
+            if seconds > 0 && YT_ANNOUNCED.swap(deadline, Ordering::Relaxed) != deadline {
+                eprintln!("YouTube blocked downloads. Waiting {seconds} s.");
+            }
+            Ok((seconds > 0).then_some(Duration::from_secs(seconds)))
         },
-        |result| result.as_ref().is_ok_and(blocked),
-        |attempt, _| backoff(attempt),
+        |_| Ok(cmd.output()?),
+        |attempt, result| {
+            if result.as_ref().is_ok_and(blocked) {
+                let seconds = std::env::var("SPOTDL_TEST_BACKOFF_SECONDS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or([30, 60, 120][attempt]);
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                YT_BLOCKED.fetch_max(now + seconds, Ordering::Relaxed);
+                Some(Duration::ZERO)
+            } else {
+                None
+            }
+        },
     )
 }
 
@@ -170,7 +163,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let main = h.artists.iter().chain([&h.name]).map(|r| ratio(&slug(&s.artist), &slug(r))).fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
     let fwords = FORBIDDEN.split(' ').filter(|w| rname.contains(w) && !sname.contains(w)).count() as f64;
-    let stripped = s.artists.iter().fold(rname.clone(), |n, a| n.replace(&slug(a), ""));
+    let stripped = s.artists.iter().fold(slug(&h.name), |n, a| n.replace(&slug(a), ""));
     let name = ratio(&sname, &rname).max(ratio(&sname, stripped.trim_matches('-'))) - 15.0 * fwords;
     let time = (-0.1 * (s.duration - h.duration).abs()).exp() * 100.0;
     let album = if h.album.is_empty() { 0.0 } else { ratio(&slug(&s.album_name), &slug(&h.album)) };

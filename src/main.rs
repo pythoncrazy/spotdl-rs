@@ -12,22 +12,29 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub(crate) fn retry<T>(
     attempts: usize,
+    mut before: impl FnMut(usize) -> R<Option<Duration>>,
     mut run: impl FnMut(usize) -> R<T>,
-    mut should_retry: impl FnMut(&R<T>) -> bool,
-    mut wait: impl FnMut(usize, &R<T>),
+    mut delay: impl FnMut(usize, &R<T>) -> Option<Duration>,
 ) -> R<T> {
     for attempt in 0..attempts {
+        while let Some(wait) = before(attempt)? {
+            std::thread::sleep(wait);
+        }
         let result = run(attempt);
-        if attempt + 1 == attempts || !should_retry(&result) {
+        if attempt + 1 == attempts {
             return result;
         }
-        wait(attempt, &result);
+        let Some(wait) = delay(attempt, &result) else {
+            return result;
+        };
+        std::thread::sleep(wait);
     }
     Err("retry limit reached".into())
 }
@@ -191,7 +198,7 @@ fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
         s.album_name = list_name.clone();
         s.album_artist = list_name;
         (s.track_number, s.tracks_count, s.disc_number, s.disc_count) = (i as u32 + 1, len as u32, 1, 1);
-        s.cover_url = s.cover_url.clone().filter(|_| cfg.playlist_retain_track_cover);
+        s.cover_url = s.cover_url.take().filter(|_| cfg.playlist_retain_track_cover);
     });
     let keep =
         |s: &Song| (!cfg.skip_explicit || !s.explicit) && cfg.album_type.as_ref().is_none_or(|t| &s.album_type == t);
@@ -200,6 +207,94 @@ fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
         .filter(keep)
         .filter(|s| !cfg.ignore_albums.iter().any(|a| s.album_name.to_lowercase().contains(&a.to_lowercase())))
         .collect()
+}
+
+fn resolve(queries: &[String], op: &str, cfg: &Settings, sync: Option<&Value>) -> R<(Vec<Song>, Vec<String>)> {
+    let errors = Mutex::new(Vec::new());
+    let mut songs: Vec<Song> = queries
+        .par_iter()
+        .flat_map_iter(|q| {
+            number(
+                spotify::resolve(q, cfg, op != "save" && op != "url")
+                    .inspect_err(|e| errors.lock().unwrap().push(format!("{q}: {e}")))
+                    .unwrap_or_default(),
+                cfg,
+            )
+        })
+        .collect();
+    if cfg.fetch_albums {
+        let ids: HashSet<_> = songs.iter().map(|s| s.album_id.as_str()).filter(|id| !id.is_empty()).collect();
+        let album = |id| {
+            number(
+                spotify::resolve(&format!("spotify:album:{id}"), cfg, op != "save" && op != "url").unwrap_or_default(),
+                cfg,
+            )
+        };
+        let albums = ids.par_iter().flat_map_iter(album).collect::<Vec<_>>();
+        songs.extend(albums);
+    }
+    let mut seen = HashSet::new();
+    songs.retain(|s| {
+        seen.insert(if op == "download" || op == "sync" { download::path(s, cfg) } else { PathBuf::from(&s.url) })
+    });
+    if let Some(old) = sync.filter(|_| !cfg.sync_without_deleting) {
+        let previous = serde_json::from_value::<Vec<Song>>(old["songs"].clone())?;
+        download::prune(&previous, &songs, cfg);
+    }
+    Ok((songs, errors.into_inner().unwrap()))
+}
+
+fn download_songs(songs: Vec<Song>, op: &str, cfg: &Settings) -> R<Vec<(Song, R<PathBuf>)>> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(cfg.threads.max(1)).build()?;
+    Ok(pool.install(|| songs.into_par_iter().with_max_len(1).map(|s| download::process(s, op, cfg)).collect()))
+}
+
+fn write_outputs(
+    done: &[(Song, R<PathBuf>)],
+    op: &str,
+    queries: Vec<String>,
+    sync_path: Option<String>,
+    cfg: &Settings,
+    mut errors: Vec<String>,
+) -> R<()> {
+    errors.extend(done.iter().filter_map(|(s, r)| r.as_ref().err().map(|e| format!("{} - {}: {e}", s.artist, s.name))));
+    let saved: Vec<&Song> = done.iter().map(|(s, _)| s).collect();
+    if op == "sync" {
+        let path = sync_path.or(cfg.save_file.clone());
+        let path = path.unwrap_or_else(|| format!("{}.spotdl", download::clean(&queries[0])));
+        fs::write(&path, serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": &saved}))?)?;
+    }
+    if op == "save" {
+        fs::write(cfg.save_file.as_deref().unwrap_or("saved.spotdl"), serde_json::to_string_pretty(&saved)?)?;
+    }
+    if let Some(m3u) = &cfg.m3u {
+        let n = if m3u.is_empty() || m3u == "true" { "{list[0]}.m3u8" } else { m3u.as_str() };
+        let suffix = if n.ends_with('/') {
+            "{list[0]}.m3u8"
+        } else if n.ends_with(".m3u") || n.ends_with(".m3u8") {
+            ""
+        } else {
+            ".m3u8"
+        };
+        let name = format!("{n}{suffix}");
+        let first = done.first().map_or("playlist", |(s, _)| s.list_name.as_deref().unwrap_or(s.album_name.as_str()));
+        let mut files = BTreeMap::<String, String>::new();
+        done.iter().filter(|(_, r)| cfg.add_unavailable || r.as_ref().is_ok_and(|p| p.is_file())).for_each(|(s, r)| {
+            let path = r.as_ref().ok().cloned().unwrap_or_else(|| download::path(s, cfg));
+            let list = download::clean(s.list_name.as_deref().unwrap_or(s.album_name.as_str()));
+            let file = name.replace("{list}", &list).replace("{list[0]}", &download::clean(first));
+            let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", s, cfg);
+            files.entry(file).or_insert("#EXTM3U\n".into()).push_str(&format!("{line}\n{}\n", path.display()));
+        });
+        files.into_iter().try_for_each(|(f, v)| {
+            fs::create_dir_all(Path::new(&f).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
+                .and_then(|_| fs::write(f, v))
+        })?;
+    }
+    errors.iter().filter(|_| cfg.print_errors).for_each(|e| eprintln!("{e}"));
+    cfg.save_errors.iter().try_for_each(|p| fs::write(p, errors.join("\n")))?;
+    eprintln!("{} succeeded, {} failed", done.iter().filter(|(_, r)| r.is_ok()).count(), errors.len());
+    errors.is_empty().then_some(()).ok_or_else(|| format!("{} downloads failed", errors.len()).into())
 }
 
 fn run() -> R<()> {
@@ -225,82 +320,9 @@ fn run() -> R<()> {
     let sync_path = sync.as_ref().map(|_| original[0].clone());
     let queries: Vec<String> =
         sync.as_ref().map_or_else(|| original, |s| serde_json::from_value(s["query"].clone()).unwrap_or_default());
-    let errors = Mutex::new(Vec::new());
-    let mut songs: Vec<Song> = queries
-        .par_iter()
-        .flat_map_iter(|q| {
-            number(
-                spotify::resolve(q, &cfg, op != "save" && op != "url")
-                    .inspect_err(|e| errors.lock().unwrap().push(format!("{q}: {e}")))
-                    .unwrap_or_default(),
-                &cfg,
-            )
-        })
-        .collect();
-    if cfg.fetch_albums {
-        let ids: HashSet<_> = songs.iter().map(|s| s.album_id.as_str()).filter(|id| !id.is_empty()).collect();
-        let album = |id| {
-            number(
-                spotify::resolve(&format!("spotify:album:{id}"), &cfg, op != "save" && op != "url").unwrap_or_default(),
-                &cfg,
-            )
-        };
-        let albums = ids.par_iter().flat_map_iter(album).collect::<Vec<_>>();
-        songs.extend(albums);
-    }
-    let mut seen = HashSet::new();
-    songs.retain(|s| {
-        seen.insert(if op == "download" || op == "sync" { download::path(s, &cfg) } else { PathBuf::from(&s.url) })
-    });
-    if let Some(old) = sync.as_ref().filter(|_| !cfg.sync_without_deleting) {
-        download::prune(&serde_json::from_value::<Vec<Song>>(old["songs"].clone())?, &songs, &cfg);
-    }
-    let done: Vec<(Song, R<PathBuf>)> = rayon::ThreadPoolBuilder::new()
-        .num_threads(cfg.threads.max(1))
-        .build()?
-        .install(|| songs.into_par_iter().with_max_len(1).map(|s| download::process(s, &op, &cfg)).collect());
-    errors
-        .lock()
-        .unwrap()
-        .extend(done.iter().filter_map(|(s, r)| r.as_ref().err().map(|e| format!("{} - {}: {e}", s.artist, s.name))));
-    let saved: Vec<&Song> = done.iter().map(|(s, _)| s).collect();
-    if op == "sync" {
-        let path = sync_path.or(cfg.save_file.clone());
-        let path = path.unwrap_or_else(|| format!("{}.spotdl", download::clean(&queries[0])));
-        fs::write(&path, serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": &saved}))?)?;
-    }
-    if op == "save" {
-        fs::write(cfg.save_file.as_deref().unwrap_or("saved.spotdl"), serde_json::to_string_pretty(&saved)?)?;
-    }
-    if let Some(m3u) = &cfg.m3u {
-        let n = if m3u.is_empty() || m3u == "true" { "{list[0]}.m3u8" } else { m3u.as_str() };
-        let suffix = if n.ends_with('/') {
-            "{list[0]}.m3u8"
-        } else if n.ends_with(".m3u") || n.ends_with(".m3u8") {
-            ""
-        } else {
-            ".m3u8"
-        };
-        let name = format!("{n}{suffix}");
-        let first = done.first().map_or("playlist", |(s, _)| s.list_name.as_deref().unwrap_or(s.album_name.as_str()));
-        let mut files = BTreeMap::<String, String>::new();
-        done.iter().filter(|(_, r)| cfg.add_unavailable || r.as_ref().is_ok_and(|p| p.is_file())).for_each(|(s, r)| {
-            let path = r.as_ref().ok().cloned().unwrap_or_else(|| download::path(s, &cfg));
-            let list = download::clean(s.list_name.as_deref().unwrap_or(s.album_name.as_str()));
-            let file = name.replace("{list}", &list).replace("{list[0]}", &download::clean(first));
-            let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", s, &cfg);
-            files.entry(file).or_insert("#EXTM3U\n".into()).push_str(&format!("{line}\n{}\n", path.display()));
-        });
-        files.into_iter().try_for_each(|(f, v)| {
-            fs::create_dir_all(Path::new(&f).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
-                .and_then(|_| fs::write(f, v))
-        })?;
-    }
-    let errors = errors.into_inner().unwrap();
-    errors.iter().filter(|_| cfg.print_errors).for_each(|e| eprintln!("{e}"));
-    cfg.save_errors.iter().try_for_each(|p| fs::write(p, errors.join("\n")))?;
-    eprintln!("{} succeeded, {} failed", done.iter().filter(|(_, r)| r.is_ok()).count(), errors.len());
-    errors.is_empty().then_some(()).ok_or_else(|| format!("{} downloads failed", errors.len()).into())
+    let (songs, errors) = resolve(&queries, &op, &cfg, sync.as_ref())?;
+    let done = download_songs(songs, &op, &cfg)?;
+    write_outputs(&done, &op, queries, sync_path, &cfg, errors)
 }
 
 fn main() {

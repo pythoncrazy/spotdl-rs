@@ -22,24 +22,8 @@ static DEEZER_RATE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(Default::de
 
 const PAGE: usize = 343;
 
-fn first_text<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
-    fields.iter().find_map(|field| value.get(*field).and_then(Value::as_str))
-}
-
-fn first_number(value: &Value, fields: &[&str]) -> Option<u64> {
-    fields.iter().find_map(|field| value.get(*field).and_then(Value::as_u64))
-}
-
-fn person_name(value: &Value) -> Option<&str> {
-    value["profile"]["name"].as_str().or(value["name"].as_str())
-}
-
-fn people(value: &Value) -> Vec<String> {
-    value.as_array().into_iter().flatten().filter_map(person_name).map(String::from).collect()
-}
-
-fn id(uri: &str) -> &str {
-    uri.rsplit(':').next().unwrap_or_default()
+fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key).filter(|value| !value.is_null()))
 }
 
 fn totp(secret: &[u8]) -> R<String> {
@@ -154,21 +138,23 @@ fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
     };
     let mut rejected = None;
     let auth_error = |result: &R<Value>| {
-        result
-            .as_ref()
-            .err()
-            .is_some_and(|e| ["401", "hash", "PersistedQuery"].iter().any(|k| e.to_string().contains(k)))
+        result.as_ref().err().is_some_and(|e| {
+            let message = e.to_string();
+            ["401", "hash", "PersistedQuery"].iter().any(|key| message.contains(key))
+        })
     };
     let refresh = std::cell::Cell::new(false);
     let v = crate::retry(
         cfg.max_retries.saturating_add(1),
+        |_| Ok(None),
         |_| attempt(refresh.get(), &mut rejected),
-        |result| result.is_err(),
         |attempt, result| {
-            let auth = auth_error(result);
-            refresh.set(auth);
-            if !auth {
-                std::thread::sleep(Duration::from_millis(250 << (attempt + 1)));
+            if result.is_err() {
+                let auth = auth_error(result);
+                refresh.set(auth);
+                Some(if auth { Duration::ZERO } else { Duration::from_millis(250 << (attempt + 1)) })
+            } else {
+                None
             }
         },
     )?;
@@ -178,28 +164,29 @@ fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
     Ok(v)
 }
 
-fn wait_deezer() -> R<()> {
-    let mut previous = DEEZER_RATE.lock().map_err(|e| e.to_string())?;
-    if let Some(time) = *previous {
-        std::thread::sleep(Duration::from_millis(100).saturating_sub(time.elapsed()));
-    }
-    *previous = Some(Instant::now());
-    Ok(())
-}
-
 fn deezer(url: &str, query: Option<(&str, &str)>) -> R<Value> {
+    let mut reserved = None;
     let value = crate::retry(
         3,
+        |attempt| {
+            if reserved == Some(attempt) {
+                return Ok(None);
+            }
+            reserved = Some(attempt);
+            let mut next = DEEZER_RATE.lock().map_err(|e| e.to_string())?;
+            let now = Instant::now();
+            let wait = next.map_or(Duration::ZERO, |at| at.saturating_duration_since(now));
+            *next = Some(now + wait + Duration::from_millis(100));
+            Ok(Some(wait))
+        },
         |_| -> R<Value> {
-            wait_deezer()?;
             let mut request = HTTP.get(url);
             if let Some((key, value)) = query {
                 request = request.query(key, value);
             }
             Ok(request.call()?.body_mut().read_json()?)
         },
-        |result| result.as_ref().is_ok_and(|value| value["error"]["code"] == 4),
-        |_, _| std::thread::sleep(Duration::from_secs(5)),
+        |_, result| result.as_ref().is_ok_and(|value| value["error"]["code"] == 4).then_some(Duration::from_secs(5)),
     )?;
     if value["error"]["code"] == 4 {
         Err("Deezer rate limit".into())
@@ -218,13 +205,17 @@ fn deezer_album(uri: &str, album: &Value) -> Option<Value> {
     if let Some(v) = DEEZER.lock().ok()?.get(uri).cloned() {
         return Some(v);
     }
-    let artist = person_name(&album["artists"]["items"][0])?;
-    let title = first_text(album, &["name", "title"])?;
+    let artist =
+        album["artists"]["items"][0]["profile"]["name"].as_str().or(album["artists"]["items"][0]["name"].as_str())?;
+    let title = field(album, &["name", "title"])?.as_str()?;
     let term = format!("{artist} {title}");
     let hits = deezer("https://api.deezer.com/search/album", Some(("q", &term))).ok()?;
     let hit = hits["data"].as_array()?.iter().find(|h| {
-        high_match(title, first_text(h, &["title", "name"]).unwrap_or_default())
-            && high_match(artist, person_name(&h["artist"]).unwrap_or_default())
+        high_match(title, field(h, &["title", "name"]).and_then(Value::as_str).unwrap_or_default())
+            && high_match(
+                artist,
+                h["artist"]["profile"]["name"].as_str().or(h["artist"]["name"].as_str()).unwrap_or_default(),
+            )
     })?;
     let id = hit["id"].as_u64()?;
     let v = deezer(&format!("https://api.deezer.com/album/{id}"), None).ok()?;
@@ -234,20 +225,24 @@ fn deezer_album(uri: &str, album: &Value) -> Option<Value> {
 
 fn deezer_track<'a>(album: &'a Value, track: &Value) -> Option<&'a Value> {
     let tracks = album["tracks"]["data"].as_array()?;
-    let disc = first_number(track, &["discNumber", "disc_number"]).unwrap_or(1);
-    let number = first_number(track, &["trackNumber", "track_number"]).unwrap_or(1);
+    let disc = field(track, &["discNumber", "disc_number"]).and_then(Value::as_u64).unwrap_or(1);
+    let number = field(track, &["trackNumber", "track_number"]).and_then(Value::as_u64).unwrap_or(1);
     tracks
         .iter()
         .find(|t| {
-            first_number(t, &["disk_number"]) == Some(disc) && first_number(t, &["track_position"]) == Some(number)
+            field(t, &["disk_number"]).and_then(Value::as_u64) == Some(disc)
+                && field(t, &["track_position"]).and_then(Value::as_u64) == Some(number)
         })
         .or_else(|| {
-            let title = first_text(track, &["name", "title"]).unwrap_or_default();
+            let title = field(track, &["name", "title"]).and_then(Value::as_str).unwrap_or_default();
             tracks
                 .iter()
-                .filter(|t| high_match(title, first_text(t, &["title", "name"]).unwrap_or_default()))
+                .filter(|t| high_match(title, field(t, &["title", "name"]).and_then(Value::as_str).unwrap_or_default()))
                 .max_by_key(|t| {
-                    crate::search::ratio(title, first_text(t, &["title", "name"]).unwrap_or_default()) as u32
+                    crate::search::ratio(
+                        title,
+                        field(t, &["title", "name"]).and_then(Value::as_str).unwrap_or_default(),
+                    ) as u32
                 })
         })
 }
@@ -286,25 +281,24 @@ fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
     Ok(items)
 }
 
-fn variables(uri: &str, offset: usize, limit: usize) -> Value {
-    json!({
-        "uri": uri,
-        "locale": "",
-        "offset": offset,
-        "limit": limit,
-        "order": "DATE_DESC",
-        "enableWatchFeedEntrypoint": false
-    })
-}
-
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Settings) -> R<(Value, Vec<Value>)> {
+    let variables = |offset| {
+        json!({
+            "uri": uri,
+            "locale": "",
+            "offset": offset,
+            "limit": limit,
+            "order": "DATE_DESC",
+            "enableWatchFeedEntrypoint": false
+        })
+    };
     let items = |v: &Value| v.pointer(&format!("{list}/items")).and_then(Value::as_array).cloned().unwrap_or_default();
-    let first = query(op, variables(uri, 0, limit), cfg)?;
+    let first = query(op, variables(0), cfg)?;
     let total =
         first.pointer(&format!("{list}/totalCount")).and_then(Value::as_u64).ok_or(format!("{uri} unavailable"))?;
     let offsets: Vec<usize> = (limit..total as usize).step_by(limit).collect();
     let rest: Vec<Vec<Value>> =
-        offsets.par_iter().map(|o| query(op, variables(uri, *o, limit), cfg).map(|v| items(&v))).collect::<R<_>>()?;
+        offsets.par_iter().map(|o| query(op, variables(*o), cfg).map(|v| items(&v))).collect::<R<_>>()?;
     let meta = first["data"].as_object().and_then(|d| d.values().next()).cloned().unwrap_or_default();
     Ok((meta, std::iter::once(items(&first)).chain(rest).flatten().collect()))
 }
@@ -313,20 +307,23 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
     let mut uris: Vec<&String> = tracks.iter().map(|(_, a)| a).collect();
     uris.sort();
     uris.dedup();
-    let embedded: HashMap<&String, &Value> = tracks.iter().map(|(track, uri)| (uri, &track["albumOfTrack"])).collect();
     let albums: HashMap<&String, (Value, Value)> = uris
         .par_iter()
         .filter_map(|u| {
             let keep = ["name", "artists", "date", "discs", "tracksV2", "label", "coverArt", "copyright", "type"];
-            let fetch = || {
-                let mut a = query("getAlbum", variables(u, 0, 1), cfg).ok()?["data"]["albumUnion"].take();
-                a.as_object_mut()?.retain(|k, _| keep.contains(&k.as_str()));
-                Some(a)
-            };
             let cached = ALBUMS.lock().ok()?.get(*u).cloned();
-            let album = cached
-                .or_else(|| if enrich { fetch() } else { None })
-                .or_else(|| embedded.get(*u).map(|album| (*album).clone()))?;
+            let album = cached.or_else(|| {
+                let mut album = query(
+                    "getAlbum",
+                    json!({"uri": u, "locale": "", "offset": 0, "limit": 1, "order": "DATE_DESC", "enableWatchFeedEntrypoint": false}),
+                    cfg,
+                )
+                .ok()?["data"]["albumUnion"]
+                    .take();
+                album.as_object_mut()?.retain(|key, _| keep.contains(&key.as_str()));
+                ALBUMS.lock().ok()?.insert((*u).clone(), album.clone());
+                Some(album)
+            })?;
             let deezer = if enrich { deezer_album((*u).as_str(), &album).unwrap_or_default() } else { Value::Null };
             Some((*u, (album, deezer)))
         })
@@ -343,59 +340,60 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
             let artists: Vec<String> =
                 [&t["artists"]["items"], &t["firstArtist"]["items"], &t["otherArtists"]["items"], &t["artists"]]
                     .into_iter()
-                    .flat_map(people)
+                    .flat_map(|value| value.as_array().into_iter().flatten())
+                    .filter_map(|artist| {
+                        artist["profile"]["name"].as_str().or(artist["name"].as_str()).map(String::from)
+                    })
                     .collect();
             let date = al["date"]["isoString"].as_str().unwrap_or_default().get(..10).unwrap_or_default().to_string();
             let dur = |k: &str| t[k]["totalMilliseconds"].as_f64();
             let covers = al["coverArt"]["sources"].as_array().into_iter().flatten();
             let dz_track = deezer_track(dz, t);
-            let song_id = id(t["uri"].as_str().unwrap_or_default()).to_string();
+            let song_id = t["uri"].as_str().unwrap_or_default().rsplit(':').next().unwrap_or_default().to_string();
             let url = format!("https://open.spotify.com/track/{song_id}");
-            let artist_uri = al["artists"]["items"][0]["uri"]
-                .as_str()
-                .or(t["artists"]["items"][0]["uri"].as_str())
-                .or(t["firstArtist"]["items"][0]["uri"].as_str())
-                .unwrap_or_default();
+            let artist_uri = al["artists"]["items"][0]["uri"].as_str().unwrap_or_default();
             Song {
-                name: first_text(t, &["name", "title"]).unwrap_or_default().into(),
+                name: field(t, &["name", "title"]).and_then(Value::as_str).unwrap_or_default().into(),
                 artist: artists.first().cloned().unwrap_or_default(),
-                album_artist: person_name(&al["artists"]["items"][0])
-                    .or_else(|| artists.first().map(String::as_str))
+                album_artist: al["artists"]["items"][0]["profile"]["name"]
+                    .as_str()
+                    .or(al["artists"]["items"][0]["name"].as_str())
                     .unwrap_or_default()
                     .into(),
-                artist_id: id(artist_uri).into(),
+                artist_id: artist_uri.rsplit(':').next().unwrap_or_default().into(),
                 artists,
-                disc_number: first_number(t, &["discNumber", "disc_number"]).unwrap_or(1) as u32,
-                disc_count: first_number(&al["discs"], &["totalCount"]).unwrap_or(1) as u32,
-                album_name: first_text(al, &["name", "title"]).unwrap_or_default().into(),
+                disc_number: field(t, &["discNumber", "disc_number"]).and_then(Value::as_u64).unwrap_or(1) as u32,
+                disc_count: field(&al["discs"], &["totalCount"]).and_then(Value::as_u64).unwrap_or(1) as u32,
+                album_name: field(al, &["name", "title"]).and_then(Value::as_str).unwrap_or_default().into(),
                 duration: dur("duration").or(dur("trackDuration")).or(t["duration_ms"].as_f64()).unwrap_or_default()
                     / 1000.0,
                 year: date.get(..4).and_then(|y| y.parse().ok()).unwrap_or_default(),
                 date,
-                track_number: first_number(t, &["trackNumber", "track_number"]).unwrap_or(1) as u32,
-                tracks_count: first_number(&al["tracksV2"], &["totalCount"])
-                    .or(first_number(&al["tracks"], &["totalCount"]))
+                track_number: field(t, &["trackNumber", "track_number"]).and_then(Value::as_u64).unwrap_or(1) as u32,
+                tracks_count: field(&al["tracksV2"], &["totalCount"])
+                    .or_else(|| field(&al["tracks"], &["totalCount"]))
+                    .and_then(Value::as_u64)
                     .unwrap_or(1) as u32,
                 song_id,
                 url,
                 explicit: t["contentRating"]["label"] == "EXPLICIT" || t["explicit"] == true,
-                publisher: first_text(dz, &["label"]).or(first_text(al, &["label"])).unwrap_or_default().into(),
+                publisher: dz["label"].as_str().or(al["label"].as_str()).unwrap_or_default().into(),
                 isrc: t["external_ids"]["isrc"].as_str().map(String::from),
                 cover_url: covers.max_by_key(|x| x["width"].as_u64()).and_then(|x| x["url"].as_str().map(String::from)),
                 copyright_text: al["copyright"]["items"][0]["text"].as_str().map(String::from),
                 popularity: t["playcount"].as_str().and_then(|p| p.parse().ok()),
-                album_id: id(a).into(),
-                album_type: first_text(al, &["type"]).unwrap_or_default().to_lowercase(),
+                album_id: a.rsplit(':').next().unwrap_or_default().into(),
+                album_type: field(al, &["type"]).and_then(Value::as_str).unwrap_or_default().to_lowercase(),
                 genres: dz["genres"]["data"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|g| first_text(g, &["name"]).map(String::from))
+                    .filter_map(|g| field(g, &["name"]).and_then(Value::as_str).map(String::from))
                     .collect(),
-                original_date: first_text(dz, &["release_date"]).unwrap_or_default().into(),
-                upc: first_text(dz, &["upc"]).unwrap_or_default().into(),
+                original_date: dz["release_date"].as_str().unwrap_or_default().into(),
+                upc: dz["upc"].as_str().unwrap_or_default().into(),
                 deezer_track_id: dz_track
-                    .and_then(|d| first_number(d, &["id"]))
+                    .and_then(|d| field(d, &["id"]).and_then(Value::as_u64))
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
                 list_name: list.map(|l| l.0.into()),
