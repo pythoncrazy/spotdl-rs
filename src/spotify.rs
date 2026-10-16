@@ -14,6 +14,8 @@ const UA: (&str, &str) = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
 );
 
+const SECRETS_URL: &str = "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json";
+
 static STATE: Mutex<Option<Value>> = Mutex::new(None);
 
 static ALBUMS: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::default);
@@ -76,13 +78,7 @@ fn state(cfg: &Value, rejected: Option<&str>) -> R<Value> {
         *guard = Some(v.clone());
         return Ok(v);
     }
-    let secrets = http(
-        "GET",
-        "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json",
-        &[UA],
-        None,
-        cfg,
-    )?;
+    let secrets = http("GET", SECRETS_URL, &[UA], None, cfg)?;
     let secrets: HashMap<String, Vec<u8>> = serde_json::from_slice(&secrets)?;
     let (ver, secret) = secrets.iter().max_by_key(|(k, _)| k.parse::<u32>().unwrap_or(0)).ok_or("no TOTP secret")?;
     let code = totp(secret)?;
@@ -119,10 +115,9 @@ fn query(op: &str, vars: Value, cfg: &Value) -> R<Value> {
         let token = state["token"].as_str().unwrap_or_default();
         let hash = state["hashes"][op].as_str().ok_or("missing query hash")?;
         let extensions = json!({"persistedQuery": {"version": 1, "sha256Hash": hash}}).to_string();
+        let [variables, extensions] = [vars.to_string(), extensions].map(|value| crate::url_encode(&value));
         let url = format!(
-            "https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={}&extensions={}",
-            crate::url_encode(&vars.to_string()),
-            crate::url_encode(&extensions)
+            "https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}"
         );
         let auth = format!("Bearer {token}");
         let reply = http("GET", &url, &[UA, ("Authorization", &auth)], None, cfg);
@@ -614,21 +609,17 @@ pub fn resolve(text: &str, cfg: &Value, enrich: bool) -> R<Vec<Song>> {
     };
     let id = uri.rsplit(':').next().unwrap_or_default();
     let api = cfg["use_official_api"] == true;
-    match (uri.split(':').nth(1).unwrap_or_default(), api) {
-        ("track", true) => {
-            let tracks = official(&format!("tracks/{id}"), cfg)?.into_iter().map(with_album).collect();
-            Ok(build(tracks, None, cfg, enrich))
-        }
-        ("track", false) => {
-            let mut reply = query("getTrack", json!({"uri": uri}), cfg)?;
-            Ok(build(vec![with_album(reply["data"]["trackUnion"].take())], None, cfg, enrich))
-        }
-        ("album", true) => {
-            let tracks = official(&format!("albums/{id}/tracks?limit=50"), cfg)?;
-            Ok(build(tracks.into_iter().map(|track| (track, uri.clone())).collect(), None, cfg, enrich))
-        }
-        ("album", false) => Ok(build(album(&uri, cfg)?, None, cfg, enrich)),
-        ("artist", _) => artist(&uri, cfg, enrich),
-        _ => playlist(&uri, id, api, cfg, enrich),
-    }
+    let kind = uri.split(':').nth(1).unwrap_or_default();
+    let tracks = match (kind, api) {
+        ("track", true) => official(&format!("tracks/{id}"), cfg)?.into_iter().map(with_album).collect(),
+        ("track", false) => vec![with_album(query("getTrack", json!({"uri": uri}), cfg)?["data"]["trackUnion"].take())],
+        ("album", true) => official(&format!("albums/{id}/tracks?limit=50"), cfg)?
+            .into_iter()
+            .map(|track| (track, uri.clone()))
+            .collect(),
+        ("album", false) => album(&uri, cfg)?,
+        ("artist", _) => return artist(&uri, cfg, enrich),
+        _ => return playlist(&uri, id, api, cfg, enrich),
+    };
+    Ok(build(tracks, None, cfg, enrich))
 }
