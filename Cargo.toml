@@ -12,7 +12,6 @@ ureq = { version = "3", features = ["json"] }
 lofty = "0.22"
 deunicode = "1"
 sha1 = "0.10"
-base32 = "0.5"
 rayon = "1"
 
 [profile.release]

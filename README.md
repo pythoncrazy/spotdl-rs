@@ -1,13 +1,20 @@
 # spotdl-rs
 
-Rust Spotify downloader. Requires `yt-dlp` and `ffmpeg` on `PATH`.
+Compact Rust rewrite of [spotDL](https://github.com/spotDL/spotify-downloader). Needs `yt-dlp` and `ffmpeg` on `PATH`.
 
 ```sh
-cargo build --release
-spotdl download "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
-spotdl save "https://open.spotify.com/playlist/PLAYLIST_ID" --save-file list.spotdl
-spotdl sync list.spotdl --threads 16
-spotdl meta "song.mp3"
+spotdl https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT
+spotdl download https://open.spotify.com/artist/0gxyHStUsqpMadRV0Di1Qt --threads 32
+spotdl save "playlist:top 1000 songs" --save-file list.spotdl
+spotdl sync https://open.spotify.com/playlist/ID --save-file list.spotdl
+spotdl sync list.spotdl
+spotdl url "Daft Punk - Get Lucky"
+spotdl meta ~/Music
 ```
 
-Spotify public URLs use the anonymous web-player API. Text search requires Spotify API credentials; user-library queries require `--auth-token`. The rewrite uses rayon pools and supports YouTube Music, YouTube, and SoundCloud searches. The web UI, Piped, Slider.kz, Bandcamp, profiles, and update checks are not included.
+- Public tracks, albums, playlists, artists and text/`album:`/`playlist:`/`artist:` searches use Spotify's anonymous web-player API; no credentials needed.
+- `saved`, `all-user-playlists`, `all-saved-playlists`, `all-user-saved-albums`, `all-user-followed-artists` need `--auth-token` (or `--client-id`/`--client-secret` for public data).
+- Pages of a playlist, album or discography are fetched in parallel, each album's metadata is fetched once, tracks repeated across queries download once.
+- `--meta-threads` (default 32) bounds metadata work, `--threads` (default 16, no cap) bounds downloads.
+- Same `config.json` keys and `.spotdl` format as spotDL (`~/.config/spotdl` or `~/.spotdl`). `--generate-config` writes defaults.
+- Not included: web UI, Piped, Slider.kz, Bandcamp, profiles, update checks.

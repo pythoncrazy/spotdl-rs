@@ -14,59 +14,48 @@ use std::{
 };
 
 pub fn clean(s: &str) -> String {
-    s.chars()
-        .filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control())
-        .collect::<String>()
-        .trim()
-        .trim_end_matches('.')
-        .into()
+    let kept: String = s.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect();
+    kept.trim().trim_end_matches('.').into()
+}
+
+pub fn fill(tpl: &str, s: &Song, cfg: &Settings) -> String {
+    let extra = [
+        ("title", s.name.clone()),
+        ("artists", s.artists.join(", ")),
+        ("album", s.album_name.clone()),
+        ("genre", s.genres.first().cloned().unwrap_or_default()),
+        ("original-date", s.date.clone()),
+        ("track-id", s.song_id.clone()),
+        ("track-number", format!("{:02}", s.track_number)),
+        ("duration", (s.duration as u64).to_string()),
+        ("output-ext", cfg.format.clone()),
+    ];
+    let json = serde_json::to_value(s).unwrap_or_default();
+    let text = |v: &Value| if v.is_null() { String::new() } else { v.as_str().map_or(v.to_string(), String::from) };
+    let fields = json.as_object().into_iter().flatten().map(|(k, v)| (k.replace('_', "-"), text(v)));
+    let vars = extra.into_iter().map(|(k, v)| (k.to_string(), v)).chain(fields);
+    vars.fold(tpl.to_string(), |p, (k, v)| p.replace(&format!("{{{k}}}"), &clean(&v)))
 }
 
 pub fn path(s: &Song, cfg: &Settings) -> PathBuf {
-    let vars = [
-        ("{title}", s.name.clone()),
-        ("{artists}", s.artists.join(", ")),
-        ("{artist}", s.artist.clone()),
-        ("{album}", s.album_name.clone()),
-        ("{album-artist}", s.album_artist.clone()),
-        ("{genre}", s.genres.first().cloned().unwrap_or_default()),
-        ("{disc-number}", s.disc_number.to_string()),
-        ("{disc-count}", s.disc_count.to_string()),
-        ("{duration}", (s.duration as u64).to_string()),
-        ("{year}", s.year.to_string()),
-        ("{original-date}", s.date.clone()),
-        ("{track-number}", format!("{:02}", s.track_number)),
-        ("{tracks-count}", s.tracks_count.to_string()),
-        ("{isrc}", s.isrc.clone().unwrap_or_default()),
-        ("{track-id}", s.song_id.clone()),
-        ("{publisher}", s.publisher.clone()),
-        ("{list-length}", s.list_length.unwrap_or_default().to_string()),
-        ("{list-position}", s.list_position.unwrap_or_default().to_string()),
-        ("{list-name}", s.list_name.clone().unwrap_or_default()),
-        ("{output-ext}", cfg.format.clone()),
-    ];
-    let tpl = if cfg.output.contains('{') {
-        cfg.output.clone()
-    } else {
-        format!("{}/{{artists}} - {{title}}.{{output-ext}}", cfg.output)
-    };
-    let tpl = if tpl.ends_with("{output-ext}") { tpl } else { format!("{tpl}.{{output-ext}}") };
-    tpl.split('/')
+    let tpl =
+        if cfg.output.contains('{') { cfg.output.clone() } else { format!("{}/{{artists}} - {{title}}", cfg.output) };
+    let max = if cfg.max_filename_length > 0 { cfg.max_filename_length } else { usize::MAX };
+    let mut out: PathBuf = tpl
+        .trim_end_matches(".{output-ext}")
+        .split('/')
         .map(|part| {
-            let v = vars.iter().fold(part.to_string(), |p, (k, v)| p.replace(k, &clean(v)));
+            let v = fill(part, s, cfg);
             let v = match cfg.restrict.as_deref() {
                 Some("strict") => search::slug(&v).replace('-', "_"),
                 Some("ascii") => deunicode::deunicode(&v),
                 _ => v,
             };
-            if cfg.max_filename_length > 0 {
-                v.chars().take(cfg.max_filename_length).collect()
-            } else {
-                v
-            }
+            v.chars().take(max).collect::<String>()
         })
-        .collect::<PathBuf>()
-        .with_extension(&cfg.format)
+        .collect();
+    out.as_mut_os_string().push(format!(".{}", cfg.format));
+    out
 }
 
 fn html(page: &str, start: &str, end: &str) -> Option<String> {
@@ -163,15 +152,11 @@ fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
 }
 
 fn fetch(url: &str, out: &Path, cfg: &Settings) -> R<()> {
-    let fmt = match cfg.format.as_str() {
-        "m4a" => "bestaudio[ext=m4a]/bestaudio/best",
-        "opus" => "bestaudio[ext=webm]/bestaudio/best",
-        _ => "bestaudio/best",
-    };
-    let tmp = out.with_extension("spotdl-tmp");
+    let fmt = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
+    let fmt = fmt.iter().find(|f| f.0 == cfg.format).map_or("bestaudio/best", |f| f.1);
     let mut y = Command::new(&cfg.yt_dlp);
-    y.args(["-f", fmt, "--no-playlist", "--no-warnings", "-q", "--print", "after_move:filepath", "-o"])
-        .arg(tmp.with_extension("%(ext)s"));
+    y.args(["-f", fmt, "--no-playlist", "--no-warnings", "-q", "--print", "after_move:filepath", "-o"]);
+    y.arg(out.with_extension("spotdl-tmp.%(ext)s"));
     y.args(cfg.cookie_file.iter().flat_map(|c| ["--cookies", c.as_str()]));
     y.args(cfg.proxy.iter().flat_map(|p| ["--proxy", p.as_str()]));
     y.args(cfg.sponsor_block.then_some(["--sponsorblock-remove", "all"]).into_iter().flatten());
@@ -183,34 +168,27 @@ fn fetch(url: &str, out: &Path, cfg: &Settings) -> R<()> {
     }
     let ext = got.extension().unwrap_or_default().to_string_lossy();
     let same = ext == cfg.format || (ext == "webm" && cfg.format == "opus");
-    if same && (cfg.bitrate == "disable" || cfg.bitrate == "auto") {
+    let keep = ["auto", "disable"].contains(&cfg.bitrate.as_str());
+    if same && keep {
         return Ok(fs::rename(&got, out)?);
     }
-    let codec = match cfg.format.as_str() {
-        "mp3" => "libmp3lame",
-        "flac" => "flac",
-        "ogg" => "libvorbis",
-        "opus" => "libopus",
-        "m4a" => "aac",
-        _ => "pcm_s16le",
-    };
+    let codecs = [("mp3", "libmp3lame"), ("flac", "flac"), ("ogg", "libvorbis"), ("opus", "libopus"), ("m4a", "aac")];
+    let codec = codecs.iter().find(|c| c.0 == cfg.format).map_or("pcm_s16le", |c| c.1);
     let mut f = Command::new(&cfg.ffmpeg);
-    f.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got).args(["-vn", "-map_metadata", "-1"]);
-    f.args(if same { vec!["-c:a", "copy"] } else { vec!["-c:a", codec] });
-    f.args(
-        (!same && !["auto", "disable"].contains(&cfg.bitrate.as_str()))
-            .then_some(["-b:a", cfg.bitrate.as_str()])
-            .into_iter()
-            .flatten(),
-    );
+    f.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got).args(["-vn", "-map_metadata", "-1", "-c:a"]);
+    let codec = if same {
+        vec!["copy"]
+    } else if keep {
+        vec![codec]
+    } else {
+        vec![codec, "-b:a", &cfg.bitrate]
+    };
+    f.args(codec);
     f.args(cfg.ffmpeg_args.iter().flat_map(|a| a.split_whitespace()));
     let res = f.arg(out).output()?;
     let _ = fs::remove_file(&got);
-    if res.status.success() {
-        Ok(())
-    } else {
-        Err(format!("ffmpeg: {}", String::from_utf8_lossy(&res.stderr).trim()).into())
-    }
+    let err = format!("ffmpeg: {}", String::from_utf8_lossy(&res.stderr).trim());
+    res.status.success().then_some(()).ok_or(err.into())
 }
 
 fn finish(mut s: Song, op: &str, cfg: &Settings) -> R<(Song, PathBuf)> {
@@ -249,23 +227,13 @@ fn finish(mut s: Song, op: &str, cfg: &Settings) -> R<(Song, PathBuf)> {
 
 pub fn process(s: Song, op: &str, cfg: &Settings) -> (Song, R<PathBuf>) {
     let label = format!("{} - {}", s.artists.join(", "), s.name);
-    match finish(s.clone(), op, cfg) {
-        Ok((s, p)) => {
-            println!(
-                "{}",
-                if op == "url" {
-                    s.download_url.clone().unwrap_or_default()
-                } else {
-                    format!("{label}: {}", p.display())
-                }
-            );
-            (s, Ok(p))
-        }
-        Err(e) => {
-            eprintln!("{label}: {e}");
-            (s, Err(e))
-        }
+    let res = finish(s.clone(), op, cfg);
+    match &res {
+        Ok((s, _)) if op == "url" => println!("{}", s.download_url.clone().unwrap_or_default()),
+        Ok((_, p)) => println!("{label}: {}", p.display()),
+        Err(e) => eprintln!("{label}: {e}"),
     }
+    res.map_or_else(|e| (s, Err(e)), |(s, p)| (s, Ok(p)))
 }
 
 pub fn prune(old: &[Song], new: &[Song], cfg: &Settings) {
@@ -282,17 +250,12 @@ pub fn prune(old: &[Song], new: &[Song], cfg: &Settings) {
 }
 
 pub fn meta(files: &[String], cfg: &Settings) -> R<()> {
-    let files: Vec<PathBuf> = files
+    let exts = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
+    let listed = files
         .iter()
-        .flat_map(|f| {
-            fs::read_dir(f).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_else(|_| vec![PathBuf::from(f)])
-        })
-        .filter(|p| {
-            p.extension().is_some_and(|e| ["mp3", "flac", "ogg", "opus", "m4a", "wav"].contains(&&*e.to_string_lossy()))
-        })
-        .collect();
-    files.iter().for_each(|f| {
-        let res = lofty::read_from_path(f).map_err(Into::into).and_then(|t| -> R<()> {
+        .flat_map(|f| fs::read_dir(f).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or(vec![f.into()]));
+    listed.filter(|p: &PathBuf| p.extension().is_some_and(|e| exts.contains(&&*e.to_string_lossy()))).for_each(|f| {
+        let res = lofty::read_from_path(&f).map_err(Into::into).and_then(|t| -> R<()> {
             let tg = t.primary_tag().ok_or("no tags")?;
             let url =
                 tg.get(&ItemKey::AudioFileUrl).and_then(|i| i.value().locator()).filter(|u| u.contains("spotify"));
@@ -302,8 +265,7 @@ pub fn meta(files: &[String], cfg: &Settings) -> R<()> {
                 tg.title().unwrap_or_default()
             ));
             let song = crate::spotify::resolve(&q, cfg)?.into_iter().next().ok_or("no match")?;
-            let song = Song { lyrics: lyrics(&song, cfg), download_url: tg.comment().map(String::from), ..song };
-            tag(f, &song, cfg)
+            tag(&f, &Song { lyrics: lyrics(&song, cfg), download_url: tg.comment().map(String::from), ..song }, cfg)
         });
         println!("{}: {}", f.display(), res.map_or_else(|e| e.to_string(), |_| "updated".into()));
     });

@@ -6,28 +6,17 @@ use std::{
     collections::HashMap,
     fs,
     sync::{LazyLock, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::config_builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36")
-        .build()
-        .into()
-});
+const UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
+pub static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| ureq::Agent::config_builder().user_agent(UA).build().into());
 static STATE: Mutex<Option<Value>> = Mutex::new(None);
 static ALBUMS: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::default);
 const PAGE: usize = 343;
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
-fn text(url: &str) -> R<String> {
-    Ok(HTTP.get(url).call()?.body_mut().with_config().limit(1 << 26).read_to_string()?)
-}
-
-fn totp(secret: &[u8]) -> String {
+fn totp(secret: &[u8]) -> R<String> {
     let key: Vec<u8> = secret
         .iter()
         .enumerate()
@@ -35,66 +24,65 @@ fn totp(secret: &[u8]) -> String {
         .flat_map(|b| b.to_string().into_bytes())
         .collect();
     let pad = |x: u8| (0..64).map(|i| key.get(i).unwrap_or(&0) ^ x).collect::<Vec<u8>>();
-    let inner = Sha1::new().chain_update(pad(0x36)).chain_update((now() / 30).to_be_bytes()).finalize();
+    let inner = Sha1::new()
+        .chain_update(pad(0x36))
+        .chain_update((SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 30).to_be_bytes())
+        .finalize();
     let d = Sha1::new().chain_update(pad(0x5c)).chain_update(inner).finalize();
     let o = (d[19] & 15) as usize;
-    format!("{:06}", (u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) & 0x7fff_ffff) % 1_000_000)
+    Ok(format!("{:06}", (u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) & 0x7fff_ffff) % 1_000_000))
 }
 
 fn hashes(ops: &[&str]) -> R<Value> {
+    let text = |url: &str| -> R<String> {
+        Ok(HTTP.get(url).call()?.body_mut().with_config().limit(1 << 26).read_to_string()?)
+    };
     let html = text("https://open.spotify.com")?;
-    let main = html
-        .split('"')
-        .find(|s| s.contains("/web-player/web-player.") && s.ends_with(".js"))
-        .ok_or("Spotify web-player bundle not found")?;
+    let main =
+        html.split('"').find(|s| s.contains("/web-player/web-player.") && s.ends_with(".js")).ok_or("no web-player")?;
     let js = text(main)?;
-    let maps: Vec<HashMap<String, String>> = js
-        .match_indices("{")
-        .filter_map(|(i, _)| js[i..].find('}').map(|j| &js[i..=i + j]))
-        .filter(|m| m.len() > 200 && m[1..].starts_with(|c: char| c.is_ascii_digit()) && m.contains(":\""))
-        .map(|m| {
-            m[1..m.len() - 1]
-                .split(',')
-                .filter_map(|kv| kv.split_once(':'))
-                .map(|(k, v)| (k.into(), v.trim_matches('"').into()))
-                .collect()
+    let maps: Vec<HashMap<&str, &str>> = js
+        .split('{')
+        .filter_map(|m| {
+            m.split_once('}').map(|x| x.0).filter(|m| m.len() > 200 && m.starts_with(|c: char| c.is_ascii_digit()))
         })
+        .map(|m| m.split(',').filter_map(|kv| kv.split_once(':')).map(|(k, v)| (k, v.trim_matches('"'))).collect())
         .collect();
-    let chunks: Vec<String> = maps
-        .iter()
-        .flat_map(|names| names.iter().filter(|(_, n)| n.contains("routes-search") || n.contains("routes-artist")))
-        .flat_map(|(k, n)| maps.iter().filter_map(move |h| h.get(k).filter(|h| *h != n).map(|h| format!("{n}.{h}.js"))))
-        .filter_map(|c| text(&format!("https://open.spotifycdn.com/cdn/build/web-player/{c}")).ok())
-        .collect();
-    let all = std::iter::once(js).chain(chunks).collect::<String>();
-    Ok(ops
-        .iter()
-        .filter_map(|op| {
-            let rest = all.split_once(&format!("\"{op}\",\"query\",\""))?.1;
-            Some((op.to_string(), json!(rest.get(..64)?)))
-        })
-        .collect::<serde_json::Map<_, _>>()
-        .into())
+    let routes = maps.iter().flatten().filter(|(_, n)| n.contains("routes-search") || n.contains("routes-artist"));
+    let chunks = routes.flat_map(|(k, n)| {
+        maps.iter().filter_map(move |h| h.get(k).filter(|h| *h != n).map(|h| format!("{n}.{h}.js")))
+    });
+    let chunks: Vec<String> =
+        chunks.filter_map(|c| text(&format!("https://open.spotifycdn.com/cdn/build/web-player/{c}")).ok()).collect();
+    let all = chunks.concat() + &js;
+    let found = ops.iter().filter_map(|op| {
+        Some((op.to_string(), json!(all.split_once(&format!("\"{op}\",\"query\",\""))?.1.get(..64)?)))
+    });
+    Ok(Value::Object(found.collect()))
 }
 
 fn state(refresh: bool) -> R<Value> {
     let mut guard = STATE.lock().map_err(|e| e.to_string())?;
     let path = home().join("anon.json");
     let cached = guard.clone().or_else(|| serde_json::from_slice::<Value>(&fs::read(&path).ok()?).ok());
-    if let Some(v) = cached.filter(|v| !refresh && v["exp"].as_u64().unwrap_or(0) > now() * 1000 + 60_000) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    let fresh =
+        |v: &Value| v["exp"].as_u64() > Some(now + 60_000) && (!refresh || v["at"].as_u64() > Some(now - 60_000));
+    if let Some(v) = cached.filter(fresh) {
         *guard = Some(v.clone());
         return Ok(v);
     }
-    let secrets: HashMap<String, Vec<u8>> = serde_json::from_str(&text(
-        "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json",
-    )?)?;
+    let secrets =
+        HTTP.get("https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json").call()?;
+    let secrets: HashMap<String, Vec<u8>> = secrets.into_body().read_json()?;
     let (ver, secret) = secrets.iter().max_by_key(|(k, _)| k.parse::<u32>().unwrap_or(0)).ok_or("no TOTP secret")?;
-    let code = totp(secret);
+    let code = totp(secret)?;
     let url = format!("https://open.spotify.com/api/token?reason=init&productType=web-player&totp={code}&totpVer={ver}&totpServer={code}");
     let tok: Value = HTTP.get(&url).call()?.body_mut().read_json()?;
     let v = json!({
         "token": tok["accessToken"].as_str().ok_or("Spotify token missing")?,
         "exp": tok["accessTokenExpirationTimestampMs"],
+        "at": now,
         "hashes": hashes(&["getTrack", "getAlbum", "fetchPlaylist", "queryArtistDiscographyAll", "searchDesktop"])?,
     });
     fs::create_dir_all(home())?;
@@ -106,11 +94,8 @@ fn state(refresh: bool) -> R<Value> {
 fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
     let key = format!("{:x}", Sha1::digest(format!("{op}{vars}")));
     let path = home().join("cache").join(&key[..16]);
-    if let Some(v) = fs::read(&path)
-        .ok()
-        .filter(|_| !cfg.no_cache && op != "searchDesktop")
-        .and_then(|b| serde_json::from_slice(&b).ok())
-    {
+    let cache = !cfg.no_cache && op.starts_with("get");
+    if let Some(v) = fs::read(&path).ok().filter(|_| cache).and_then(|b| serde_json::from_slice(&b).ok()) {
         return Ok(v);
     }
     let attempt = |refresh: bool| -> R<Value> {
@@ -129,28 +114,27 @@ fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
             .read_json()?;
         v.get("data").map(|_| v.clone()).ok_or_else(|| format!("{op}: {}", v["errors"]).into())
     };
-    let v = attempt(false).or_else(|_| attempt(true))?;
-    fs::create_dir_all(path.parent().unwrap_or(&path))?;
-    fs::write(&path, v.to_string())?;
+    let v = (1..5).fold(attempt(false), |r, n| {
+        r.or_else(|e| {
+            let auth = ["401", "hash", "PersistedQuery"].iter().any(|k| e.to_string().contains(k));
+            std::thread::sleep(Duration::from_millis(if auth { 0 } else { 250 << n }));
+            attempt(auth)
+        })
+    })?;
+    let _ =
+        fs::create_dir_all(home().join("cache"))
+            .and_then(|_| if cache { fs::write(&path, v.to_string()) } else { Ok(()) });
     Ok(v)
 }
 
 fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
-    let token = match &cfg.auth_token {
-        Some(t) => t.clone(),
-        None => HTTP
-            .post("https://accounts.spotify.com/api/token")
-            .send_form([
-                ("grant_type", "client_credentials"),
-                ("client_id", &cfg.client_id),
-                ("client_secret", &cfg.client_secret),
-            ])?
-            .body_mut()
-            .read_json::<Value>()?["access_token"]
-            .as_str()
-            .ok_or("official Spotify login failed")?
-            .to_string(),
+    let creds =
+        [("grant_type", "client_credentials"), ("client_id", &cfg.client_id), ("client_secret", &cfg.client_secret)];
+    let login = || -> R<String> {
+        let v: Value = HTTP.post("https://accounts.spotify.com/api/token").send_form(creds)?.body_mut().read_json()?;
+        Ok(v["access_token"].as_str().ok_or("official Spotify login failed")?.into())
     };
+    let token = cfg.auth_token.clone().map_or_else(login, Ok)?;
     let mut next = Some(format!("https://api.spotify.com/v1/{url}"));
     let mut items = Vec::new();
     while let Some(u) = next {
@@ -168,25 +152,15 @@ fn vars(uri: &str, offset: usize, limit: usize) -> Value {
 }
 
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Settings) -> R<(Value, Vec<Value>)> {
+    let items = |v: &Value| v.pointer(&format!("{list}/items")).and_then(Value::as_array).cloned().unwrap_or_default();
     let first = query(op, vars(uri, 0, limit), cfg)?;
-    let total = first
-        .pointer(&format!("{list}/totalCount"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("{uri} unavailable"))?;
-    let rest: Vec<Value> = (limit..total as usize)
-        .step_by(limit)
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|o| {
-            query(op, vars(uri, *o, limit), cfg)
-                .map(|v| v.pointer(&format!("{list}/items")).cloned().unwrap_or_default())
-        })
-        .collect::<R<_>>()?;
-    let items = std::iter::once(first.pointer(&format!("{list}/items")).cloned().unwrap_or_default()).chain(rest);
-    Ok((
-        first["data"].as_object().and_then(|d| d.values().next()).cloned().unwrap_or_default(),
-        items.flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect(),
-    ))
+    let total =
+        first.pointer(&format!("{list}/totalCount")).and_then(Value::as_u64).ok_or(format!("{uri} unavailable"))?;
+    let offsets: Vec<usize> = (limit..total as usize).step_by(limit).collect();
+    let rest: Vec<Vec<Value>> =
+        offsets.par_iter().map(|o| query(op, vars(uri, *o, limit), cfg).map(|v| items(&v))).collect::<R<_>>()?;
+    let meta = first["data"].as_object().and_then(|d| d.values().next()).cloned().unwrap_or_default();
+    Ok((meta, std::iter::once(items(&first)).chain(rest).flatten().collect()))
 }
 
 fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Settings) -> R<Vec<Song>> {
@@ -196,11 +170,14 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
     let albums: HashMap<&String, Value> = uris
         .par_iter()
         .filter_map(|u| {
+            let keep = ["name", "artists", "date", "discs", "tracksV2", "label", "coverArt", "copyright", "type"];
+            let fetch = || {
+                let mut a = query("getAlbum", vars(u, 0, 1), cfg).ok()?["data"]["albumUnion"].take();
+                a.as_object_mut()?.retain(|k, _| keep.contains(&k.as_str()));
+                Some(a)
+            };
             let known = ALBUMS.lock().ok()?.get(*u).cloned();
-            Some((
-                *u,
-                known.or_else(|| Some(query("getAlbum", vars(u, 0, 1), cfg).ok()?["data"]["albumUnion"].clone()))?,
-            ))
+            Some((*u, known.or_else(fetch)?))
         })
         .collect();
     let len = tracks.len();
@@ -210,13 +187,8 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
         .filter(|(_, (t, _))| t["uri"].as_str().is_some_and(|u| u.starts_with("spotify:track:")))
         .map(|(i, (t, a))| {
             let al = albums.get(a).unwrap_or(&Value::Null);
-            let names = |v: &Value| -> Vec<String> {
-                v.as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|x| x["profile"]["name"].as_str().or(x["name"].as_str()).map(String::from))
-                    .collect()
-            };
+            let name = |x: &Value| x["profile"]["name"].as_str().or(x["name"].as_str()).map(String::from);
+            let names = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(name).collect() };
             let artists: Vec<String> =
                 [&t["artists"]["items"], &t["firstArtist"]["items"], &t["otherArtists"]["items"], &t["artists"]]
                     .into_iter()
@@ -224,6 +196,8 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
                     .collect();
             let date = al["date"]["isoString"].as_str().unwrap_or_default().get(..10).unwrap_or_default().to_string();
             let id = |v: &Value| v.as_str().unwrap_or_default().rsplit(':').next().unwrap_or_default().to_string();
+            let dur = |k: &str| t[k]["totalMilliseconds"].as_f64();
+            let covers = al["coverArt"]["sources"].as_array().into_iter().flatten();
             let num = |a: &Value, b: &Value| a.as_u64().or(b.as_u64()).unwrap_or(1) as u32;
             Song {
                 name: t["name"].as_str().unwrap_or_default().into(),
@@ -234,10 +208,7 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
                 disc_number: num(&t["discNumber"], &t["disc_number"]),
                 disc_count: num(&al["discs"]["totalCount"], &Value::Null),
                 album_name: al["name"].as_str().unwrap_or_default().into(),
-                duration: (t["duration"]["totalMilliseconds"].as_f64())
-                    .or(t["trackDuration"]["totalMilliseconds"].as_f64())
-                    .or(t["duration_ms"].as_f64())
-                    .unwrap_or_default()
+                duration: dur("duration").or(dur("trackDuration")).or(t["duration_ms"].as_f64()).unwrap_or_default()
                     / 1000.0,
                 year: date.get(..4).and_then(|y| y.parse().ok()).unwrap_or_default(),
                 date,
@@ -248,10 +219,7 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
                 explicit: t["contentRating"]["label"] == "EXPLICIT" || t["explicit"] == true,
                 publisher: al["label"].as_str().unwrap_or_default().into(),
                 isrc: t["external_ids"]["isrc"].as_str().map(String::from),
-                cover_url: al["coverArt"]["sources"]
-                    .as_array()
-                    .and_then(|s| s.iter().max_by_key(|x| x["width"].as_u64()))
-                    .and_then(|x| x["url"].as_str().map(String::from)),
+                cover_url: covers.max_by_key(|x| x["width"].as_u64()).and_then(|x| x["url"].as_str().map(String::from)),
                 copyright_text: al["copyright"]["items"][0]["text"].as_str().map(String::from),
                 popularity: t["playcount"].as_str().and_then(|p| p.parse().ok()),
                 album_id: id(&Value::String(a.clone())),
@@ -301,36 +269,30 @@ pub fn resolve(q: &str, cfg: &Settings) -> R<Vec<Song>> {
     if q.contains("youtube.com/") || q.contains("youtu.be/") {
         return crate::search::youtube(q, cfg);
     }
-    let q = if q.contains("spotify.link") {
-        ureq::ResponseExt::get_uri(&HTTP.get(q).call()?).to_string()
-    } else {
-        q.to_string()
-    };
-    let lib = |path: &str, key: &str| -> R<Vec<String>> {
-        Ok(official(path, cfg)?
-            .iter()
-            .filter_map(|x| x[key]["uri"].as_str().or(x["uri"].as_str()).map(String::from))
-            .collect())
-    };
+    let short = q.contains("spotify.link").then(|| HTTP.get(q).call()).transpose()?;
+    let q = short.map_or(q.to_string(), |r| ureq::ResponseExt::get_uri(&r).to_string());
+    let lib =
+        |path: &str, key: &str| -> R<Vec<Value>> { Ok(official(path, cfg)?.iter().map(|x| x[key].clone()).collect()) };
     let uris = match q.as_str() {
         "saved" => {
-            let tracks = official("me/tracks?limit=50", cfg)?;
+            let tracks = lib("me/tracks?limit=50", "track")?.into_iter();
             return build(
-                tracks
-                    .into_iter()
-                    .map(|t| (t["track"].clone(), t["track"]["album"]["uri"].as_str().unwrap_or_default().into()))
-                    .collect(),
+                tracks.map(|t| (t.clone(), t["album"]["uri"].as_str().unwrap_or_default().into())).collect(),
                 None,
                 cfg,
             );
         }
-        "all-user-playlists" | "all-saved-playlists" => lib("me/playlists?limit=50", "")?,
+        "all-user-playlists" | "all-saved-playlists" => official("me/playlists?limit=50", cfg)?,
         "all-user-saved-albums" => lib("me/albums?limit=50", "album")?,
-        "all-user-followed-artists" => lib("me/following?type=artist&limit=50", "")?,
+        "all-user-followed-artists" => official("me/following?type=artist&limit=50", cfg)?,
         _ => vec![],
     };
     if !uris.is_empty() {
-        return Ok(uris.par_iter().flat_map(|u| resolve(u, cfg).unwrap_or_default()).collect());
+        return Ok(uris
+            .par_iter()
+            .filter_map(|u| u["uri"].as_str())
+            .flat_map(|u| resolve(u, cfg).unwrap_or_default())
+            .collect());
     }
     let (kind, term) = ["album:", "playlist:", "artist:"]
         .iter()
@@ -340,13 +302,12 @@ pub fn resolve(q: &str, cfg: &Settings) -> R<Vec<Song>> {
         Some(u) => u,
         None => {
             let vars = json!({"searchTerm": term, "offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": false, "includeArtistHasConcertsField": false, "includePreReleases": false, "includeLocalConcertsField": false});
-            let s = query("searchDesktop", vars, cfg)?;
-            let items = &s["data"]["searchV2"]
-                [format!("{kind}s{}", if kind == "track" || kind == "album" { "V2" } else { "" })]["items"];
-            let first = &items[0];
-            [&first["item"]["data"]["uri"], &first["data"]["uri"]]
-                .iter()
-                .find_map(|u| u.as_str())
+            let s = query("searchDesktop", vars, cfg)?["data"]["searchV2"].clone();
+            let first =
+                &s[format!("{kind}s{}", if kind == "track" || kind == "album" { "V2" } else { "" })]["items"][0];
+            first["item"]["data"]["uri"]
+                .as_str()
+                .or(first["data"]["uri"].as_str())
                 .ok_or("no Spotify results")?
                 .to_string()
         }

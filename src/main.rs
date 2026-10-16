@@ -125,10 +125,8 @@ fn settings() -> R<(String, Vec<String>, Settings)> {
         i += 1 + usize::from(take);
         value.into_iter().for_each(|v| raw[key.as_str()] = v);
     }
-    let op = match positional.first().map(String::as_str) {
-        Some("download" | "save" | "sync" | "url" | "meta") => positional.remove(0),
-        _ => "download".into(),
-    };
+    let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
+    let op = if known { positional.remove(0) } else { "download".into() };
     Ok((op, positional, serde_json::from_value(raw)?))
 }
 
@@ -143,35 +141,27 @@ fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
         s.disc_count = 1;
         s.cover_url = s.cover_url.clone().filter(|_| cfg.playlist_retain_track_cover);
     });
+    let keep =
+        |s: &Song| (!cfg.skip_explicit || !s.explicit) && cfg.album_type.as_ref().is_none_or(|t| &s.album_type == t);
     songs
         .into_iter()
-        .filter(|s| !cfg.skip_explicit || !s.explicit)
-        .filter(|s| cfg.album_type.as_ref().is_none_or(|t| &s.album_type == t))
+        .filter(keep)
         .filter(|s| !cfg.ignore_albums.iter().any(|a| s.album_name.to_lowercase().contains(&a.to_lowercase())))
         .collect()
 }
 
-fn write_json(path: &str, value: &impl Serialize) -> R<()> {
-    fs::write(path, serde_json::to_string_pretty(value)?)?;
-    Ok(())
-}
-
 fn run() -> R<()> {
     let (op, original, cfg) = settings()?;
-    if std::env::args().any(|a| a == "--version") {
-        println!("spotdl {}", env!("CARGO_PKG_VERSION"));
+    let flag = |f: &str| std::env::args().any(|a| a == f);
+    if flag("--version") || flag("--generate-config") || original.is_empty() {
+        let created = flag("--generate-config")
+            && fs::create_dir_all(home()).and(fs::write(home().join("config.json"), DEFAULTS)).is_ok();
+        println!(
+            "spotdl {} {}",
+            env!("CARGO_PKG_VERSION"),
+            if created { "config written" } else { "[download|save|sync|url|meta] <query>..." }
+        );
         return Ok(());
-    }
-    if std::env::args().any(|a| a == "--generate-config") {
-        fs::create_dir_all(home())?;
-        return fs::write(
-            home().join("config.json"),
-            serde_json::to_string_pretty(&serde_json::from_str::<Value>(DEFAULTS)?)?,
-        )
-        .map_err(Into::into);
-    }
-    if original.is_empty() {
-        return Err("usage: spotdl [download|save|sync|url|meta] <query>... [--option value]".into());
     }
     rayon::ThreadPoolBuilder::new().num_threads(cfg.meta_threads.max(1)).build_global()?;
     if op == "meta" {
@@ -198,7 +188,7 @@ fn run() -> R<()> {
     if op == "sync" {
         let path = sync.as_ref().map(|_| original[0].clone()).or(cfg.save_file.clone());
         let path = path.unwrap_or_else(|| format!("{}.spotdl", download::clean(&queries[0])));
-        write_json(&path, &json!({"type": "sync", "query": queries, "songs": songs}))?;
+        fs::write(&path, serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": songs}))?)?;
     }
     let done: Vec<(Song, R<PathBuf>)> = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads.max(1))
@@ -212,7 +202,7 @@ fn run() -> R<()> {
         .extend(done.iter().filter_map(|(s, r)| r.as_ref().err().map(|e| format!("{} - {}: {e}", s.artist, s.name))));
     if op == "save" {
         let saved: Vec<&Song> = done.iter().map(|(s, _)| s).collect();
-        write_json(cfg.save_file.as_deref().unwrap_or("saved.spotdl"), &saved)?;
+        fs::write(cfg.save_file.as_deref().unwrap_or("saved.spotdl"), serde_json::to_string_pretty(&saved)?)?;
     }
     if let Some(m3u) = &cfg.m3u {
         let name = done.first().and_then(|(s, _)| s.list_name.clone()).unwrap_or_else(|| "playlist".into());
