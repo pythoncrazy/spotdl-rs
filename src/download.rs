@@ -30,16 +30,11 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
     ];
     let json = serde_json::to_value(s).unwrap_or_default();
     let text = |v: &Value| {
-        v.as_str().map_or_else(
-            || {
-                if v.is_null() {
-                    String::new()
-                } else {
-                    v.to_string()
-                }
-            },
-            String::from,
-        )
+        if v.is_null() {
+            String::new()
+        } else {
+            v.as_str().map_or(v.to_string(), String::from)
+        }
     };
     let fields = json.as_object().into_iter().flatten().map(|(k, v)| (k.replace('_', "-"), text(v)));
     let vars = extra.into_iter().map(|(k, v)| (k.to_string(), v)).chain(fields);
