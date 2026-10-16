@@ -1,0 +1,22 @@
+[package]
+name = "spotdl"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Download your Spotify playlists and songs along with album art, lyrics and metadata"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+lofty = "0.22"
+deunicode = "1"
+sha1 = "0.10"
+rayon = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
