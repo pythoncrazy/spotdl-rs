@@ -1,7 +1,6 @@
 use crate::{spotify::HTTP, Settings, Song, R};
 use serde_json::{json, Value};
-use std::process::Command;
-
+use std::{collections::HashSet, process::Command};
 #[derive(Default)]
 pub struct Hit {
     url: String,
@@ -12,14 +11,11 @@ pub struct Hit {
     verified: bool,
     isrc: bool,
 }
-
 const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
-
 pub fn slug(s: &str) -> String {
     let s = deunicode::deunicode(s).to_lowercase();
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-")
 }
-
 pub fn ratio(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let row = a.iter().fold(vec![0usize; b.len() + 1], |row, x| {
@@ -35,7 +31,6 @@ pub fn ratio(a: &str, b: &str) -> f64 {
         200.0 * row[b.len()] as f64 / n
     }
 }
-
 fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
     let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
     let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
@@ -76,7 +71,6 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
         })
         .collect())
 }
-
 fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
     let out = Command::new(&cfg.yt_dlp).args(["--flat-playlist", "-J", "--no-warnings", search]).output()?;
     let v: Value = serde_json::from_slice(&out.stdout)?;
@@ -99,7 +93,6 @@ fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
         })
         .collect())
 }
-
 fn score(s: &Song, h: &Hit) -> f64 {
     let (rname, sname) = (slug(&h.name), slug(&s.name));
     let found = |a: &String| h.artists.iter().any(|r| ratio(&slug(a), &slug(r)) > 85.0) || rname.contains(&slug(a));
@@ -118,33 +111,38 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
-
-pub fn find(s: &Song, cfg: &Settings) -> R<String> {
+pub fn find(s: &Song, cfg: &Settings) -> R<Vec<String>> {
     let q = crate::download::fill(cfg.search_query.as_deref().unwrap_or("{artists} - {title}"), s, cfg);
-    let best = |hits: Vec<Hit>| -> Option<(f64, String)> {
-        let first = hits.first().filter(|_| !cfg.filter_results).map(|h| (100.0, h.url.clone()));
-        first.or_else(|| {
-            hits.iter().map(|h| (score(s, h), h.url.clone())).filter(|x| x.0 > 0.0).max_by(|a, b| a.0.total_cmp(&b.0))
-        })
-    };
+    let rank = |h: Hit| (if cfg.filter_results { score(s, &h) } else { 100.0 }, h.url);
     let isrc = s.isrc.as_ref().filter(|_| cfg.audio_providers.iter().any(|p| p == "youtube-music"));
-    let close = |h: Vec<Hit>| h.into_iter().filter(|h| (h.duration - s.duration).abs() < 10.0).take(1).collect();
-    let by_isrc = isrc.and_then(|i| ytm(i, true, true).ok()).and_then(|h| best(close(h)));
-    let search = |p: &String| -> Option<(f64, String)> {
-        let top = match p.as_str() {
+    let mut found: Vec<_> = isrc
+        .into_iter()
+        .flat_map(|i| ytm(i, true, true).unwrap_or_default())
+        .filter(|h| (h.duration - s.duration).abs() < 10.0)
+        .map(&rank)
+        .filter(|x| x.0 > 0.0)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .into_iter()
+        .map(|x| (f64::INFINITY, x.1))
+        .collect();
+    for p in &cfg.audio_providers {
+        let mut hits = match p.as_str() {
             "youtube-music" => ytm(&q, true, false),
             "youtube" => ytdlp(&format!("ytsearch10:{q}"), cfg),
             _ => ytdlp(&format!("scsearch10:{q}"), cfg),
-        };
-        let top = top.ok().and_then(best);
-        let more = p == "youtube-music" && !cfg.only_verified_results && top.as_ref().is_none_or(|t| t.0 < 80.0);
-        let videos = more.then(|| ytm(&q, false, false).ok().and_then(best)).flatten();
-        top.into_iter().chain(videos).max_by(|a, b| a.0.total_cmp(&b.0))
-    };
-    let found = by_isrc.or_else(|| cfg.audio_providers.iter().find_map(search));
-    found.map(|b| b.1).ok_or_else(|| format!("no match for {q}").into())
+        }
+        .unwrap_or_default();
+        let best = hits.iter().map(|h| if cfg.filter_results { score(s, h) } else { 100.0 }).max_by(f64::total_cmp);
+        if p == "youtube-music" && !cfg.only_verified_results && best.is_none_or(|n| n < 80.0) {
+            hits.extend(ytm(&q, false, false).unwrap_or_default());
+        }
+        found.extend(hits.into_iter().map(&rank).filter(|x| x.0 > 0.0));
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut seen = HashSet::new();
+    let found: Vec<String> = found.into_iter().filter(|x| seen.insert(x.1.clone())).take(3).map(|x| x.1).collect();
+    (!found.is_empty()).then_some(found).ok_or_else(|| format!("no match for {q}").into())
 }
-
 pub fn youtube(url: &str, cfg: &Settings) -> R<Vec<Song>> {
     let n = if url.contains("list=") && !url.contains("watch?") { usize::MAX } else { 1 };
     let hits = ytdlp(url, cfg)?.into_iter().take(n);

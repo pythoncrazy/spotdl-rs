@@ -2,20 +2,16 @@ use crate::{home, Settings, Song, R};
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::{
-    collections::HashMap,
-    fs,
-    sync::{LazyLock, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
+use std::collections::HashMap;
+use std::fs;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 pub static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| ureq::Agent::config_builder().user_agent(UA).build().into());
 static STATE: Mutex<Option<Value>> = Mutex::new(None);
 static ALBUMS: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::default);
 const PAGE: usize = 343;
-
 fn totp(secret: &[u8]) -> R<String> {
     let key: Vec<u8> = secret
         .iter()
@@ -32,7 +28,6 @@ fn totp(secret: &[u8]) -> R<String> {
     let o = (d[19] & 15) as usize;
     Ok(format!("{:06}", (u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) & 0x7fff_ffff) % 1_000_000))
 }
-
 fn hashes(ops: &[&str]) -> R<Value> {
     let text = |url: &str| -> R<String> {
         Ok(HTTP.get(url).call()?.body_mut().with_config().limit(1 << 26).read_to_string()?)
@@ -60,14 +55,15 @@ fn hashes(ops: &[&str]) -> R<Value> {
     });
     Ok(Value::Object(found.collect()))
 }
-
-fn state(refresh: bool) -> R<Value> {
+fn state(rejected: Option<&str>) -> R<Value> {
     let mut guard = STATE.lock().map_err(|e| e.to_string())?;
     let path = home().join("anon.json");
     let cached = guard.clone().or_else(|| serde_json::from_slice::<Value>(&fs::read(&path).ok()?).ok());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-    let fresh =
-        |v: &Value| v["exp"].as_u64() > Some(now + 60_000) && (!refresh || v["at"].as_u64() > Some(now - 60_000));
+    let fresh = |v: &Value| {
+        v["exp"].as_u64() > Some(now + 60_000)
+            && rejected.is_none_or(|t| v["at"].as_u64() > Some(now - 60_000) && v["token"].as_str() != Some(t))
+    };
     if let Some(v) = cached.filter(fresh) {
         *guard = Some(v.clone());
         return Ok(v);
@@ -90,35 +86,41 @@ fn state(refresh: bool) -> R<Value> {
     *guard = Some(v.clone());
     Ok(v)
 }
-
 fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
     let key = format!("{:x}", Sha1::digest(format!("{op}{vars}")));
     let path = home().join("cache").join(&key[..16]);
-    let cache = !cfg.no_cache && op.starts_with("get");
-    if let Some(v) = fs::read(&path).ok().filter(|_| cache).and_then(|b| serde_json::from_slice(&b).ok()) {
+    let cache = !cfg.no_cache && ["getAlbum", "getTrack"].contains(&op);
+    let fresh = cache
+        && fs::metadata(&path)
+            .is_ok_and(|m| m.modified().is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() < 604_800)));
+    if let Some(v) = fs::read(&path).ok().filter(|_| fresh).and_then(|b| serde_json::from_slice(&b).ok()) {
         return Ok(v);
     }
-    let attempt = |refresh: bool| -> R<Value> {
-        let s = state(refresh)?;
+    let attempt = |refresh: bool, rejected: &mut Option<String>| -> R<Value> {
+        let s = state(if refresh { rejected.as_deref() } else { None })?;
+        *rejected = Some(s["token"].as_str().unwrap_or_default().into());
         let ext = json!({"persistedQuery": {"version": 1, "sha256Hash": s["hashes"][op].as_str().ok_or("missing query hash")?}});
-        let v: Value = HTTP
-            .get("https://api-partner.spotify.com/pathfinder/v1/query")
-            .query("operationName", op)
-            .query("variables", vars.to_string())
-            .query("extensions", ext.to_string())
-            .header("Authorization", format!("Bearer {}", s["token"].as_str().unwrap_or_default()))
-            .call()?
-            .body_mut()
-            .with_config()
-            .limit(1 << 26)
-            .read_json()?;
+        let v: Value = serde_json::from_slice(
+            &HTTP
+                .get("https://api-partner.spotify.com/pathfinder/v1/query")
+                .query("operationName", op)
+                .query("variables", vars.to_string())
+                .query("extensions", ext.to_string())
+                .header("Authorization", format!("Bearer {}", s["token"].as_str().unwrap_or_default()))
+                .call()?
+                .body_mut()
+                .with_config()
+                .limit(1 << 26)
+                .read_to_vec()?,
+        )?;
         v.get("data").map(|_| v.clone()).ok_or_else(|| format!("{op}: {}", v["errors"]).into())
     };
-    let v = (1..5).fold(attempt(false), |r, n| {
+    let mut rejected = None;
+    let v = (1..=cfg.max_retries).fold(attempt(false, &mut rejected), |r, n| {
         r.or_else(|e| {
             let auth = ["401", "hash", "PersistedQuery"].iter().any(|k| e.to_string().contains(k));
             std::thread::sleep(Duration::from_millis(if auth { 0 } else { 250 << n }));
-            attempt(auth)
+            attempt(auth, &mut rejected)
         })
     })?;
     let _ =
@@ -126,7 +128,6 @@ fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
             .and_then(|_| if cache { fs::write(&path, v.to_string()) } else { Ok(()) });
     Ok(v)
 }
-
 fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
     let creds =
         [("grant_type", "client_credentials"), ("client_id", &cfg.client_id), ("client_secret", &cfg.client_secret)];
@@ -146,11 +147,9 @@ fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
     }
     Ok(items)
 }
-
 fn vars(uri: &str, offset: usize, limit: usize) -> Value {
     json!({"uri": uri, "locale": "", "offset": offset, "limit": limit, "order": "DATE_DESC", "enableWatchFeedEntrypoint": false})
 }
-
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Settings) -> R<(Value, Vec<Value>)> {
     let items = |v: &Value| v.pointer(&format!("{list}/items")).and_then(Value::as_array).cloned().unwrap_or_default();
     let first = query(op, vars(uri, 0, limit), cfg)?;
@@ -162,7 +161,6 @@ fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Settings) -> R<(Va
     let meta = first["data"].as_object().and_then(|d| d.values().next()).cloned().unwrap_or_default();
     Ok((meta, std::iter::once(items(&first)).chain(rest).flatten().collect()))
 }
-
 fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Settings) -> R<Vec<Song>> {
     let mut uris: Vec<&String> = tracks.iter().map(|(_, a)| a).collect();
     uris.sort();
@@ -233,14 +231,12 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
         })
         .collect())
 }
-
 fn album(uri: &str, cfg: &Settings) -> R<Vec<(Value, String)>> {
     let (mut meta, items) = pages("getAlbum", uri, "/data/albumUnion/tracksV2", PAGE, cfg)?;
     meta["tracksV2"]["items"] = Value::Null;
     ALBUMS.lock().map_err(|e| e.to_string())?.insert(uri.into(), meta);
     Ok(items.into_iter().map(|i| (i["track"].clone(), uri.to_string())).collect())
 }
-
 fn artist(uri: &str, cfg: &Settings) -> R<Vec<Song>> {
     let (_, releases) = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50, cfg)?;
     let albums: Vec<&str> = releases.iter().filter_map(|x| x["releases"]["items"][0]["uri"].as_str()).collect();
@@ -249,7 +245,6 @@ fn artist(uri: &str, cfg: &Settings) -> R<Vec<Song>> {
     let songs = build(tracks, None, cfg)?.into_iter();
     Ok(songs.filter(|s| seen.insert((s.name.to_lowercase(), s.artists.clone()))).collect())
 }
-
 fn uri(query: &str) -> Option<String> {
     let q = query.split('?').next()?.trim_end_matches('/');
     ["track", "album", "playlist", "artist"].iter().find_map(|k| {
@@ -257,7 +252,6 @@ fn uri(query: &str) -> Option<String> {
         Some(format!("spotify:{k}:{}", id.split('/').next()?))
     })
 }
-
 pub fn resolve(q: &str, cfg: &Settings) -> R<Vec<Song>> {
     if q.ends_with(".spotdl") {
         let v: Value = serde_json::from_slice(&fs::read(q)?)?;
@@ -305,6 +299,10 @@ pub fn resolve(q: &str, cfg: &Settings) -> R<Vec<Song>> {
             let s = query("searchDesktop", vars, cfg)?["data"]["searchV2"].clone();
             let first =
                 &s[format!("{kind}s{}", if kind == "track" || kind == "album" { "V2" } else { "" })]["items"][0];
+            let name = first["item"]["data"]["name"].as_str().unwrap_or_default();
+            if kind == "track" && crate::search::ratio(term, name) < 25.0 {
+                return Err("no Spotify results".into());
+            }
             first["item"]["data"]["uri"]
                 .as_str()
                 .or(first["data"]["uri"].as_str())

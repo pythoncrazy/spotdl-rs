@@ -1,23 +1,20 @@
 use crate::{search, spotify::HTTP, Settings, Song, R};
-use lofty::{
-    config::WriteOptions,
-    picture::{MimeType, Picture, PictureType},
-    prelude::*,
-    tag::{ItemKey, ItemValue, Tag, TagItem},
-};
+use lofty::config::WriteOptions;
+use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::prelude::*;
+use lofty::tag::{ItemKey, ItemValue, Tag, TagItem};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::Command,
 };
-
 pub fn clean(s: &str) -> String {
     let kept: String = s.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect();
     kept.trim().trim_end_matches('.').into()
 }
-
 pub fn fill(tpl: &str, s: &Song, cfg: &Settings) -> String {
     let extra = [
         ("title", s.name.clone()),
@@ -36,28 +33,29 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Settings) -> String {
     let vars = extra.into_iter().map(|(k, v)| (k.to_string(), v)).chain(fields);
     vars.fold(tpl.to_string(), |p, (k, v)| p.replace(&format!("{{{k}}}"), &clean(&v)))
 }
-
 pub fn path(s: &Song, cfg: &Settings) -> PathBuf {
     let tpl =
         if cfg.output.contains('{') { cfg.output.clone() } else { format!("{}/{{artists}} - {{title}}", cfg.output) };
     let max = if cfg.max_filename_length > 0 { cfg.max_filename_length } else { usize::MAX };
-    let mut out: PathBuf = tpl
-        .trim_end_matches(".{output-ext}")
-        .split('/')
-        .map(|part| {
-            let v = fill(part, s, cfg);
-            let v = match cfg.restrict.as_deref() {
-                Some("strict") => search::slug(&v).replace('-', "_"),
-                Some("ascii") => deunicode::deunicode(&v),
-                _ => v,
-            };
-            v.chars().take(max).collect::<String>()
-        })
-        .collect();
+    let absolute = tpl.starts_with('/');
+    let mut out = Path::new(if absolute { "/" } else { "" }).join(
+        tpl.trim_start_matches('/')
+            .trim_end_matches(".{output-ext}")
+            .split('/')
+            .map(|part| {
+                let v = fill(part, s, cfg);
+                match cfg.restrict.as_deref() {
+                    Some("strict") => search::slug(&v).replace('-', "_"),
+                    Some("ascii") => deunicode::deunicode(&v),
+                    _ => v,
+                }
+            })
+            .map(|v| if v == "." || v == ".." { "_".to_string() } else { v.chars().take(max).collect() })
+            .collect::<PathBuf>(),
+    );
     out.as_mut_os_string().push(format!(".{}", cfg.format));
     out
 }
-
 fn html(page: &str, start: &str, end: &str) -> Option<String> {
     let region = page.split_once(start)?.1.split(end).next()?;
     let (_, text) = region.split('<').enumerate().fold((0, String::new()), |(skip, mut out), (i, p)| {
@@ -75,7 +73,6 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     });
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
-
 fn lyrics(s: &Song, cfg: &Settings) -> Option<String> {
     let page = |r: ureq::RequestBuilder<ureq::typestate::WithoutBody>| r.call().ok()?.body_mut().read_to_string().ok();
     cfg.lyrics_providers.iter().find_map(|p| {
@@ -110,7 +107,6 @@ fn lyrics(s: &Song, cfg: &Settings) -> Option<String> {
         Some(text.trim().to_string()).filter(|t| !t.is_empty())
     })
 }
-
 fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
     let mut f = lofty::read_from_path(file)?;
     let mut t = Tag::new(f.primary_tag_type());
@@ -146,17 +142,24 @@ fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
     art.into_iter()
         .for_each(|a| t.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, a)));
     f.clear();
+    if file.extension().is_some_and(|e| e == "wav") {
+        f.insert_tag(lofty::iff::wav::RiffInfoList::from(t.clone()).into());
+    }
     f.insert_tag(t);
-    f.save_to_path(file, WriteOptions::default())?;
-    Ok(())
+    f.save_to_path(file, WriteOptions::default()).map_err(Into::into)
 }
-
-fn fetch(url: &str, out: &Path, cfg: &Settings) -> R<()> {
+fn fetch(url: &str, out: &Path, id: &str, cfg: &Settings) -> R<()> {
     let fmt = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
     let fmt = fmt.iter().find(|f| f.0 == cfg.format).map_or("bestaudio/best", |f| f.1);
     let mut y = Command::new(&cfg.yt_dlp);
-    y.args(["-f", fmt, "--no-playlist", "--no-warnings", "-q", "--print", "after_move:filepath", "-o"]);
-    y.arg(out.with_extension("spotdl-tmp.%(ext)s"));
+    y.args(["-f", fmt, "--no-playlist", "--no-warnings"]).args([
+        "--force-overwrites",
+        "-q",
+        "--print",
+        "after_move:filepath",
+        "-o",
+    ]);
+    y.arg(out.with_extension(format!("{id}.%(ext)s")));
     y.args(cfg.cookie_file.iter().flat_map(|c| ["--cookies", c.as_str()]));
     y.args(cfg.proxy.iter().flat_map(|p| ["--proxy", p.as_str()]));
     y.args(cfg.sponsor_block.then_some(["--sponsorblock-remove", "all"]).into_iter().flatten());
@@ -164,78 +167,96 @@ fn fetch(url: &str, out: &Path, cfg: &Settings) -> R<()> {
     let res = y.arg(url).output()?;
     let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
     if !res.status.success() || !got.is_file() {
+        let _ = fs::remove_file(&got);
         return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&res.stderr).trim()).into());
     }
     let ext = got.extension().unwrap_or_default().to_string_lossy();
-    let same = ext == cfg.format || (ext == "webm" && cfg.format == "opus");
     let keep = ["auto", "disable"].contains(&cfg.bitrate.as_str());
-    if same && keep {
-        return Ok(fs::rename(&got, out)?);
+    if ext == cfg.format && keep {
+        return fs::rename(&got, out).or_else(|e| fs::remove_file(&got).and(Err(e))).map_err(Into::into);
     }
     let codecs = [("mp3", "libmp3lame"), ("flac", "flac"), ("ogg", "libvorbis"), ("opus", "libopus"), ("m4a", "aac")];
     let codec = codecs.iter().find(|c| c.0 == cfg.format).map_or("pcm_s16le", |c| c.1);
     let mut f = Command::new(&cfg.ffmpeg);
     f.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got).args(["-vn", "-map_metadata", "-1", "-c:a"]);
-    let codec = if same {
-        vec!["copy"]
-    } else if keep {
-        vec![codec]
-    } else {
-        vec![codec, "-b:a", &cfg.bitrate]
-    };
-    f.args(codec);
+    f.arg(codec);
+    if !keep {
+        f.args(["-b:a", &cfg.bitrate]);
+    }
     f.args(cfg.ffmpeg_args.iter().flat_map(|a| a.split_whitespace()));
-    let res = f.arg(out).output()?;
+    let temp = out.with_extension(format!("{id}.converted.{}", cfg.format));
+    let res = f.arg(&temp).output();
     let _ = fs::remove_file(&got);
-    let err = format!("ffmpeg: {}", String::from_utf8_lossy(&res.stderr).trim());
-    res.status.success().then_some(()).ok_or(err.into())
+    let res = res?;
+    if !res.status.success() {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("ffmpeg: {}", String::from_utf8_lossy(&res.stderr).trim()).into());
+    }
+    fs::rename(&temp, out).or_else(|e| fs::remove_file(&temp).and(Err(e))).map_err(Into::into)
 }
-
 fn finish(mut s: Song, op: &str, cfg: &Settings) -> R<(Song, PathBuf)> {
     let out = path(&s, cfg);
+    let detected = cfg.detect_formats.iter().map(|f| out.with_extension(f)).find(|p| p.is_file());
+    let mut target = if out.is_file() { out.clone() } else { detected.unwrap_or(out.clone()) };
     let archived =
         cfg.archive.as_ref().and_then(|a| fs::read_to_string(a).ok()).is_some_and(|a| a.lines().any(|l| l == s.url));
-    let skip = cfg.respect_skip_file && Path::new(&format!("{}.skip", out.display())).exists();
-    let exists = out.exists() || cfg.detect_formats.iter().any(|f| out.with_extension(f).exists());
-    if (op == "download" || op == "sync")
-        && (archived || skip || (exists && cfg.overwrite == "skip" && !cfg.force_update_metadata))
+    let archive = || {
+        cfg.archive.as_ref().map(|a| {
+            fs::OpenOptions::new().create(true).append(true).open(a).and_then(|mut f| writeln!(f, "{}", s.url))
+        })
+    };
+    let skip = cfg.respect_skip_file && Path::new(&format!("{}.skip", target.display())).exists();
+    let exists = target.is_file();
+    if matches!(op, "download" | "sync")
+        && (archived || skip || exists && cfg.overwrite == "skip" && !cfg.force_update_metadata)
     {
-        return Ok((s, out));
+        if exists && !archived {
+            archive().transpose()?;
+        }
+        return Ok((s, target));
     }
-    if s.download_url.is_none() && (op != "save" || cfg.preload) && !(exists && cfg.overwrite == "metadata") {
-        s.download_url = Some(search::find(&s, cfg)?);
-    }
+    let metadata_only = exists && cfg.overwrite == "metadata" && !cfg.redownload;
+    let candidates = match &s.download_url {
+        Some(u) => vec![u.clone()],
+        None if metadata_only && op != "save" && op != "url" => Vec::new(),
+        None => search::find(&s, cfg)?,
+    };
     if op == "save" || op == "url" {
-        return Ok((s, out));
+        s.download_url = candidates.first().cloned();
+        return Ok((s, target));
     }
     if !exists || cfg.overwrite == "force" || cfg.redownload {
         fs::create_dir_all(out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-        let url = s.download_url.as_deref().unwrap_or_default();
-        fetch(url, &out, cfg).or_else(|_| fetch(url, &out, cfg))?;
+        let id = if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
+        let mut error = None;
+        let url = candidates.iter().find_map(|u| {
+            fetch(u, &out, &id, cfg).inspect_err(|e| error = Some(e.to_string())).ok().map(|_| u.clone())
+        });
+        s.download_url = Some(url.ok_or_else(|| error.unwrap_or_else(|| "no match".into()))?);
+        target = out.clone();
     }
     s.lyrics = s.lyrics.clone().or_else(|| lyrics(&s, cfg));
-    tag(&out, &s, cfg)?;
+    tag(&target, &s, cfg)?;
     let lrc = s.lyrics.as_ref().filter(|l| cfg.generate_lrc && l.starts_with('['));
-    lrc.iter().try_for_each(|l| fs::write(out.with_extension("lrc"), l))?;
-    let append = |p: String, line: &str| {
-        OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| writeln!(f, "{line}"))
-    };
-    cfg.archive.iter().try_for_each(|a| append(a.clone(), &s.url))?;
-    cfg.create_skip_file.then(|| format!("{}.skip", out.display())).iter().try_for_each(|p| append(p.clone(), ""))?;
-    Ok((s, out))
+    lrc.iter().try_for_each(|l| fs::write(target.with_extension("lrc"), l))?;
+    cfg.create_skip_file.then(|| format!("{}.skip", target.display())).iter().try_for_each(|p| fs::write(p, ""))?;
+    archive().transpose().map(|_| (s, target)).map_err(Into::into)
 }
-
 pub fn process(s: Song, op: &str, cfg: &Settings) -> (Song, R<PathBuf>) {
     let label = format!("{} - {}", s.artists.join(", "), s.name);
     let res = finish(s.clone(), op, cfg);
     match &res {
         Ok((s, _)) if op == "url" => println!("{}", s.download_url.clone().unwrap_or_default()),
         Ok((_, p)) => println!("{label}: {}", p.display()),
-        Err(e) => eprintln!("{label}: {e}"),
+        Err(e) => {
+            eprintln!("{label}: {e}");
+            let _ = cfg.archive.as_ref().filter(|_| cfg.add_unavailable).and_then(|a| {
+                fs::OpenOptions::new().create(true).append(true).open(a).and_then(|mut f| writeln!(f, "{}", s.url)).ok()
+            });
+        }
     }
     res.map_or_else(|e| (s, Err(e)), |(s, p)| (s, Ok(p)))
 }
-
 pub fn prune(old: &[Song], new: &[Song], cfg: &Settings) {
     old.iter().for_each(|o| {
         let (from, to) = (path(o, cfg), new.iter().find(|n| n.url == o.url).map(|n| path(n, cfg)));
@@ -248,7 +269,6 @@ pub fn prune(old: &[Song], new: &[Song], cfg: &Settings) {
         let _ = lrc.then(|| fs::remove_file(from.with_extension("lrc")));
     });
 }
-
 pub fn meta(files: &[String], cfg: &Settings) -> R<()> {
     let exts = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
     let listed = files
