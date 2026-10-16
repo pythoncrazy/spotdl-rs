@@ -1,7 +1,13 @@
 use crate::{spotify::HTTP, Settings, Song, R};
 use serde_json::{json, Value};
-use std::{collections::HashSet, process::Command};
+use std::{
+    collections::HashSet,
+    process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 #[derive(Default)]
+
 pub struct Hit {
     url: String,
     name: String,
@@ -11,11 +17,62 @@ pub struct Hit {
     verified: bool,
     isrc: bool,
 }
+
 const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
+
+static YT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+static YT_ANNOUNCED: AtomicU64 = AtomicU64::new(0);
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn wait_youtube() {
+    loop {
+        let deadline = YT_BLOCKED.load(Ordering::Relaxed);
+        let seconds = deadline.saturating_sub(now());
+        if seconds == 0 {
+            return;
+        }
+        if YT_ANNOUNCED.swap(deadline, Ordering::Relaxed) != deadline {
+            eprintln!("YouTube blocked downloads. Waiting {seconds} s.");
+        }
+        std::thread::sleep(Duration::from_secs(seconds));
+    }
+}
+
+fn blocked(output: &Output) -> bool {
+    let error = String::from_utf8_lossy(&output.stderr);
+    error.contains("Sign in to confirm")
+        || error.contains("HTTP Error 429")
+        || error.contains("HTTP 429")
+        || error.contains("Too Many Requests")
+}
+
+fn backoff(retry: usize) {
+    let seconds =
+        std::env::var("SPOTDL_TEST_BACKOFF_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or([30, 60, 120][retry]);
+    YT_BLOCKED.fetch_max(now() + seconds, Ordering::Relaxed);
+}
+
+pub fn yt_output(cmd: &mut Command) -> R<Output> {
+    for retry in 0..=3 {
+        wait_youtube();
+        let output = cmd.output()?;
+        if !blocked(&output) || retry == 3 {
+            return Ok(output);
+        }
+        backoff(retry);
+    }
+    Err("YouTube retry limit".into())
+}
+
 pub fn slug(s: &str) -> String {
     let s = deunicode::deunicode(s).to_lowercase();
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-")
 }
+
 pub fn ratio(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let row = a.iter().fold(vec![0usize; b.len() + 1], |row, x| {
@@ -31,6 +88,7 @@ pub fn ratio(a: &str, b: &str) -> f64 {
         200.0 * row[b.len()] as f64 / n
     }
 }
+
 fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
     let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
     let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
@@ -71,8 +129,11 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
         })
         .collect())
 }
+
 fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
-    let out = Command::new(&cfg.yt_dlp).args(["--flat-playlist", "-J", "--no-warnings", search]).output()?;
+    let mut cmd = Command::new(&cfg.yt_dlp);
+    cmd.args(["--flat-playlist", "-J", "--no-warnings", search]);
+    let out = yt_output(&mut cmd)?;
     let v: Value = serde_json::from_slice(&out.stdout)?;
     let entries = v["entries"].as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
     Ok(entries
@@ -93,6 +154,7 @@ fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
         })
         .collect())
 }
+
 fn score(s: &Song, h: &Hit) -> f64 {
     let (rname, sname) = (slug(&h.name), slug(&s.name));
     let found = |a: &String| h.artists.iter().any(|r| ratio(&slug(a), &slug(r)) > 85.0) || rname.contains(&slug(a));
@@ -111,6 +173,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
+
 pub fn find(s: &Song, cfg: &Settings) -> R<Vec<String>> {
     let q = crate::download::fill(cfg.search_query.as_deref().unwrap_or("{artists} - {title}"), s, cfg);
     let rank = |h: Hit| (if cfg.filter_results { score(s, &h) } else { 100.0 }, h.url);
@@ -143,6 +206,7 @@ pub fn find(s: &Song, cfg: &Settings) -> R<Vec<String>> {
     let found: Vec<String> = found.into_iter().filter(|x| seen.insert(x.1.clone())).take(3).map(|x| x.1).collect();
     (!found.is_empty()).then_some(found).ok_or_else(|| format!("no match for {q}").into())
 }
+
 pub fn youtube(url: &str, cfg: &Settings) -> R<Vec<Song>> {
     let n = if url.contains("list=") && !url.contains("watch?") { usize::MAX } else { 1 };
     let hits = ytdlp(url, cfg)?.into_iter().take(n);

@@ -1,8 +1,16 @@
 # spotdl-rs
 
-Download audio for Spotify songs, albums, playlists, and artists.
+Use spotdl to download audio for Spotify tracks, albums, playlists, and artists.
 
-Install `yt-dlp` and `ffmpeg`. Add both tools to `PATH`.
+Install Python 3.10 or later. Python 3.11 or later is recommended.
+
+Install or update yt-dlp with `python -m pip install -U "yt-dlp[default]"`.
+Install Deno from https://deno.land. yt-dlp can use Deno to solve YouTube JavaScript checks.
+Keep yt-dlp and Deno up to date.
+
+Install ffmpeg. Add yt-dlp and ffmpeg to `PATH`.
+
+If YouTube asks you to sign in, pass a cookies file with `--cookie-file`.
 
 ```sh
 spotdl <Spotify URL>

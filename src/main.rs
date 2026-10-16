@@ -1,6 +1,9 @@
 mod download;
+
 mod search;
+
 mod spotify;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,49 +13,121 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"mp3","bitrate":"128k","overwrite":"skip","threads":16,"meta_threads":32,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"auth_token":null,"client_id":"","client_secret":"","no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"cache_path":null,"use_cache_file":false,"max_retries":3,"headless":false,"keep_sessions":false,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"user_auth":false,"use_official_api":false,"load_config":true}"#;
-#[rustfmt::skip]
-const ALIASES: [(&str, &str); 4] = [("audio", "audio_providers"), ("lyrics", "lyrics_providers"), ("genius_access_token", "genius_token"), ("dont_filter_results", "filter_results")];
+
+const ALIASES: [(&str, &str); 4] = [
+    ("audio", "audio_providers"),
+    ("lyrics", "lyrics_providers"),
+    ("genius_access_token", "genius_token"),
+    ("dont_filter_results", "filter_results"),
+];
+
 #[derive(Clone, Deserialize)]
-#[rustfmt::skip]
+
 pub struct Settings {
-    pub output: String, pub format: String, pub bitrate: String,
-    pub overwrite: String, pub threads: usize, pub meta_threads: usize,
-    pub ffmpeg: String, pub yt_dlp: String, pub audio_providers: Vec<String>,
-    pub lyrics_providers: Vec<String>, pub search_query: Option<String>, pub cookie_file: Option<String>,
-    pub proxy: Option<String>, pub yt_dlp_args: Option<String>, pub ffmpeg_args: Option<String>,
-    pub restrict: Option<String>, pub playlist_numbering: bool, pub playlist_retain_track_cover: bool,
-    pub m3u: Option<String>, pub archive: Option<String>, pub save_file: Option<String>,
-    pub filter_results: bool, pub album_type: Option<String>, pub print_errors: bool,
-    pub save_errors: Option<String>, pub sponsor_block: bool, pub preload: bool,
-    pub id3_separator: String, pub generate_lrc: bool, pub force_update_metadata: bool,
-    pub only_verified_results: bool, pub sync_without_deleting: bool, pub sync_remove_lrc: bool,
-    pub max_filename_length: usize, pub detect_formats: Vec<String>, pub ignore_albums: Vec<String>,
-    pub skip_explicit: bool, pub redownload: bool, pub skip_album_art: bool,
-    pub create_skip_file: bool, pub respect_skip_file: bool, pub auth_token: Option<String>,
-    pub client_id: String, pub client_secret: String, pub no_cache: bool,
-    pub max_retries: usize, pub fetch_albums: bool, pub add_unavailable: bool,
+    pub output: String,
+    pub format: String,
+    pub bitrate: String,
+    pub overwrite: String,
+    pub threads: usize,
+    pub meta_threads: usize,
+    pub ffmpeg: String,
+    pub yt_dlp: String,
+    pub audio_providers: Vec<String>,
+    pub lyrics_providers: Vec<String>,
+    pub search_query: Option<String>,
+    pub cookie_file: Option<String>,
+    pub proxy: Option<String>,
+    pub yt_dlp_args: Option<String>,
+    pub ffmpeg_args: Option<String>,
+    pub restrict: Option<String>,
+    pub playlist_numbering: bool,
+    pub playlist_retain_track_cover: bool,
+    pub m3u: Option<String>,
+    pub archive: Option<String>,
+    pub save_file: Option<String>,
+    pub filter_results: bool,
+    pub album_type: Option<String>,
+    pub print_errors: bool,
+    pub save_errors: Option<String>,
+    pub sponsor_block: bool,
+    pub preload: bool,
+    pub id3_separator: String,
+    pub generate_lrc: bool,
+    pub force_update_metadata: bool,
+    pub only_verified_results: bool,
+    pub sync_without_deleting: bool,
+    pub sync_remove_lrc: bool,
+    pub max_filename_length: usize,
+    pub detect_formats: Vec<String>,
+    pub ignore_albums: Vec<String>,
+    pub skip_explicit: bool,
+    pub redownload: bool,
+    pub skip_album_art: bool,
+    pub create_skip_file: bool,
+    pub respect_skip_file: bool,
+    pub auth_token: Option<String>,
+    pub client_id: String,
+    pub client_secret: String,
+    pub no_cache: bool,
+    pub max_retries: usize,
+    pub fetch_albums: bool,
+    pub add_unavailable: bool,
 }
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-#[rustfmt::skip]
 pub struct Song {
-    pub name: String, pub artists: Vec<String>, pub artist: String,
-    pub genres: Vec<String>, pub disc_number: u32, pub disc_count: u32,
-    pub album_name: String, pub album_artist: String, pub duration: f64,
-    pub year: u32, pub date: String, pub track_number: u32,
-    pub tracks_count: u32, pub song_id: String, pub explicit: bool,
-    pub publisher: String, pub url: String, pub isrc: Option<String>,
-    pub cover_url: Option<String>, pub copyright_text: Option<String>, pub download_url: Option<String>,
-    pub lyrics: Option<String>, pub popularity: Option<u64>, pub album_id: String,
-    pub list_name: Option<String>, pub list_url: Option<String>, pub list_position: Option<usize>,
-    pub list_length: Option<usize>, pub artist_id: String, pub album_type: String,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub artist: String,
+    pub genres: Vec<String>,
+    pub disc_number: u32,
+    pub disc_count: u32,
+    pub album_name: String,
+    pub album_artist: String,
+    pub duration: f64,
+    pub year: u32,
+    pub date: String,
+    pub track_number: u32,
+    pub tracks_count: u32,
+    pub song_id: String,
+    pub explicit: bool,
+    pub publisher: String,
+    pub url: String,
+    pub isrc: Option<String>,
+    pub cover_url: Option<String>,
+    pub copyright_text: Option<String>,
+    pub download_url: Option<String>,
+    pub lyrics: Option<String>,
+    pub popularity: Option<u64>,
+    pub album_id: String,
+    pub list_name: Option<String>,
+    pub list_url: Option<String>,
+    pub list_position: Option<usize>,
+    pub list_length: Option<usize>,
+    pub artist_id: String,
+    pub album_type: String,
+    #[serde(skip)]
+    pub original_date: String,
+    #[serde(skip)]
+    pub upc: String,
+    #[serde(skip)]
+    pub bpm: f64,
+    #[serde(skip)]
+    pub gain: f64,
+    #[serde(skip)]
+    pub deezer_track_id: String,
 }
+
 pub fn home() -> PathBuf {
     let home = PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_default());
     [home.join(".config/spotdl"), home.join(".spotdl")].into_iter().find(|p| p.exists()).unwrap_or(home.join(".spotdl"))
 }
+
 fn settings() -> R<(String, Vec<String>, Settings)> {
     let mut raw: Value = serde_json::from_str(DEFAULTS)?;
     let file = fs::read(home().join("config.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
@@ -92,6 +167,7 @@ fn settings() -> R<(String, Vec<String>, Settings)> {
     let op = if known { positional.remove(0) } else { "download".into() };
     Ok((op, positional, serde_json::from_value(raw)?))
 }
+
 fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
     let len = songs.len();
     songs.iter_mut().enumerate().filter(|(_, s)| cfg.playlist_numbering && s.list_name.is_some()).for_each(|(i, s)| {
@@ -108,6 +184,7 @@ fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
         .filter(|s| !cfg.ignore_albums.iter().any(|a| s.album_name.to_lowercase().contains(&a.to_lowercase())))
         .collect()
 }
+
 fn run() -> R<()> {
     let (op, original, cfg) = settings()?;
     let flag = |f: &str| std::env::args().any(|a| a == f);
@@ -135,7 +212,7 @@ fn run() -> R<()> {
         .par_iter()
         .flat_map_iter(|q| {
             number(
-                spotify::resolve(q, &cfg)
+                spotify::resolve(q, &cfg, op != "save" && op != "url")
                     .inspect_err(|e| errors.lock().unwrap().push(format!("{q}: {e}")))
                     .unwrap_or_default(),
                 &cfg,
@@ -144,7 +221,12 @@ fn run() -> R<()> {
         .collect();
     if cfg.fetch_albums {
         let ids: HashSet<_> = songs.iter().map(|s| s.album_id.clone()).filter(|id| !id.is_empty()).collect();
-        let album = |id| number(spotify::resolve(&format!("spotify:album:{id}"), &cfg).unwrap_or_default(), &cfg);
+        let album = |id| {
+            number(
+                spotify::resolve(&format!("spotify:album:{id}"), &cfg, op != "save" && op != "url").unwrap_or_default(),
+                &cfg,
+            )
+        };
         songs.extend(ids.par_iter().flat_map_iter(album).collect::<Vec<_>>());
     }
     let mut seen = HashSet::new();
@@ -201,6 +283,7 @@ fn run() -> R<()> {
     eprintln!("{} succeeded, {} failed", done.iter().filter(|(_, r)| r.is_ok()).count(), errors.len());
     errors.is_empty().then_some(()).ok_or_else(|| format!("{} downloads failed", errors.len()).into())
 }
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
