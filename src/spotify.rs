@@ -2,12 +2,15 @@ use crate::{home, Settings, Song, R};
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::fs;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::PathBuf,
+    process::Command,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const UA: &str =
@@ -278,73 +281,155 @@ fn deezer_album(uri: &str, album: &Value, cfg: &Settings) -> Option<Value> {
     Some(result)
 }
 
-fn official_token(cfg: &Settings) -> R<String> {
+fn base64(value: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::new();
+    for chunk in value.chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or_default() as usize;
+        let c = chunk.get(2).copied().unwrap_or_default() as usize;
+        encoded.push(TABLE[a >> 2] as char);
+        encoded.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
+        encoded.push(if chunk.len() > 1 { TABLE[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
+        encoded.push(if chunk.len() > 2 { TABLE[c & 63] as char } else { '=' });
+    }
+    encoded
+}
+
+fn token_request(cfg: &Settings, fields: &[(&str, &str)]) -> R<Value> {
+    let credentials = base64(format!("{}:{}", cfg.client_id, cfg.client_secret).as_bytes());
+    let mut response = HTTP
+        .post("https://accounts.spotify.com/api/token")
+        .header("Authorization", format!("Basic {credentials}"))
+        .send_form(fields.iter().copied())?;
+    Ok(response.body_mut().read_json()?)
+}
+
+fn authorization_code(cfg: &Settings, state: &str) -> R<String> {
+    let listener = TcpListener::bind("127.0.0.1:9900")?;
+    let callback = "http://127.0.0.1:9900/";
+    let scope = "user-library-read user-follow-read playlist-read-private";
+    let url = format!(
+        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&state={state}",
+        crate::url_encode(&cfg.client_id),
+        crate::url_encode(callback),
+        crate::url_encode(scope),
+    );
+    if cfg.headless {
+        println!("{url}");
+    } else {
+        let mut browser = if cfg!(target_os = "macos") {
+            Command::new("open").arg(&url).spawn()
+        } else if cfg!(windows) {
+            Command::new("cmd").args(["/C", "start", ""]).arg(&url).spawn()
+        } else {
+            Command::new("xdg-open").arg(&url).spawn()
+        };
+        if browser.as_mut().is_err() {
+            println!("{url}");
+        }
+    }
+    crate::log(cfg, "INFO", "Waiting for Spotify authorization at 127.0.0.1:9900");
+    let (mut stream, _) = listener.accept()?;
+    let mut request = [0; 8192];
+    let length = stream.read(&mut request)?;
+    let request = String::from_utf8_lossy(&request[..length]);
+    let route =
+        request.lines().next().and_then(|line| line.split_whitespace().nth(1)).ok_or("invalid OAuth callback")?;
+    let query = route.split_once('?').map_or("", |(_, query)| query);
+    let parameter = |name: &str| query.split('&').find_map(|part| part.strip_prefix(&format!("{name}=")));
+    if parameter("state") != Some(state) {
+        let body = b"Invalid Spotify OAuth state";
+        write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n", body.len())?;
+        stream.write_all(body)?;
+        return Err("Spotify OAuth state did not match".into());
+    }
+    let code = parameter("code").ok_or("Spotify did not return an authorization code")?.to_string();
+    let body = b"Spotify login complete. You can close this tab.";
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())?;
+    stream.write_all(body)?;
+    Ok(code)
+}
+
+pub(crate) fn token(cfg: &Settings, user_auth: bool) -> R<String> {
     if let Some(token) = &cfg.auth_token {
         return Ok(token.clone());
     }
-    let mut token = TOKEN.lock().map_err(|error| error.to_string())?;
-    if let Some((value, _)) = token.as_ref().filter(|(_, expires)| *expires > Instant::now()) {
+    let mut current = TOKEN.lock().map_err(|error| error.to_string())?;
+    if let Some((value, _)) = current.as_ref().filter(|(_, expires)| *expires > Instant::now()) {
         return Ok(value.clone());
     }
     let path = cfg.cache_path.as_ref().map(PathBuf::from).unwrap_or_else(|| home().join(".spotipy"));
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    if !cfg.no_cache {
-        if let Some(cache) = fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
-            if cache["expires_at"].as_u64().is_some_and(|expiry| expiry > now + 30) {
-                if let Some(value) = cache["access_token"].as_str() {
-                    *token = Some((
-                        value.into(),
-                        Instant::now() + Duration::from_secs(cache["expires_at"].as_u64().unwrap_or(now) - now),
-                    ));
-                    return Ok(value.into());
-                }
-            }
-        }
+    let cache = if cfg.no_cache {
+        None
+    } else {
+        fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    if let Some(value) = cache
+        .as_ref()
+        .filter(|cache| cache["expires_at"].as_u64().is_some_and(|expiry| expiry > now + 30))
+        .and_then(|cache| cache["access_token"].as_str())
+    {
+        let expiry = cache.as_ref().and_then(|cache| cache["expires_at"].as_u64()).unwrap_or(now);
+        *current = Some((value.into(), Instant::now() + Duration::from_secs(expiry - now)));
+        return Ok(value.into());
     }
-    let creds =
-        [("grant_type", "client_credentials"), ("client_id", &cfg.client_id), ("client_secret", &cfg.client_secret)];
-    let response: Value =
-        HTTP.post("https://accounts.spotify.com/api/token").send_form(creds)?.body_mut().read_json()?;
-    let value = response["access_token"].as_str().ok_or("official Spotify login failed")?.to_string();
+    let response = if let Some(refresh) = cache.as_ref().and_then(|cache| cache["refresh_token"].as_str()) {
+        token_request(cfg, &[("grant_type", "refresh_token"), ("refresh_token", refresh)])?
+    } else if user_auth {
+        let state = format!("{now:x}");
+        let code = authorization_code(cfg, &state)?;
+        token_request(
+            cfg,
+            &[("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", "http://127.0.0.1:9900/")],
+        )?
+    } else {
+        token_request(cfg, &[("grant_type", "client_credentials")])?
+    };
+    let access = response["access_token"].as_str().ok_or("Spotify did not return an access token")?.to_string();
     let expires_in = response["expires_in"].as_u64().unwrap_or(3600);
-    *token = Some((value.clone(), Instant::now() + Duration::from_secs(expires_in)));
+    let expires_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + expires_in;
+    *current = Some((access.clone(), Instant::now() + Duration::from_secs(expires_in)));
     if !cfg.no_cache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_vec(&json!({"access_token": value, "expires_at": now + expires_in}))?)?;
+        let mut cached = json!({"access_token": access, "expires_at": expires_at});
+        if let Some(refresh) = response["refresh_token"]
+            .as_str()
+            .or_else(|| cache.as_ref().and_then(|cache| cache["refresh_token"].as_str()))
+        {
+            cached["refresh_token"] = json!(refresh);
+        }
+        fs::write(path, serde_json::to_vec(&cached)?)?;
     }
-    Ok(value)
-}
-
-fn official_page(url: &str, token: &str, cfg: &Settings) -> R<Value> {
-    crate::retry(
-        cfg.max_retries.saturating_add(1),
-        |_| {
-            let page: Value =
-                HTTP.get(url).header("Authorization", format!("Bearer {token}")).call()?.body_mut().read_json()?;
-            Ok(page)
-        },
-        |error| {
-            let message = error.to_string();
-            ["429", "500", "502", "503", "504"]
-                .iter()
-                .any(|status| message.contains(status))
-                .then_some(Duration::from_secs(1))
-        },
-    )
+    Ok(access)
 }
 
 fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
     let cache_key = format!("official:{url}");
     if let Some(cached) = read_persistent(&cache_key, cfg).and_then(|value| value.as_array().cloned()) {
-        return Ok(cached);
+        return Ok(normalize_official(cached));
     }
-    let token = official_token(cfg)?;
+    let token = token(cfg, false)?;
     let mut next = Some(format!("https://api.spotify.com/v1/{url}"));
     let mut items = Vec::new();
     while let Some(u) = next {
-        let page = official_page(&u, &token, cfg)?;
+        let page: Value = crate::retry(
+            cfg.max_retries.saturating_add(1),
+            |_| {
+                let mut response = HTTP.get(&u).header("Authorization", format!("Bearer {token}")).call()?;
+                Ok(response.body_mut().read_json::<Value>()?)
+            },
+            |error| {
+                let message = error.to_string();
+                ["429", "500", "502", "503", "504"]
+                    .iter()
+                    .any(|status| message.contains(status))
+                    .then_some(Duration::from_secs(1))
+            },
+        )?;
         let result =
             ["tracks", "albums", "artists", "playlists", "shows"].iter().find_map(|key| page.get(key)).unwrap_or(&page);
         items.extend(result["items"].as_array().cloned().unwrap_or_default());
@@ -353,21 +438,9 @@ fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
         }
         next = result["next"].as_str().map(String::from);
     }
+    let items = normalize_official(items);
     write_persistent(&cache_key, &json!(items), cfg)?;
     Ok(items)
-}
-
-fn encode_query(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
 }
 
 fn pathfinder_track(mut track: Value) -> Value {
@@ -388,10 +461,25 @@ fn pathfinder_track(mut track: Value) -> Value {
     track
 }
 
+fn normalize_official(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            if item["track"]["duration"].is_null() && item["track"]["duration_ms"].is_number() {
+                item["track"] = pathfinder_track(item["track"].take());
+                item
+            } else if item["duration"].is_null() && item["duration_ms"].is_number() {
+                pathfinder_track(item)
+            } else {
+                item
+            }
+        })
+        .collect()
+}
+
 fn official_search(term: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
-    let results = official(&format!("search?q={}&type=track&limit=10", encode_query(term)), cfg)?;
+    let results = official(&format!("search?q={}&type=track&limit=10", crate::url_encode(term)), cfg)?;
     let track = results.into_iter().next().ok_or("no Spotify results")?;
-    let track = pathfinder_track(track);
     let album = track["album"]["uri"].as_str().unwrap_or_default().to_string();
     build(vec![(track, album)], None, cfg, enrich)
 }
@@ -462,12 +550,11 @@ fn build(tracks: Vec<(Value, String)>, list: Option<&PlaylistInfo<'_>>, cfg: &Se
             let pair = albums.get(a);
             let al = pair.map_or(&Value::Null, |v| &v.0);
             let dz = pair.map_or(&Value::Null, |v| &v.1);
-            let artists: Vec<String> =
-                [&t["artists"]["items"], &t["firstArtist"]["items"], &t["otherArtists"]["items"]]
-                    .into_iter()
-                    .flat_map(|value| value.as_array().into_iter().flatten())
-                    .filter_map(|artist| artist["profile"]["name"].as_str().map(String::from))
-                    .collect();
+            let artists: Vec<String> = [&t["firstArtist"]["items"], &t["otherArtists"]["items"]]
+                .into_iter()
+                .flat_map(|value| value.as_array().into_iter().flatten())
+                .filter_map(|artist| artist["profile"]["name"].as_str().map(String::from))
+                .collect();
             let date = al["date"]["isoString"].as_str().unwrap_or_default().get(..10).unwrap_or_default().to_string();
             let covers = al["coverArt"]["sources"].as_array().into_iter().flatten();
             let track_key =
@@ -491,11 +578,7 @@ fn build(tracks: Vec<(Value, String)>, list: Option<&PlaylistInfo<'_>>, cfg: &Se
                 disc_number: t["discNumber"].as_u64().unwrap_or(1) as u32,
                 disc_count: al["discs"]["totalCount"].as_u64().unwrap_or(1) as u32,
                 album_name: al["name"].as_str().unwrap_or_default().into(),
-                duration: t["duration"]["totalMilliseconds"]
-                    .as_f64()
-                    .or(t["trackDuration"]["totalMilliseconds"].as_f64())
-                    .unwrap_or_default()
-                    / 1000.0,
+                duration: t["duration"]["totalMilliseconds"].as_f64().unwrap_or_default() / 1000.0,
                 year: date.get(..4).and_then(|y| y.parse().ok()).unwrap_or_default(),
                 date,
                 track_number: t["trackNumber"].as_u64().unwrap_or(1) as u32,
@@ -533,6 +616,11 @@ fn build(tracks: Vec<(Value, String)>, list: Option<&PlaylistInfo<'_>>, cfg: &Se
         .collect())
 }
 
+fn unique_songs(songs: Vec<Song>) -> Vec<Song> {
+    let mut seen = HashSet::new();
+    songs.into_iter().filter(|song| seen.insert((song.name.to_lowercase(), song.artists.clone()))).collect()
+}
+
 fn album(uri: &str, cfg: &Settings) -> R<Vec<(Value, String)>> {
     let (mut meta, items) = pages("getAlbum", uri, "/data/albumUnion/tracksV2", PAGE, cfg)?;
     meta["tracksV2"]["items"] = Value::Null;
@@ -549,9 +637,7 @@ fn artist(uri: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
         .filter(|uri| seen.insert(*uri))
         .collect();
     let tracks: Vec<(Value, String)> = albums.par_iter().flat_map(|a| album(a, cfg).unwrap_or_default()).collect();
-    let mut seen = std::collections::HashSet::new();
-    let songs = build(tracks, None, cfg, enrich)?.into_iter();
-    Ok(songs.filter(|s| seen.insert((s.name.to_lowercase(), s.artists.clone()))).collect())
+    Ok(unique_songs(build(tracks, None, cfg, enrich)?))
 }
 
 fn official_artist(uri: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
@@ -574,15 +660,13 @@ fn official_artist(uri: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
                 .into_iter()
                 .map(|mut track| {
                     track["album"] = json!({"uri": album_uri});
-                    (pathfinder_track(track), album_uri.to_string())
+                    (track, album_uri.to_string())
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
         })
         .collect();
-    let mut seen_tracks = HashSet::new();
-    let songs = build(tracks, None, cfg, enrich)?.into_iter();
-    Ok(songs.filter(|song| seen_tracks.insert((song.name.to_lowercase(), song.artists.clone()))).collect())
+    Ok(unique_songs(build(tracks, None, cfg, enrich)?))
 }
 
 fn uri(query: &str) -> Option<String> {
@@ -601,6 +685,31 @@ fn playlist_songs(playlists: &[Value], cfg: &Settings, enrich: bool) -> Vec<Song
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum UrlKind {
+    Youtube,
+    Source,
+}
+
+const URL_DISPATCH: &[(&str, UrlKind)] =
+    &[("youtube.com/", UrlKind::Youtube), ("youtu.be/", UrlKind::Youtube), ("soundcloud.com/", UrlKind::Source)];
+
+fn resolve_url(query: &str, cfg: &Settings, enrich: bool) -> Option<R<Vec<Song>>> {
+    let kind = URL_DISPATCH.iter().find(|(prefix, _)| query.contains(prefix))?.1;
+    Some(match kind {
+        UrlKind::Youtube => crate::search::youtube(query, cfg, enrich),
+        UrlKind::Source => crate::search::source(query, cfg),
+    })
+}
+
+fn expand_shortlink(query: &str) -> R<String> {
+    if !query.contains("spotify.link") {
+        return Ok(query.to_string());
+    }
+    let response = HTTP.get(query).call()?;
+    Ok(ureq::ResponseExt::get_uri(&response).to_string())
+}
+
 fn paired_youtube(yt: &str, spotify: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
     if !yt.contains("playlist?list=") && !yt.contains("browse/VLPL") {
         return Ok(resolve(spotify, cfg, enrich)?
@@ -614,7 +723,7 @@ fn paired_youtube(yt: &str, spotify: &str, cfg: &Settings, enrich: bool) -> R<Ve
         1,
     );
     let ytm_songs = crate::search::source(&ytm_url, cfg)?;
-    let mut songs = resolve(spotify, cfg, enrich)?;
+    let songs = resolve(spotify, cfg, enrich)?;
     if songs.len() != ytm_songs.len() {
         return Err(format!(
             "YouTube Music ({}) and Spotify ({}) lists have different lengths",
@@ -624,7 +733,7 @@ fn paired_youtube(yt: &str, spotify: &str, cfg: &Settings, enrich: bool) -> R<Ve
         .into());
     }
     Ok(songs
-        .drain(..)
+        .into_iter()
         .zip(ytm_songs)
         .map(|(mut spotify_song, ytm_song)| {
             if cfg.ytm_data {
@@ -642,27 +751,17 @@ fn paired_youtube(yt: &str, spotify: &str, cfg: &Settings, enrich: bool) -> R<Ve
 
 pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
     if q.ends_with(".spotdl") {
-        let v: Value = serde_json::from_slice(&fs::read(q)?)?;
-        return Ok(serde_json::from_value(v.get("songs").cloned().unwrap_or(v))?);
+        let mut value: Value = serde_json::from_slice(&fs::read(q)?)?;
+        let songs = value.get_mut("songs").map(Value::take).unwrap_or(value);
+        return Ok(serde_json::from_value(songs)?);
     }
     if let Some((yt, sp)) = q.split_once('|') {
         return paired_youtube(yt, sp, cfg, enrich);
     }
-    if q.contains("youtube.com/") || q.contains("youtu.be/") {
-        return crate::search::youtube(q, cfg, enrich);
+    if let Some(result) = resolve_url(q, cfg, enrich) {
+        return result;
     }
-    if q.contains("soundcloud.com/") {
-        return crate::search::source(q, cfg);
-    }
-    if q.contains("bandcamp.com/") {
-        return crate::search::source(q, cfg);
-    }
-    if q.contains("piped.video/watch") {
-        let id = q.split_once("v=").and_then(|(_, value)| value.split('&').next()).unwrap_or_default();
-        return crate::search::youtube(&format!("https://www.youtube.com/watch?v={id}"), cfg, enrich);
-    }
-    let short = q.contains("spotify.link").then(|| HTTP.get(q).call()).transpose()?;
-    let q = short.map_or(q.to_string(), |r| ureq::ResponseExt::get_uri(&r).to_string());
+    let q = expand_shortlink(q)?;
     if let Some(user) = q
         .split_once("open.spotify.com/user/")
         .map(|(_, path)| path.split('/').next().and_then(|value| value.split('?').next()).unwrap_or_default())
@@ -671,17 +770,7 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
         return Ok(playlist_songs(&playlists, cfg, enrich));
     }
     let lib = |path: &str, key: &str| -> R<Vec<Value>> {
-        Ok(official(path, cfg)?
-            .into_iter()
-            .map(|mut x| {
-                let value = x[key].take();
-                if key == "track" {
-                    pathfinder_track(value)
-                } else {
-                    value
-                }
-            })
-            .collect())
+        Ok(official(path, cfg)?.into_iter().map(|mut value| value[key].take()).collect())
     };
     match q.as_str() {
         "saved" => {
@@ -752,7 +841,6 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
             if cfg.use_official_api {
                 let id = uri.rsplit(':').next().unwrap_or_default();
                 let track = official(&format!("tracks/{id}"), cfg)?.into_iter().next().ok_or("no Spotify track")?;
-                let track = pathfinder_track(track);
                 let album = track["album"]["uri"].as_str().unwrap_or_default().to_string();
                 return build(vec![(track, album)], None, cfg, enrich);
             }
@@ -767,7 +855,7 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
                 .into_iter()
                 .map(|mut track| {
                     track["album"]["uri"] = json!(uri);
-                    (pathfinder_track(track), uri.clone())
+                    (track, uri.clone())
                 })
                 .collect();
             build(tracks, None, cfg, enrich)
@@ -791,7 +879,7 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
                 .filter_map(|mut item| {
                     let track = item["track"].take();
                     let album = track["album"]["uri"].as_str()?.to_string();
-                    Some((pathfinder_track(track), album))
+                    Some((track, album))
                 })
                 .collect();
             build(tracks, Some(&list), cfg, enrich)

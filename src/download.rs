@@ -10,6 +10,8 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
+    sync::LazyLock,
+    time::Duration,
 };
 
 pub fn clean(s: &str) -> String {
@@ -78,44 +80,74 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
 
-fn lyrics(s: &Song, cfg: &Settings) -> Option<String> {
-    let page = |r: ureq::RequestBuilder<ureq::typestate::WithoutBody>| r.call().ok()?.body_mut().read_to_string().ok();
-    cfg.lyrics_providers.iter().find_map(|p| {
-        let text = match p.as_str() {
-            "synced" => {
-                let r = HTTP
-                    .get("https://lrclib.net/api/search")
-                    .query("artist_name", &s.artist)
-                    .query("track_name", &s.name);
-                let v: Vec<Value> = r.call().ok()?.body_mut().read_json().ok()?;
-                let hit = v.iter().find(|x| (x["duration"].as_f64().unwrap_or_default() - s.duration).abs() < 4.0)?;
-                hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
-            }
-            "genius" => {
-                let mut r =
-                    HTTP.get("https://genius.com/api/search/song").query("q", format!("{} {}", s.artist, s.name));
-                if !cfg.genius_token.is_empty() {
-                    r = r.header("Authorization", format!("Bearer {}", cfg.genius_token));
-                }
-                let v: Value = r.call().ok()?.body_mut().read_json().ok()?;
-                let url = v["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
-                html(&page(HTTP.get(url))?, "data-lyrics-container=\"true\"", "LyricsFooter")?
-            }
-            "azlyrics" => {
-                let key = |x: &str| search::slug(x).replace('-', "");
-                let url = format!("https://www.azlyrics.com/lyrics/{}/{}.html", key(&s.artist), key(&s.name));
-                html(&page(HTTP.get(&url))?, "<!-- Usage of azlyrics.com", "</div>")?
-            }
-            "musixmatch" => {
-                let url =
-                    format!("https://www.musixmatch.com/lyrics/{}/{}", search::slug(&s.artist), search::slug(&s.name));
-                let body = page(HTTP.get(&url))?.split_once("\"body\":")?.1.to_string();
-                serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
-            }
-            _ => return None,
-        };
-        Some(text.trim().to_string()).filter(|t| !t.is_empty())
-    })
+static LYRICS_HTTP: LazyLock<ureq::Agent> =
+    LazyLock::new(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into());
+
+fn lyric_page(url: &str) -> Option<String> {
+    let mut response = LYRICS_HTTP.get(url).call().ok()?;
+    response.body_mut().read_to_string().ok()
+}
+
+fn lyric_json<T: serde::de::DeserializeOwned>(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> Option<T> {
+    let mut response = request.call().ok()?;
+    response.body_mut().read_json().ok()
+}
+
+fn lyrics_from_provider(provider: &str, song: &Song, cfg: &Settings) -> Option<String> {
+    let text = match provider {
+        "synced" => {
+            let request = LYRICS_HTTP
+                .get("https://lrclib.net/api/search")
+                .query("artist_name", &song.artist)
+                .query("track_name", &song.name);
+            let tracks: Vec<Value> = lyric_json(request)?;
+            let hit = tracks
+                .iter()
+                .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
+            hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
+        }
+        "genius" => {
+            let request = LYRICS_HTTP
+                .get("https://genius.com/api/search/song")
+                .query("q", format!("{} {}", song.artist, song.name));
+            let request = if cfg.genius_token.is_empty() {
+                request
+            } else {
+                request.header("Authorization", format!("Bearer {}", cfg.genius_token))
+            };
+            let response: Value = lyric_json(request)?;
+            let url = response["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
+            html(&lyric_page(url)?, "data-lyrics-container=\"true\"", "LyricsFooter")?
+        }
+        "azlyrics" => {
+            let artist = search::slug(&song.artist).replace('-', "");
+            let title = search::slug(&song.name).replace('-', "");
+            let url = format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html");
+            html(&lyric_page(&url)?, "<!-- Usage of azlyrics.com", "</div>")?
+        }
+        "musixmatch" => {
+            let url = format!(
+                "https://www.musixmatch.com/lyrics/{}/{}",
+                search::slug(&song.artist),
+                search::slug(&song.name)
+            );
+            let body = lyric_page(&url)?.split_once("\"body\":")?.1.to_string();
+            serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
+        }
+        _ => return None,
+    };
+    Some(text.trim().to_string()).filter(|text| !text.is_empty())
+}
+
+fn lyrics(song: &Song, cfg: &Settings) -> Option<String> {
+    for provider in &cfg.lyrics_providers {
+        if let Some(text) = lyrics_from_provider(provider, song, cfg) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn tag(file: &Path, s: &Song, cfg: &Settings) -> R<()> {
@@ -343,8 +375,7 @@ fn finish(s: &mut Song, op: &str, cfg: &Settings) -> R<PathBuf> {
         s.lyrics = lyrics(s, cfg);
     }
     tag(&target, s, cfg)?;
-    let lrc = s.lyrics.as_ref().filter(|l| cfg.generate_lrc && l.starts_with('['));
-    lrc.iter().try_for_each(|l| fs::write(target.with_extension("lrc"), l))?;
+    write_lrc(&target, s, cfg)?;
     cfg.create_skip_file.then(|| format!("{}.skip", target.display())).iter().try_for_each(|p| fs::write(p, ""))?;
     append_archive(s, cfg)?;
     Ok(target)
@@ -394,25 +425,22 @@ pub fn prune(old: &[Song], new: &[Song], cfg: &Settings) {
     });
 }
 
-fn tag_text(tag: &Tag, key: &ItemKey) -> Option<String> {
-    tag.get(key).and_then(|item| item.value().text()).map(String::from)
-}
-
-fn tag_locator(tag: &Tag, key: &ItemKey) -> Option<String> {
-    tag.get(key).and_then(|item| item.value().locator()).map(String::from)
+fn tag_value(tag: &Tag, key: &ItemKey) -> Option<String> {
+    let value = tag.get(key)?.value();
+    value.text().or_else(|| value.locator()).map(String::from)
 }
 
 fn metadata_complete(tag: &Tag) -> bool {
     tag.title().is_some_and(|value| !value.is_empty())
         && tag.artist().is_some_and(|value| !value.is_empty())
-        && tag_text(tag, &ItemKey::TrackArtists).is_some_and(|value| !value.is_empty())
-        && tag_text(tag, &ItemKey::Lyrics).is_some_and(|value| !value.is_empty())
+        && tag_value(tag, &ItemKey::TrackArtists).is_some_and(|value| !value.is_empty())
+        && tag_value(tag, &ItemKey::Lyrics).is_some_and(|value| !value.is_empty())
         && !tag.pictures().is_empty()
 }
 
 fn song_from_tag(tag: &Tag, cfg: &Settings) -> Song {
     let artist = tag.artist().unwrap_or_default().to_string();
-    let artists = tag_text(tag, &ItemKey::TrackArtists)
+    let artists = tag_value(tag, &ItemKey::TrackArtists)
         .map(|value| {
             let separator = if value.contains('\0') { "\0" } else { cfg.id3_separator.as_str() };
             value.split(separator).map(str::to_string).collect()
@@ -422,14 +450,14 @@ fn song_from_tag(tag: &Tag, cfg: &Settings) -> Song {
         name: tag.title().unwrap_or_default().into(),
         artists,
         artist,
-        url: tag_locator(tag, &ItemKey::AudioFileUrl).unwrap_or_default(),
+        url: tag_value(tag, &ItemKey::AudioFileUrl).unwrap_or_default(),
         download_url: tag.comment().map(String::from),
         ..Song::default()
     }
 }
 
-fn write_lrc(file: &Path, song: &Song) -> R<()> {
-    if let Some(lyrics) = song.lyrics.as_deref().filter(|text| text.starts_with('[')) {
+fn write_lrc(file: &Path, song: &Song, cfg: &Settings) -> R<()> {
+    if let Some(lyrics) = song.lyrics.as_deref().filter(|text| cfg.generate_lrc && text.starts_with('[')) {
         fs::write(file.with_extension("lrc"), lyrics)?;
     }
     Ok(())
@@ -441,8 +469,7 @@ fn redownload_song(song: Song, cfg: &Settings) -> R<()> {
     } else {
         vec![song]
     };
-    for song in songs {
-        let (_, result) = process(song, "download", cfg);
+    for (_, result) in crate::download_songs(songs, "download", cfg)? {
         result?;
     }
     Ok(())
@@ -451,15 +478,16 @@ fn redownload_song(song: Song, cfg: &Settings) -> R<()> {
 fn meta_file(file: &Path, cfg: &Settings) -> R<()> {
     let tags = lofty::read_from_path(file)?;
     let primary = tags.primary_tag().ok_or("no tags")?;
-    let url = tag_locator(primary, &ItemKey::AudioFileUrl).filter(|value| value.contains("spotify"));
     let query =
-        url.unwrap_or(format!("{} - {}", primary.artist().unwrap_or_default(), primary.title().unwrap_or_default()));
+        tag_value(primary, &ItemKey::AudioFileUrl).filter(|value| value.contains("spotify")).unwrap_or_else(|| {
+            format!("{} - {}", primary.artist().unwrap_or_default(), primary.title().unwrap_or_default())
+        });
     let complete = metadata_complete(primary);
     let needs_lrc = cfg.generate_lrc && !file.with_extension("lrc").exists();
     if complete && !cfg.force_update_metadata && !cfg.redownload && !needs_lrc {
         return Ok(());
     }
-    let stored_lyrics = tag_text(primary, &ItemKey::Lyrics);
+    let stored_lyrics = tag_value(primary, &ItemKey::Lyrics);
     let mut song = if complete && !cfg.force_update_metadata && !cfg.redownload {
         song_from_tag(primary, cfg)
     } else {
@@ -469,8 +497,8 @@ fn meta_file(file: &Path, cfg: &Settings) -> R<()> {
     if !complete || cfg.force_update_metadata {
         tag(file, &song, cfg)?;
     }
-    if cfg.generate_lrc && !file.with_extension("lrc").exists() {
-        write_lrc(file, &song)?;
+    if needs_lrc {
+        write_lrc(file, &song, cfg)?;
     }
     if cfg.redownload {
         redownload_song(song, cfg)?;

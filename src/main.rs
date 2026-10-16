@@ -10,8 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    io::{Read, Write},
-    net::TcpListener,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -233,7 +232,7 @@ fn settings() -> R<(String, Vec<String>, Settings)> {
     let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
     let op = if known { positional.remove(0) } else { "download".into() };
     let cfg: Settings = serde_json::from_value(raw)?;
-    let audio = ["youtube-music", "youtube", "soundcloud", "bandcamp", "piped"];
+    let audio = ["youtube-music", "youtube", "soundcloud"];
     if let Some(provider) = cfg.audio_providers.iter().find(|provider| !audio.contains(&provider.as_str())) {
         return Err(format!("unknown audio provider: {provider}").into());
     }
@@ -263,87 +262,116 @@ fn set_executable(path: &Path) -> R<()> {
     Ok(())
 }
 
-fn download_ffmpeg() -> R<PathBuf> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let url = match (os, arch) {
-        ("windows", "x86_64") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/win32-x64",
-        ("windows", "x86") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/win32-ia32",
-        ("linux", "x86_64") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-x64",
-        ("linux", "x86") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-ia32",
-        ("linux", "arm") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-arm",
-        ("linux", "aarch64") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-arm64",
-        ("macos", "x86_64") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/darwin-x64",
-        ("macos", "aarch64") => "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/darwin-arm64",
-        _ => return Err("FFmpeg binary is not available for your system".into()),
-    };
+const FFMPEG_SOURCES: &[(&str, &str, &str)] = &[
+    ("windows", "x86_64", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/win32-x64"),
+    ("windows", "x86", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/win32-ia32"),
+    ("linux", "x86_64", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-x64"),
+    ("linux", "x86", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-ia32"),
+    ("linux", "arm", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-arm"),
+    ("linux", "aarch64", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/linux-arm64"),
+    ("macos", "x86_64", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/darwin-x64"),
+    ("macos", "aarch64", "https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/darwin-arm64"),
+];
+
+const DENO_TARGETS: &[(&str, &str, &str)] = &[
+    ("windows", "x86_64", "x86_64-pc-windows-msvc"),
+    ("windows", "aarch64", "aarch64-pc-windows-msvc"),
+    ("linux", "x86_64", "x86_64-unknown-linux-gnu"),
+    ("linux", "aarch64", "aarch64-unknown-linux-gnu"),
+    ("macos", "x86_64", "x86_64-apple-darwin"),
+    ("macos", "aarch64", "aarch64-apple-darwin"),
+];
+
+fn download_and_unpack(url: &str, path: &Path, member: Option<&str>) -> R<PathBuf> {
     fs::create_dir_all(home())?;
-    let path = home().join(if os == "windows" { "ffmpeg.exe" } else { "ffmpeg" });
     let bytes = spotify::HTTP.get(url).call()?.body_mut().with_config().limit(1 << 30).read_to_vec()?;
-    fs::write(&path, bytes)?;
-    set_executable(&path)?;
-    Ok(path)
+    let binary = if let Some(member) = member {
+        let archive = home().join(format!("deno-{}.zip", std::process::id()));
+        fs::write(&archive, bytes)?;
+        let result = if cfg!(windows) {
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command"])
+                .arg(format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive.display(),
+                    home().display()
+                ))
+                .output()?
+        } else {
+            Command::new("unzip").args(["-p"]).arg(&archive).arg(member).output()?
+        };
+        let _ = fs::remove_file(&archive);
+        if !result.status.success() {
+            return Err("Could not extract Deno archive".into());
+        }
+        if cfg!(windows) {
+            fs::read(home().join(member))?
+        } else {
+            result.stdout
+        }
+    } else {
+        bytes
+    };
+    if binary.is_empty() {
+        return Err(format!("Could not install tool from {url}").into());
+    }
+    fs::write(path, binary)?;
+    set_executable(path)?;
+    Ok(path.to_path_buf())
 }
 
-fn download_deno() -> R<PathBuf> {
+fn platform_source(
+    sources: &[(&'static str, &'static str, &'static str)],
+    os: &str,
+    arch: &str,
+) -> Option<&'static str> {
+    sources.iter().find(|source| source.0 == os && source.1 == arch).map(|source| source.2)
+}
+
+fn download_tool(tool: &str) -> R<PathBuf> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let target = match (os, arch) {
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        _ => return Err("Deno binary is not available for your system".into()),
-    };
-    let latest = spotify::HTTP.get("https://dl.deno.land/release-latest.txt").call()?.body_mut().read_to_string()?;
-    let url = format!("https://dl.deno.land/release/{}/deno-{target}.zip", latest.trim());
-    fs::create_dir_all(home())?;
-    let archive = home().join(format!("deno-{}.zip", std::process::id()));
-    let bytes = spotify::HTTP.get(&url).call()?.body_mut().with_config().limit(1 << 30).read_to_vec()?;
-    fs::write(&archive, bytes)?;
-    let filename = if os == "windows" { "deno.exe" } else { "deno" };
-    let binary = if os == "windows" {
-        let result = Command::new("powershell")
-            .args(["-NoProfile", "-Command"])
-            .arg(format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", archive.display(), home().display()))
-            .output()?;
-        if !result.status.success() {
-            return Err("Could not extract Deno archive".into());
+    match tool {
+        "ffmpeg" => {
+            let url =
+                platform_source(FFMPEG_SOURCES, os, arch).ok_or("FFmpeg binary is not available for your system")?;
+            let name = if os == "windows" { "ffmpeg.exe" } else { "ffmpeg" };
+            download_and_unpack(url, &home().join(name), None)
         }
-        fs::read(home().join(filename))?
-    } else {
-        let result = Command::new("unzip").args(["-p"]).arg(&archive).arg(filename).output()?;
-        if !result.status.success() {
-            return Err("Could not extract Deno archive".into());
+        "deno" => {
+            let target =
+                platform_source(DENO_TARGETS, os, arch).ok_or("Deno binary is not available for your system")?;
+            let latest =
+                spotify::HTTP.get("https://dl.deno.land/release-latest.txt").call()?.body_mut().read_to_string()?;
+            let url = format!("https://dl.deno.land/release/{}/deno-{target}.zip", latest.trim());
+            let name = if os == "windows" { "deno.exe" } else { "deno" };
+            download_and_unpack(&url, &home().join(name), Some(name))
         }
-        result.stdout
-    };
-    let _ = fs::remove_file(&archive);
-    if binary.is_empty() {
-        return Err(format!("Could not extract Deno from {}", url).into());
+        _ => Err(format!("Unknown tool: {tool}").into()),
     }
-    let path = home().join(filename);
-    fs::write(&path, binary)?;
-    set_executable(&path)?;
-    Ok(path)
-}
-
-fn version_parts(version: &str) -> Vec<u64> {
-    version.trim_start_matches('v').split('.').filter_map(|part| part.parse().ok()).collect()
 }
 
 fn check_for_updates() -> R<()> {
-    let release: Value = spotify::HTTP
+    let mut response = match spotify::HTTP
         .get("https://api.github.com/repos/pythoncrazy/spotdl-rs/releases/latest")
         .header("User-Agent", "spotdl-rs")
-        .call()?
-        .body_mut()
-        .read_json()?;
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => {
+            println!("No release found.");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let release: Value = response.body_mut().read_json()?;
     let latest = release["tag_name"].as_str().ok_or("GitHub release has no tag_name")?;
     let current = env!("CARGO_PKG_VERSION");
-    if version_parts(latest) > version_parts(current) {
+    let latest_parts =
+        latest.trim_start_matches('v').split('.').filter_map(|part| part.parse().ok()).collect::<Vec<u64>>();
+    let current_parts =
+        current.trim_start_matches('v').split('.').filter_map(|part| part.parse().ok()).collect::<Vec<u64>>();
+    if latest_parts > current_parts {
         println!("New version available: {latest}. Current version: {current}.");
     } else {
         println!("No updates available. Current version: {current}.");
@@ -376,7 +404,7 @@ pub(crate) fn log(cfg: &Settings, level: &str, message: &str) {
     eprintln!("{formatted}");
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {
@@ -387,149 +415,6 @@ fn url_encode(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn url_decode(value: &str) -> R<String> {
-    let mut bytes = Vec::new();
-    let mut chars = value.bytes();
-    while let Some(byte) = chars.next() {
-        if byte == b'%' {
-            let hex = [chars.next().ok_or("invalid URL escape")?, chars.next().ok_or("invalid URL escape")?];
-            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex)?, 16)?);
-        } else {
-            bytes.push(if byte == b'+' { b' ' } else { byte });
-        }
-    }
-    Ok(String::from_utf8(bytes)?)
-}
-
-fn base64(value: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::new();
-    for chunk in value.chunks(3) {
-        let a = chunk[0] as usize;
-        let b = chunk.get(1).copied().unwrap_or_default() as usize;
-        let c = chunk.get(2).copied().unwrap_or_default() as usize;
-        encoded.push(TABLE[a >> 2] as char);
-        encoded.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
-        encoded.push(if chunk.len() > 1 { TABLE[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
-        encoded.push(if chunk.len() > 2 { TABLE[c & 63] as char } else { '=' });
-    }
-    encoded
-}
-
-fn user_token(cfg: &Settings) -> R<String> {
-    let path = cfg.cache_path.as_ref().map(PathBuf::from).unwrap_or_else(|| home().join(".spotipy"));
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let cache = (!cfg.no_cache)
-        .then(|| fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()))
-        .flatten();
-    if let Some(token) = cache
-        .as_ref()
-        .filter(|cache| cache["expires_at"].as_u64().is_some_and(|expiry| expiry > now + 30))
-        .and_then(|cache| cache["access_token"].as_str())
-    {
-        return Ok(token.into());
-    }
-    if let Some(refresh) = cache.as_ref().and_then(|cache| cache["refresh_token"].as_str()) {
-        let credentials = base64(format!("{}:{}", cfg.client_id, cfg.client_secret).as_bytes());
-        let fields = [("grant_type", "refresh_token"), ("refresh_token", refresh)];
-        let token: Value = spotify::HTTP
-            .post("https://accounts.spotify.com/api/token")
-            .header("Authorization", format!("Basic {credentials}"))
-            .send_form(fields)?
-            .body_mut()
-            .read_json()?;
-        let access = token["access_token"].as_str().ok_or("Spotify token refresh failed")?;
-        if !cfg.no_cache {
-            fs::write(
-                &path,
-                serde_json::to_vec(&json!({
-                    "access_token": access,
-                    "refresh_token": token["refresh_token"].as_str().unwrap_or(refresh),
-                    "expires_at": now + token["expires_in"].as_u64().unwrap_or(3600)
-                }))?,
-            )?;
-        }
-        return Ok(access.into());
-    }
-    let listener = TcpListener::bind("127.0.0.1:9900")?;
-    let callback = "http://127.0.0.1:9900/";
-    let state = format!("{now:x}");
-    let scope = "user-library-read user-follow-read playlist-read-private";
-    let url = format!(
-        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}",
-        url_encode(&cfg.client_id),
-        url_encode(callback),
-        url_encode(scope),
-        state
-    );
-    if cfg.headless {
-        println!("{url}");
-    } else {
-        let mut browser = if cfg!(target_os = "macos") {
-            Command::new("open").arg(&url).spawn()
-        } else if cfg!(windows) {
-            Command::new("cmd").args(["/C", "start", ""]).arg(&url).spawn()
-        } else {
-            Command::new("xdg-open").arg(&url).spawn()
-        };
-        if browser.as_mut().is_err() {
-            println!("{url}");
-        }
-    }
-    log(cfg, "INFO", "Waiting for Spotify authorization at 127.0.0.1:9900");
-    let (mut stream, _) = listener.accept()?;
-    let mut request = [0; 8192];
-    let length = stream.read(&mut request)?;
-    let request = String::from_utf8_lossy(&request[..length]);
-    let route =
-        request.lines().next().and_then(|line| line.split_whitespace().nth(1)).ok_or("invalid OAuth callback")?;
-    let values = route
-        .split_once('?')
-        .map(|(_, query)| {
-            query
-                .split('&')
-                .filter_map(|pair| pair.split_once('='))
-                .map(|(key, value)| Ok((url_decode(key)?, url_decode(value)?)))
-                .collect::<R<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let value = |key: &str| values.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str());
-    if value("state") != Some(state.as_str()) {
-        let body = b"Invalid Spotify OAuth state";
-        write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n", body.len())?;
-        stream.write_all(body)?;
-        return Err("Spotify OAuth state did not match".into());
-    }
-    let code = value("code").ok_or("Spotify did not return an authorization code")?;
-    let body = b"Spotify login complete. You can close this tab.";
-    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())?;
-    stream.write_all(body)?;
-    let credentials = base64(format!("{}:{}", cfg.client_id, cfg.client_secret).as_bytes());
-    let fields = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", callback)];
-    let token: Value = spotify::HTTP
-        .post("https://accounts.spotify.com/api/token")
-        .header("Authorization", format!("Basic {credentials}"))
-        .send_form(fields)?
-        .body_mut()
-        .read_json()?;
-    let access_token = token["access_token"].as_str().ok_or("Spotify did not return an access token")?;
-    if !cfg.no_cache {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            path,
-            serde_json::to_vec(&json!({
-                "access_token": access_token,
-                "refresh_token": token["refresh_token"],
-                "expires_at": now + token["expires_in"].as_u64().unwrap_or(3600)
-            }))?,
-        )?;
-    }
-    Ok(access_token.into())
 }
 
 fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
@@ -602,7 +487,8 @@ fn resolve(queries: &[String], op: &str, cfg: &Settings, sync: Option<&Value>) -
 }
 
 fn download_songs(songs: Vec<Song>, op: &str, cfg: &Settings) -> R<Vec<(Song, R<PathBuf>)>> {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(cfg.threads.max(1)).build()?;
+    let threads = if op == "save" { cfg.meta_threads } else { cfg.threads };
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build()?;
     Ok(pool.install(|| songs.into_par_iter().with_max_len(1).map(|s| download::process(s, op, cfg)).collect()))
 }
 
@@ -695,11 +581,11 @@ fn run() -> R<()> {
         return write_default_config();
     }
     if flag("--download-ffmpeg") {
-        println!("FFmpeg successfully downloaded to {}", download_ffmpeg()?.display());
+        println!("FFmpeg successfully downloaded to {}", download_tool("ffmpeg")?.display());
         return Ok(());
     }
     if flag("--download-deno") {
-        println!("Deno successfully downloaded to {}", download_deno()?.display());
+        println!("Deno successfully downloaded to {}", download_tool("deno")?.display());
         return Ok(());
     }
     if flag("--check-for-updates") {
@@ -710,7 +596,7 @@ fn run() -> R<()> {
         return Err("save file must end with .spotdl or be '-'".into());
     }
     if cfg.user_auth && cfg.auth_token.is_none() {
-        cfg.auth_token = Some(user_token(&cfg)?);
+        cfg.auth_token = Some(spotify::token(&cfg, true)?);
     }
     if cfg.user_auth || cfg.auth_token.is_some() {
         cfg.use_official_api = true;

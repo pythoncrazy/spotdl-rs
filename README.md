@@ -24,6 +24,8 @@ Use `--user-auth` to sign in to Spotify. Set `client_id` and `client_secret` in 
 
 Use `--use-official-api` to use Spotify's Web API. Use `--use-cache-file` to save track data between runs. Use `--no-cache` to turn off local caches.
 
+Use `--meta-threads N` to set metadata worker count. Save uses these workers for lyrics requests. Each lyrics request has a 10-second timeout.
+
 Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` to add all songs from each album. Use `--ytm-data` to use the title and artist from a YouTube Music page.
 
 Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover.

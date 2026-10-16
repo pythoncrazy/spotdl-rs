@@ -212,8 +212,6 @@ pub fn find(s: &Song, cfg: &Settings) -> R<Vec<String>> {
             "youtube-music" => ytm(&q, true, false),
             "youtube" => ytdlp(&format!("ytsearch10:{q}"), cfg),
             "soundcloud" => ytdlp(&format!("scsearch10:{q}"), cfg),
-            "bandcamp" => ytdlp(&format!("bcsearch10:{q}"), cfg),
-            "piped" => piped(&q),
             _ => Ok(Vec::new()),
         }
         .unwrap_or_default();
@@ -265,33 +263,6 @@ pub fn youtube(url: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
 
 pub fn source(url: &str, cfg: &Settings) -> R<Vec<Song>> {
     Ok(ytdlp(url, cfg)?.into_iter().map(from_hit).collect())
-}
-
-fn piped(query: &str) -> R<Vec<Hit>> {
-    let response: Value = HTTP
-        .get("https://api.piped.private.coffee/search")
-        .query("q", query)
-        .query("filter", "music_songs")
-        .call()?
-        .body_mut()
-        .read_json()?;
-    Ok(response["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|item| item["type"] == "stream")
-        .filter_map(|item| {
-            let id = item["url"].as_str()?.split_once("v=")?.1.split('&').next()?;
-            Some(Hit {
-                url: format!("https://www.youtube.com/watch?v={id}"),
-                name: item["title"].as_str()?.into(),
-                artists: vec![item["uploaderName"].as_str()?.into()],
-                duration: item["duration"].as_f64().unwrap_or_default(),
-                verified: true,
-                ..Hit::default()
-            })
-        })
-        .collect())
 }
 
 fn from_hit(hit: Hit) -> Song {
