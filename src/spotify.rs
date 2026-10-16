@@ -293,21 +293,6 @@ pub fn token(cfg: &Value, user: bool) -> R<String> {
     Ok(access)
 }
 
-fn pathfinder_track(mut track: Value) -> Value {
-    let artists = track["artists"].as_array().into_iter().flatten();
-    let artists: Vec<Value> =
-        artists.map(|artist| json!({"profile": {"name": artist["name"]}, "uri": artist["uri"]})).collect();
-    track["firstArtist"] = json!({"items": artists.iter().take(1).collect::<Vec<_>>()});
-    track["otherArtists"] = json!({"items": artists.iter().skip(1).collect::<Vec<_>>()});
-    track["duration"] = json!({"totalMilliseconds": track["duration_ms"]});
-    track["discNumber"] = track["disc_number"].clone();
-    track["trackNumber"] = track["track_number"].clone();
-    track["contentRating"] = json!({"label": if track["explicit"] == true { "EXPLICIT" } else { "NONE" }});
-    track["isrc"] = track["external_ids"]["isrc"].clone();
-    track["playcount"] = json!(track["popularity"].as_u64().map(|count| count.to_string()));
-    track
-}
-
 fn official(path: &str, cfg: &Value) -> R<Vec<Value>> {
     let auth = format!("Bearer {}", token(cfg, cfg["user_auth"] == true)?);
     let mut next = Some(format!("https://api.spotify.com/v1/{path}"));
@@ -323,16 +308,7 @@ fn official(path: &str, cfg: &Value) -> R<Vec<Value>> {
         }
         next = result["next"].as_str().map(String::from);
     }
-    let normalize = |mut item: Value| match (item["track"]["duration_ms"].is_number(), item["duration_ms"].is_number())
-    {
-        (true, _) => {
-            item["track"] = pathfinder_track(item["track"].take());
-            item
-        }
-        (_, true) => pathfinder_track(item),
-        _ => item,
-    };
-    Ok(items.into_iter().map(normalize).collect())
+    Ok(items)
 }
 
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Value) -> R<(Value, Vec<Value>)> {
@@ -394,15 +370,24 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value, enrich: bool) -> V
     let song = |(index, track): (usize, &Value)| {
         let uri = track["albumOfTrack"]["uri"].as_str().or(track["album"]["uri"].as_str()).unwrap_or_default();
         let (album, deezer) = albums.get(uri).unwrap_or(&empty);
-        let names = [&track["firstArtist"]["items"], &track["otherArtists"]["items"], &track["artists"]["items"]];
+        let names = [
+            &track["firstArtist"]["items"],
+            &track["otherArtists"]["items"],
+            &track["artists"]["items"],
+            &track["artists"],
+        ];
         let artists = names.into_iter().flat_map(|value| value.as_array().into_iter().flatten());
-        let artists: Vec<String> =
-            artists.filter_map(|artist| artist["profile"]["name"].as_str().map(String::from)).collect();
+        let artists: Vec<String> = artists
+            .filter_map(|artist| artist["profile"]["name"].as_str().or(artist["name"].as_str()).map(String::from))
+            .collect();
         let date = album["date"]["isoString"].as_str().unwrap_or_default().get(..10).unwrap_or_default().to_string();
-        let disc = track["discNumber"].as_u64().unwrap_or(1);
-        let number = track["trackNumber"].as_u64().unwrap_or(1);
+        let disc = track["discNumber"].as_u64().or(track["disc_number"].as_u64()).unwrap_or(1);
+        let number = track["trackNumber"].as_u64().or(track["track_number"].as_u64()).unwrap_or(1);
         let extra = &deezer["tracks"][format!("{disc}:{number}")];
-        let isrc = [&track["isrc"], &extra["isrc"]].into_iter().filter_map(Value::as_str).find(|isrc| !isrc.is_empty());
+        let isrc = [&track["isrc"], &track["external_ids"]["isrc"], &extra["isrc"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|isrc| !isrc.is_empty());
         let id = |value: &Value| value.as_str().unwrap_or_default().rsplit(':').next().unwrap_or_default().to_string();
         let song_id = id(&track["uri"]);
         let genres = deezer["genres"].as_array().into_iter().flatten().filter_map(Value::as_str);
@@ -415,19 +400,26 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value, enrich: bool) -> V
             disc_number: disc as u32,
             disc_count: album["discs"]["totalCount"].as_u64().unwrap_or(1) as u32,
             album_name: album["name"].as_str().unwrap_or_default().into(),
-            duration: track["duration"]["totalMilliseconds"].as_f64().unwrap_or_default() / 1000.0,
+            duration: track["duration"]["totalMilliseconds"]
+                .as_f64()
+                .or(track["duration_ms"].as_f64())
+                .unwrap_or_default()
+                / 1000.0,
             year: date.get(..4).and_then(|year| year.parse().ok()).unwrap_or_default(),
             date,
             track_number: number as u32,
             tracks_count: album["tracksV2"]["totalCount"].as_u64().unwrap_or(1) as u32,
             url: format!("https://open.spotify.com/track/{song_id}"),
             song_id,
-            explicit: track["contentRating"]["label"] == "EXPLICIT",
+            explicit: track["contentRating"]["label"] == "EXPLICIT" || track["explicit"] == true,
             publisher: deezer["label"].as_str().or(album["label"].as_str()).unwrap_or_default().into(),
             isrc: isrc.map(String::from),
             cover_url: cover(album).map(String::from),
             copyright_text: album["copyright"]["items"][0]["text"].as_str().map(String::from),
-            popularity: track["playcount"].as_str().and_then(|count| count.parse().ok()),
+            popularity: track["playcount"]
+                .as_str()
+                .and_then(|count| count.parse().ok())
+                .or_else(|| track["popularity"].as_u64()),
             album_id: uri.rsplit(':').next().unwrap_or_default().into(),
             album_type: album["type"].as_str().unwrap_or_default().to_lowercase(),
             genres: genres.map(String::from).collect(),
