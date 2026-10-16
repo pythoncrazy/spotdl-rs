@@ -168,7 +168,10 @@ fn settings() -> R<(String, Vec<String>, Value)> {
             (Some(Value::Number(_)), Some(v)) => (1, json!(v.parse::<usize>()?)),
             (Some(_), Some(v)) => (1, json!(v)),
             (Some(_), _) => (0, json!("")),
-            (None, _) => return Err(format!("unknown option --{raw_key}").into()),
+            (None, _) if !["help", "check_for_updates", "download_ffmpeg", "download_deno"].contains(&key) => {
+                return Err(format!("unknown option --{raw_key}").into());
+            }
+            (None, _) => (0, json!(true)),
         };
         raw[key] = value;
         i += take + 1;
