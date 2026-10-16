@@ -177,6 +177,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Settings) -> R<()> {
     }
     let codecs = [("mp3", "libmp3lame"), ("flac", "flac"), ("ogg", "libvorbis"), ("opus", "libopus"), ("m4a", "aac")];
     let codec = codecs.iter().find(|c| c.0 == cfg.format).map_or("pcm_s16le", |c| c.1);
+    let codec = if keep && ext == "webm" && cfg.format == "opus" { "copy" } else { codec };
     let mut f = Command::new(&cfg.ffmpeg);
     f.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got).args(["-vn", "-map_metadata", "-1", "-c:a"]);
     f.arg(codec);
