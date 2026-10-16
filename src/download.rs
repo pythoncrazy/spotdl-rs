@@ -30,11 +30,16 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
     ];
     let json = serde_json::to_value(s).unwrap_or_default();
     let text = |v: &Value| {
-        if v.is_null() {
-            String::new()
-        } else {
-            v.as_str().map_or(v.to_string(), String::from)
-        }
+        v.as_str().map_or_else(
+            || {
+                if v.is_null() {
+                    String::new()
+                } else {
+                    v.to_string()
+                }
+            },
+            String::from,
+        )
     };
     let fields = json.as_object().into_iter().flatten().map(|(k, v)| (k.replace('_', "-"), text(v)));
     let vars = extra.into_iter().map(|(k, v)| (k.to_string(), v)).chain(fields);
@@ -150,20 +155,14 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     t.set_disk(s.disc_number);
     t.set_disk_total(s.disc_count);
     t.set_comment(s.download_url.clone().unwrap_or_default());
+    let id3 = format == TagType::Id3v2;
     let year = if s.year > 0 { s.year.to_string() } else { String::new() };
-    let bpm = if s.bpm > 0.0 {
-        if format == TagType::Id3v2 {
-            s.bpm.round().to_string()
-        } else {
-            s.bpm.to_string()
-        }
-    } else {
-        String::new()
-    };
-    let bpm_key = if format == TagType::Id3v2 { ItemKey::IntegerBpm } else { ItemKey::Bpm };
+    let bpm = if id3 { s.bpm.round() } else { s.bpm };
+    let bpm = if s.bpm > 0.0 { bpm.to_string() } else { String::new() };
+    let bpm_key = if id3 { ItemKey::IntegerBpm } else { ItemKey::Bpm };
     let gain = if s.gain != 0.0 { format!("{} dB", s.gain) } else { String::new() };
     let compilation = if s.album_type == "compilation" { "1".into() } else { String::new() };
-    let artists = if format == TagType::Id3v2 { vec![s.artists.join("\0")] } else { s.artists.clone() };
+    let artists = if id3 { vec![s.artists.join("\0")] } else { s.artists.clone() };
     let tags = vec![
         (ItemKey::AlbumArtist, vec![s.album_artist.clone()]),
         (ItemKey::RecordingDate, vec![s.date.clone()]),
@@ -226,23 +225,13 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let selectors = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
     let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio/best", |entry| entry.1);
     let mut y = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
-    y.args([
-        "-f",
-        selector,
-        "--no-playlist",
-        "--no-warnings",
-        "--force-overwrites",
-        "-q",
-        "--print",
-        "after_move:filepath",
-        "-o",
-    ]);
+    y.args(["-f", selector])
+        .args("--no-playlist --no-warnings --force-overwrites -q --print after_move:filepath -o".split(' '));
     y.arg(out.with_extension(format!("{id}.%(ext)s")));
-    if let Some(cookies) = cfg["cookie_file"].as_str() {
-        y.args(["--cookies", cookies]);
-    }
-    if let Some(proxy) = cfg["proxy"].as_str() {
-        y.args(["--proxy", proxy]);
+    for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
+        if let Some(value) = cfg[key].as_str() {
+            y.args([flag, value]);
+        }
     }
     if cfg["sponsor_block"] == true {
         y.args(["--sponsorblock-remove", "all"]);
@@ -266,13 +255,10 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         let codec = codecs.iter().find(|entry| entry.0 == format).map_or("pcm_s16le", |entry| entry.1);
         let codec = if keep && ext == "webm" && format == "opus" { "copy" } else { codec };
         let mut f = Command::new(cfg["ffmpeg"].as_str().unwrap_or("ffmpeg"));
-        f.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got).args([
-            "-vn",
-            "-map_metadata",
-            "-1",
-            "-c:a",
-            codec,
-        ]);
+        f.args("-nostdin -y -loglevel error -i".split(' '))
+            .arg(&got)
+            .args("-vn -map_metadata -1 -c:a".split(' '))
+            .arg(codec);
         if !keep {
             f.args(["-b:a", bitrate]);
         }

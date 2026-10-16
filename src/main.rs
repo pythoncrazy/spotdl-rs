@@ -460,10 +460,9 @@ fn run() -> R<()> {
     if op == "meta" {
         return download::meta(&original, &cfg);
     }
-    let sync = match op == "sync" && original.len() == 1 && original[0].ends_with(".spotdl") {
-        true => Some(serde_json::from_slice::<Value>(&fs::read(&original[0])?)?),
-        false => None,
-    };
+    let sync = (op == "sync" && original.len() == 1 && original[0].ends_with(".spotdl"))
+        .then(|| -> R<_> { Ok(serde_json::from_slice::<Value>(&fs::read(&original[0])?)?) })
+        .transpose()?;
     if sync.as_ref().is_some_and(|file| file["type"] != "sync" || !file["songs"].is_array()) {
         return Err("sync file is not valid".into());
     }
