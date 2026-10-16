@@ -9,13 +9,25 @@ use std::{
 
 #[derive(Default)]
 pub struct Hit {
-    url: String,
-    name: String,
-    artists: Vec<String>,
-    album: String,
-    duration: f64,
+    song: Song,
     verified: bool,
     isrc: bool,
+}
+
+fn hit_song(url: String, name: String, artists: Vec<String>, album: String, duration: f64) -> Song {
+    let artist = artists.first().cloned().unwrap_or_default();
+    let song_id = url.rsplit(['=', '/']).next().unwrap_or_default().to_string();
+    Song {
+        name,
+        artist,
+        artists,
+        album_name: album,
+        duration,
+        song_id,
+        url: url.clone(),
+        download_url: Some(url),
+        ..Song::default()
+    }
 }
 
 const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
@@ -106,17 +118,19 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
             };
             let time =
                 meta.last()?["text"].as_str()?.split(':').try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
-            let artists = Some(kind("ARTIST"))
-                .filter(|a| !a.is_empty())
-                .or(Some(vec![meta.first()?["text"].as_str()?.into()]))?;
+            let artists = kind("ARTIST");
+            let artists = match artists.first() {
+                Some(_) => artists,
+                None => vec![meta.first()?["text"].as_str()?.into()],
+            };
             Some(Hit {
-                url: format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
-                name: columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"]
-                    .as_str()?
-                    .into(),
-                album: kind("ALBUM").first().cloned().unwrap_or_default(),
-                artists,
-                duration: time.ok()?,
+                song: hit_song(
+                    format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
+                    columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"].as_str()?.into(),
+                    artists,
+                    kind("ALBUM").first().cloned().unwrap_or_default(),
+                    time.ok()?,
+                ),
                 verified: songs,
                 isrc,
             })
@@ -140,11 +154,13 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
     let hit = |entry: &Value| {
         let artist = ["artist", "uploader", "channel"].iter().find_map(|key| entry[key].as_str());
         Some(Hit {
-            url: entry["webpage_url"].as_str().or(entry["url"].as_str())?.into(),
-            name: entry["track"].as_str().or(entry["title"].as_str())?.into(),
-            artists: vec![artist.unwrap_or_default().into()],
-            album: entry["album"].as_str().unwrap_or_default().into(),
-            duration: entry["duration"].as_f64().unwrap_or_default(),
+            song: hit_song(
+                entry["webpage_url"].as_str().or(entry["url"].as_str())?.into(),
+                entry["track"].as_str().or(entry["title"].as_str())?.into(),
+                vec![artist.unwrap_or_default().into()],
+                entry["album"].as_str().unwrap_or_default().into(),
+                entry["duration"].as_f64().unwrap_or_default(),
+            ),
             ..Hit::default()
         })
     };
@@ -152,19 +168,21 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 }
 
 fn score(s: &Song, h: &Hit) -> f64 {
-    let (rname, sname) = (slug(&h.name), slug(&s.name));
-    let found = |a: &String| h.artists.iter().any(|r| ratio(&slug(a), &slug(r)) > 85.0) || rname.contains(&slug(a));
+    let hit = &h.song;
+    let (rname, sname) = (slug(&hit.name), slug(&s.name));
+    let found = |a: &String| hit.artists.iter().any(|r| ratio(&slug(a), &slug(r)) > 85.0) || rname.contains(&slug(a));
     let count = s.artists.len().max(1) as f64;
     let artists = 100.0 * s.artists.iter().filter(|a| found(a)).count() as f64 / count;
-    let main = h.artists.iter().chain([&h.name]).map(|r| ratio(&slug(&s.artist), &slug(r))).fold(0.0, f64::max);
+    let main = hit.artists.iter().chain([&hit.name]).map(|r| ratio(&slug(&s.artist), &slug(r))).fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
     let fwords = FORBIDDEN.split(' ').filter(|w| rname.contains(w) && !sname.contains(w)).count() as f64;
-    let stripped = s.artists.iter().fold(slug(&h.name), |n, a| n.replace(&slug(a), ""));
+    let stripped = s.artists.iter().fold(slug(&hit.name), |n, a| n.replace(&slug(a), ""));
     let name = ratio(&sname, &rname).max(ratio(&sname, stripped.trim_matches('-'))) - 15.0 * fwords;
-    let time = (-0.1 * (s.duration - h.duration).abs()).exp() * 100.0;
-    let album = if h.album.is_empty() { 0.0 } else { ratio(&slug(&s.album_name), &slug(&h.album)) };
+    let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
+    let album = if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name), &slug(&hit.album_name)) };
     let avg = (artists + name) / 2.0;
-    let avg = if h.verified && !h.isrc && !h.album.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
+    let avg =
+        if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
     let skip = name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
@@ -180,9 +198,9 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     let mut found: Vec<(f64, String)> = Vec::new();
     if let Some(isrc) = song.isrc.as_ref().filter(|_| providers.contains(&"youtube-music")) {
         let hits = ytm(isrc, true, true, cfg).unwrap_or_default().into_iter();
-        let hits = hits.filter(|hit| (hit.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0);
+        let hits = hits.filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0);
         let best = hits.max_by(|a, b| rank(a).total_cmp(&rank(b)));
-        found.extend(best.map(|hit| (f64::INFINITY, hit.url)));
+        found.extend(best.map(|hit| (f64::INFINITY, hit.song.url)));
     }
     for provider in &providers {
         let hits = match *provider {
@@ -196,7 +214,7 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
             hits.extend(ytm(&query, false, false, cfg).unwrap_or_default());
         }
         let hits = hits.into_iter().filter(|hit| !verified || hit.verified);
-        found.extend(hits.map(|hit| (rank(&hit), hit.url)).filter(|candidate| candidate.0 > 0.0));
+        found.extend(hits.map(|hit| (rank(&hit), hit.song.url)).filter(|candidate| candidate.0 > 0.0));
     }
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut seen = HashSet::new();
@@ -208,24 +226,19 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     Ok(found)
 }
 
-fn from_hit(hit: Hit) -> Song {
-    let artist = hit.artists.first().cloned().unwrap_or_default();
-    let song_id = hit.url.rsplit(['=', '/']).next().unwrap_or_default().to_string();
-    Song {
-        name: hit.name,
-        artist,
-        artists: hit.artists,
-        album_name: hit.album,
-        duration: hit.duration,
-        song_id,
-        url: hit.url.clone(),
-        download_url: Some(hit.url),
-        ..Song::default()
-    }
+pub fn source(url: &str, cfg: &Value) -> R<Vec<Song>> {
+    Ok(ytdlp(url, cfg)?.into_iter().map(|hit| hit.song).collect())
 }
 
-pub fn source(url: &str, cfg: &Value) -> R<Vec<Song>> {
-    Ok(ytdlp(url, cfg)?.into_iter().map(from_hit).collect())
+pub(crate) fn apply_ytm_data(song: &mut Song, source: Song, copy: bool) {
+    if copy {
+        song.name = source.name;
+        song.artist = source.artist;
+        song.artists = source.artists;
+        song.duration = source.duration;
+        song.album_name = source.album_name;
+    }
+    song.download_url = source.download_url;
 }
 
 pub fn youtube(url: &str, cfg: &Value, enrich: bool) -> R<Vec<Song>> {
@@ -233,18 +246,11 @@ pub fn youtube(url: &str, cfg: &Value, enrich: bool) -> R<Vec<Song>> {
     let music = url.contains("music.youtube.com");
     let song = |hit: Hit| {
         if !music {
-            return Some(from_hit(hit));
+            return Some(hit.song);
         }
-        let query = format!("{} - {}", hit.artists.join(", "), hit.name);
+        let query = format!("{} - {}", hit.song.artists.join(", "), hit.song.name);
         let mut song = crate::spotify::resolve(&query, cfg, enrich).ok()?.into_iter().next()?;
-        song.download_url = Some(hit.url.clone());
-        if cfg["ytm_data"] == true {
-            song.artist = hit.artists.first().cloned().unwrap_or_default();
-            song.name = hit.name;
-            song.artists = hit.artists;
-            song.duration = hit.duration;
-            song.album_name = hit.album;
-        }
+        apply_ytm_data(&mut song, hit.song, cfg["ytm_data"] == true);
         Some(song)
     };
     Ok(ytdlp(url, cfg)?.into_iter().take(count).filter_map(song).collect())

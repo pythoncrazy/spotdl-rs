@@ -513,14 +513,7 @@ fn paired_youtube(yt: &str, spotify: &str, cfg: &Value, enrich: bool) -> R<Vec<S
         return Err(message.into());
     }
     let merge = |(mut song, found): (Song, Song)| {
-        if cfg["ytm_data"] == true {
-            song.name = found.name;
-            song.artist = found.artist;
-            song.artists = found.artists;
-            song.duration = found.duration;
-            song.album_name = found.album_name;
-        }
-        song.download_url = found.download_url;
+        crate::search::apply_ytm_data(&mut song, found, cfg["ytm_data"] == true);
         song
     };
     Ok(songs.into_iter().zip(found).map(merge).collect())

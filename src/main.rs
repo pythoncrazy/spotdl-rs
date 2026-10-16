@@ -187,25 +187,20 @@ fn settings() -> R<(String, Vec<String>, Value)> {
     }
     let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
     let op = if known { positional.remove(0) } else { "download".into() };
-    let audio = ["youtube-music", "youtube", "soundcloud"];
-    if let Some(provider) = raw["audio_providers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .find(|provider| !audio.contains(provider))
-    {
-        return Err(format!("unknown audio provider: {provider}").into());
-    }
-    let lyrics = ["genius", "azlyrics", "musixmatch", "synced"];
-    if let Some(provider) = raw["lyrics_providers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .find(|provider| !lyrics.contains(provider))
-    {
-        return Err(format!("unknown lyrics provider: {provider}").into());
+    let providers = [
+        ("audio_providers", "audio", &["youtube-music", "youtube", "soundcloud"][..]),
+        ("lyrics_providers", "lyrics", &["genius", "azlyrics", "musixmatch", "synced"][..]),
+    ];
+    for (key, label, allowed) in providers {
+        if let Some(provider) = raw[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|provider| !allowed.contains(provider))
+        {
+            return Err(format!("unknown {label} provider: {provider}").into());
+        }
     }
     Ok((op, positional, raw))
 }
@@ -220,27 +215,25 @@ fn write_default_config() -> R<()> {
 }
 
 fn install(tool: &str, cfg: &Value) -> R<()> {
-    let ffmpeg = [
-        ("windows-x86_64", "win32-x64"),
-        ("windows-x86", "win32-ia32"),
-        ("linux-x86_64", "linux-x64"),
-        ("linux-x86", "linux-ia32"),
-        ("linux-arm", "linux-arm"),
-        ("linux-aarch64", "linux-arm64"),
-        ("macos-x86_64", "darwin-x64"),
-        ("macos-aarch64", "darwin-arm64"),
-    ];
-    let deno = [
-        ("windows-x86_64", "x86_64-pc-windows-msvc"),
-        ("windows-aarch64", "aarch64-pc-windows-msvc"),
-        ("linux-x86_64", "x86_64-unknown-linux-gnu"),
-        ("linux-aarch64", "aarch64-unknown-linux-gnu"),
-        ("macos-x86_64", "x86_64-apple-darwin"),
-        ("macos-aarch64", "aarch64-apple-darwin"),
+    let table: &[(&str, &str, Option<&str>)] = &[
+        ("windows-x86_64", "win32-x64", Some("x86_64-pc-windows-msvc")),
+        ("windows-x86", "win32-ia32", None),
+        ("windows-aarch64", "", Some("aarch64-pc-windows-msvc")),
+        ("linux-x86_64", "linux-x64", Some("x86_64-unknown-linux-gnu")),
+        ("linux-x86", "linux-ia32", None),
+        ("linux-arm", "linux-arm", None),
+        ("linux-aarch64", "linux-arm64", Some("aarch64-unknown-linux-gnu")),
+        ("macos-x86_64", "darwin-x64", Some("x86_64-apple-darwin")),
+        ("macos-aarch64", "darwin-arm64", Some("aarch64-apple-darwin")),
     ];
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let table: &[(&str, &str)] = if tool == "ffmpeg" { &ffmpeg } else { &deno };
-    let name = table.iter().find(|entry| entry.0 == target).map(|entry| entry.1);
+    let name = table.iter().find(|entry| entry.0 == target).and_then(|entry| {
+        if tool == "ffmpeg" {
+            (!entry.1.is_empty()).then_some(entry.1)
+        } else {
+            entry.2
+        }
+    });
     let name = name.ok_or(format!("{tool} binary is not available for your system"))?;
     let member = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
     let file = home().join(&member);
