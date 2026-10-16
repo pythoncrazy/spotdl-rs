@@ -10,13 +10,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
     time::Duration,
 };
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+pub static HOME: LazyLock<PathBuf> = LazyLock::new(|| {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    PathBuf::from(home.unwrap_or_default()).join(".spotdl")
+});
 
 const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"mp3","bitrate":"128k","overwrite":"skip","threads":16,"meta_threads":32,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"auth_token":null,"client_id":"","client_secret":"","no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"cache_path":null,"use_cache_file":false,"max_retries":3,"headless":false,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"user_auth":false,"use_official_api":false,"load_config":true}"#;
 
@@ -74,11 +78,6 @@ pub struct Song {
     pub gain: f64,
 }
 
-pub fn home() -> PathBuf {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    PathBuf::from(home.unwrap_or_default()).join(".spotdl")
-}
-
 pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
     let agent = AGENT.get_or_init(|| {
         let proxy = cfg["proxy"].as_str().and_then(|proxy| ureq::Proxy::new(proxy).ok());
@@ -114,11 +113,6 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
     }
 }
 
-pub fn json(url: &str, headers: &[(&str, &str)], cfg: &Value) -> R<Value> {
-    let bytes = http("GET", url, headers, None, cfg)?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
 fn settings() -> R<(String, Vec<String>, Value)> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_flag = args.iter().position(|arg| arg == "--config");
@@ -126,7 +120,7 @@ fn settings() -> R<(String, Vec<String>, Value)> {
         Some(index) => PathBuf::from(
             args.get(index + 1).filter(|arg| !arg.starts_with("--")).ok_or("--config requires a file path")?,
         ),
-        None => home().join("config.json"),
+        None => HOME.join("config.json"),
     };
     if config_flag.is_some() && !config_path.is_file() {
         return Err(format!("config file not found: {}", config_path.display()).into());
@@ -141,7 +135,7 @@ fn settings() -> R<(String, Vec<String>, Value)> {
         }
     }
     if raw["cache_path"].is_null() {
-        raw["cache_path"] = json!(home().join(".spotipy").to_string_lossy());
+        raw["cache_path"] = json!(HOME.join(".spotipy").to_string_lossy());
     }
     let mut positional = Vec::new();
     let mut i = 0;
@@ -181,7 +175,7 @@ fn settings() -> R<(String, Vec<String>, Value)> {
         raw["m3u"] = if enabled { json!("true") } else { Value::Null };
     }
     let explicit_ffmpeg = args.iter().any(|arg| arg == "--ffmpeg");
-    let local_ffmpeg = home().join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+    let local_ffmpeg = HOME.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
     if !explicit_ffmpeg && raw["ffmpeg"] == "ffmpeg" && local_ffmpeg.is_file() {
         raw["ffmpeg"] = json!(local_ffmpeg.to_string_lossy());
     }
@@ -207,10 +201,10 @@ fn settings() -> R<(String, Vec<String>, Value)> {
 
 fn write_default_config() -> R<()> {
     let mut defaults: Value = serde_json::from_str(DEFAULTS)?;
-    defaults["cache_path"] = json!(home().join(".spotipy").to_string_lossy());
-    fs::create_dir_all(home())?;
-    fs::write(home().join("config.json"), serde_json::to_vec_pretty(&defaults)?)?;
-    println!("Config file generated at {}", home().join("config.json").display());
+    defaults["cache_path"] = json!(HOME.join(".spotipy").to_string_lossy());
+    fs::create_dir_all(&*HOME)?;
+    fs::write(HOME.join("config.json"), serde_json::to_vec_pretty(&defaults)?)?;
+    println!("Config file generated at {}", HOME.join("config.json").display());
     Ok(())
 }
 
@@ -236,15 +230,15 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
     });
     let name = name.ok_or(format!("{tool} binary is not available for your system"))?;
     let member = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
-    let file = home().join(&member);
-    fs::create_dir_all(home())?;
+    let file = HOME.join(&member);
+    fs::create_dir_all(&*HOME)?;
     let binary = if tool == "ffmpeg" {
         let url = format!("https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/{name}");
         http("GET", &url, &[], None, cfg)?
     } else {
         let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
         let url = format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim());
-        let archive = home().join("deno.zip");
+        let archive = HOME.join("deno.zip");
         fs::write(&archive, http("GET", &url, &[], None, cfg)?)?;
         let mut unpack = Command::new(if cfg!(windows) { "tar" } else { "unzip" });
         unpack.arg(if cfg!(windows) { "-xOf" } else { "-p" }).arg(&archive).arg(&member);
@@ -264,14 +258,15 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
 
 fn check_for_updates(cfg: &Value) -> R<()> {
     let url = "https://api.github.com/repos/pythoncrazy/spotdl-rs/releases/latest";
-    let release = match json(url, &[("User-Agent", "spotdl-rs")], cfg) {
-        Ok(release) => release,
+    let bytes = match http("GET", url, &[("User-Agent", "spotdl-rs")], None, cfg) {
+        Ok(bytes) => bytes,
         Err(error) if error.to_string().starts_with("HTTP 404") => {
             println!("No release found.");
             return Ok(());
         }
         Err(error) => return Err(error),
     };
+    let release: Value = serde_json::from_slice(&bytes)?;
     let latest = release["tag_name"].as_str().ok_or("GitHub release has no tag_name")?;
     let current = env!("CARGO_PKG_VERSION");
     let parts = |version: &str| {
@@ -296,7 +291,7 @@ pub fn log(cfg: &Value, level: &str, message: &str) {
     if severity(level) < severity(cfg["log_level"].as_str().unwrap_or("INFO")) {
         return;
     }
-    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs());
+    let time = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
     let line = cfg["log_format"].as_str().map_or_else(
         || format!("{level}: {message}"),
         |format| {
@@ -379,13 +374,12 @@ fn write_m3u(done: &[(Song, R<PathBuf>)], op: &str, cfg: &Value) -> R<()> {
         name if name.ends_with(".m3u") || name.ends_with(".m3u8") => "",
         _ => ".m3u8",
     };
-    let list = |song: &Song| download::clean(song.list_name.as_deref().unwrap_or(&song.album_name));
-    let first = done.first().map_or("playlist".into(), |(song, _)| list(song));
+    let first = done.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song, cfg));
     let mut files = std::collections::BTreeMap::<String, String>::new();
     let keep = |result: &R<PathBuf>| op != "download" || cfg["add_unavailable"] == true || result.is_ok();
     for (song, result) in done.iter().filter(|(_, result)| keep(result)) {
         let path = result.as_ref().map_or_else(|_| download::path(song, cfg), Clone::clone);
-        let name = format!("{pattern}{suffix}").replace("{list}", &list(song)).replace("{list[0]}", &first);
+        let name = download::fill(&format!("{pattern}{suffix}"), song, cfg).replace("{list[0]}", &first);
         let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", song, cfg);
         let file = files.entry(name).or_insert_with(|| "#EXTM3U\n".into());
         file.push_str(&format!("{line}\n{}\n", path.display()));
@@ -406,7 +400,7 @@ fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>, cfg: &Value) -> 
     }
     if let Some(path) = cfg["save_errors"].as_str().filter(|_| !errors.is_empty()) {
         let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        let time = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
         std::io::Write::write_all(&mut file, format!("{time}\n{}\n", errors.join("\n")).as_bytes())?;
     }
     eprintln!(
@@ -420,13 +414,12 @@ fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>, cfg: &Value) -> 
     }
 }
 
-fn sync_file(queries: &[String], songs: &[Song]) -> R<String> {
-    Ok(serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": songs}))?)
-}
-
 fn run() -> R<()> {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().any(|arg| arg == name);
+    let sync_file = |queries: &[String], songs: &[Song]| -> R<String> {
+        Ok(serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": songs}))?)
+    };
     if flag("--version") {
         println!("spotdl {}", env!("CARGO_PKG_VERSION"));
         return Ok(());

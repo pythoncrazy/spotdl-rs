@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 #[derive(Default)]
@@ -36,17 +36,12 @@ static BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 static STRIKES: AtomicU64 = AtomicU64::new(0);
 
-fn now() -> u64 {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH);
-    elapsed.map_or(0, |elapsed| elapsed.as_secs())
-}
-
 pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3) + 1;
     let mut announced = 0;
     for attempt in 1..=attempts {
         let until = BLOCKED_UNTIL.load(Relaxed);
-        let wait = until.saturating_sub(now());
+        let wait = until.saturating_sub(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
         if wait > 0 && announced != until {
             eprintln!("YouTube blocked downloads. Waiting {wait} s.");
             announced = until;
@@ -64,21 +59,24 @@ pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
         }
         let strike = STRIKES.fetch_add(1, Relaxed).min(2) as usize;
         let test = std::env::var("SPOTDL_TEST_BACKOFF_SECONDS").ok().and_then(|value| value.parse().ok());
-        BLOCKED_UNTIL.fetch_max(now() + test.unwrap_or([30, 60, 120][strike]), Relaxed);
+        BLOCKED_UNTIL.fetch_max(
+            UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + test.unwrap_or([30, 60, 120][strike]),
+            Relaxed,
+        );
     }
     Err("YouTube blocked downloads".into())
 }
 
 pub fn deno_args(cmd: &mut Command) {
-    let deno = crate::home().join(if cfg!(windows) { "deno.exe" } else { "deno" });
+    let deno = crate::HOME.join(if cfg!(windows) { "deno.exe" } else { "deno" });
     if deno.is_file() {
         cmd.args(["--js-runtimes", &format!("deno:{}", deno.display())]);
     }
 }
 
-pub fn slug(s: &str) -> String {
+pub fn slug(s: &str, sep: &str) -> String {
     let s = deunicode::deunicode(s).to_lowercase();
-    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-")
+    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(sep)
 }
 
 pub fn ratio(a: &str, b: &str) -> f64 {
@@ -169,17 +167,21 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
-    let (rname, sname) = (slug(&hit.name), slug(&s.name));
-    let found = |a: &String| hit.artists.iter().any(|r| ratio(&slug(a), &slug(r)) > 85.0) || rname.contains(&slug(a));
+    let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
+    let found = |a: &String| {
+        hit.artists.iter().any(|r| ratio(&slug(a, "-"), &slug(r, "-")) > 85.0) || rname.contains(&slug(a, "-"))
+    };
     let count = s.artists.len().max(1) as f64;
     let artists = 100.0 * s.artists.iter().filter(|a| found(a)).count() as f64 / count;
-    let main = hit.artists.iter().chain([&hit.name]).map(|r| ratio(&slug(&s.artist), &slug(r))).fold(0.0, f64::max);
+    let main =
+        hit.artists.iter().chain([&hit.name]).map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-"))).fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
     let fwords = FORBIDDEN.split(' ').filter(|w| rname.contains(w) && !sname.contains(w)).count() as f64;
-    let stripped = s.artists.iter().fold(slug(&hit.name), |n, a| n.replace(&slug(a), ""));
+    let stripped = s.artists.iter().fold(slug(&hit.name, "-"), |n, a| n.replace(&slug(a, "-"), ""));
     let name = ratio(&sname, &rname).max(ratio(&sname, stripped.trim_matches('-'))) - 15.0 * fwords;
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
-    let album = if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name), &slug(&hit.album_name)) };
+    let album =
+        if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
     let avg = (artists + name) / 2.0;
     let avg =
         if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
@@ -226,10 +228,6 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     Ok(found)
 }
 
-pub fn source(url: &str, cfg: &Value) -> R<Vec<Song>> {
-    Ok(ytdlp(url, cfg)?.into_iter().map(|hit| hit.song).collect())
-}
-
 pub(crate) fn apply_ytm_data(song: &mut Song, source: Song, copy: bool) {
     if copy {
         song.name = source.name;
@@ -241,13 +239,14 @@ pub(crate) fn apply_ytm_data(song: &mut Song, source: Song, copy: bool) {
     song.download_url = source.download_url;
 }
 
-pub fn youtube(url: &str, cfg: &Value, enrich: bool) -> R<Vec<Song>> {
-    let count = if url.contains("list=") && !url.contains("watch?") { usize::MAX } else { 1 };
+pub fn source(url: &str, cfg: &Value, lookup: Option<bool>) -> R<Vec<Song>> {
+    let count =
+        if url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?")) { 1 } else { usize::MAX };
     let music = url.contains("music.youtube.com");
     let song = |hit: Hit| {
-        if !music {
+        let Some(enrich) = lookup.filter(|_| music) else {
             return Some(hit.song);
-        }
+        };
         let query = format!("{} - {}", hit.song.artists.join(", "), hit.song.name);
         let mut song = crate::spotify::resolve(&query, cfg, enrich).ok()?.into_iter().next()?;
         apply_ytm_data(&mut song, hit.song, cfg["ytm_data"] == true);

@@ -11,16 +11,16 @@ use std::{
     process::Command,
 };
 
-pub fn clean(s: &str) -> String {
-    let kept: String = s.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect();
-    kept.trim().trim_end_matches('.').into()
-}
-
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
+    let clean = |value: &str| {
+        let kept: String = value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect();
+        kept.trim().trim_end_matches('.').to_string()
+    };
     let extra = [
         ("title", s.name.clone()),
         ("artists", s.artists.join(", ")),
         ("album", s.album_name.clone()),
+        ("list", s.list_name.clone().unwrap_or_else(|| s.album_name.clone())),
         ("genre", s.genres.first().cloned().unwrap_or_default()),
         ("original-date", s.date.clone()),
         ("track-id", s.song_id.clone()),
@@ -48,7 +48,7 @@ pub fn path(s: &Song, cfg: &Value) -> PathBuf {
     let part = |part: &str| {
         let value = fill(part, s, cfg);
         let value = match cfg["restrict"].as_str() {
-            Some("strict") => search::slug(&value).replace('-', "_"),
+            Some("strict") => search::slug(&value, "_"),
             Some("ascii") => deunicode::deunicode(&value),
             _ => value,
         };
@@ -82,60 +82,59 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
 
-fn page(url: &str, headers: &[(&str, &str)]) -> Option<String> {
-    let bytes = crate::http("GET", url, headers, None, &json!({"max_retries": 1})).ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn provider(name: &str, song: &Song, cfg: &Value) -> Option<String> {
-    let encode = crate::url_encode;
-    let text = match name {
-        "synced" => {
-            let url = format!(
-                "https://lrclib.net/api/search?artist_name={}&track_name={}",
-                encode(&song.artist),
-                encode(&song.name)
-            );
-            let tracks: Vec<Value> = serde_json::from_str(&page(&url, &[])?).ok()?;
-            let hit = tracks
-                .iter()
-                .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
-            hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
-        }
-        "genius" => {
-            let url =
-                format!("https://genius.com/api/search/song?q={}", encode(&format!("{} {}", song.artist, song.name)));
-            let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
-            let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
-            let reply: Value = serde_json::from_str(&page(&url, headers)?).ok()?;
-            let url = reply["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
-            html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
-        }
-        "azlyrics" => {
-            let artist = search::slug(&song.artist).replace('-', "");
-            let title = search::slug(&song.name).replace('-', "");
-            html(
-                &page(&format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html"), &[])?,
-                "<!-- Usage of azlyrics.com",
-                "</div>",
-            )?
-        }
-        _ => {
-            let url = format!(
-                "https://www.musixmatch.com/lyrics/{}/{}",
-                search::slug(&song.artist),
-                search::slug(&song.name)
-            );
-            let body = page(&url, &[])?.split_once("\"body\":")?.1.to_string();
-            serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
-        }
-    };
-    Some(text.trim().to_string()).filter(|text| !text.is_empty())
-}
-
 pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
-    let providers = cfg["lyrics_providers"].as_array().into_iter().flatten().filter_map(Value::as_str);
-    providers.into_iter().find_map(|name| provider(name, song, cfg))
+    let page = |url: &str, headers: &[(&str, &str)]| {
+        let bytes = crate::http("GET", url, headers, None, &json!({"max_retries": 1})).ok()?;
+        String::from_utf8(bytes).ok()
+    };
+    let encode = crate::url_encode;
+    let provider = |name: &str| {
+        let text = match name {
+            "synced" => {
+                let url = format!(
+                    "https://lrclib.net/api/search?artist_name={}&track_name={}",
+                    encode(&song.artist),
+                    encode(&song.name)
+                );
+                let tracks: Vec<Value> = serde_json::from_str(&page(&url, &[])?).ok()?;
+                let hit = tracks
+                    .iter()
+                    .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
+                hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
+            }
+            "genius" => {
+                let url = format!(
+                    "https://genius.com/api/search/song?q={}",
+                    encode(&format!("{} {}", song.artist, song.name))
+                );
+                let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
+                let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
+                let reply: Value = serde_json::from_str(&page(&url, headers)?).ok()?;
+                let url = reply["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
+                html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
+            }
+            "azlyrics" => {
+                let artist = search::slug(&song.artist, "");
+                let title = search::slug(&song.name, "");
+                html(
+                    &page(&format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html"), &[])?,
+                    "<!-- Usage of azlyrics.com",
+                    "</div>",
+                )?
+            }
+            _ => {
+                let url = format!(
+                    "https://www.musixmatch.com/lyrics/{}/{}",
+                    search::slug(&song.artist, "-"),
+                    search::slug(&song.name, "-")
+                );
+                let body = page(&url, &[])?.split_once("\"body\":")?.1.to_string();
+                serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
+            }
+        };
+        Some(text.trim().to_string()).filter(|text| !text.is_empty())
+    };
+    cfg["lyrics_providers"].as_array().into_iter().flatten().filter_map(Value::as_str).find_map(provider)
 }
 
 fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
@@ -209,12 +208,8 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     f.save_to_path(file, WriteOptions::default()).map_err(Into::into)
 }
 
-fn text<'a>(cfg: &'a Value, key: &str) -> Vec<&'a str> {
-    let value = cfg[key].as_str().unwrap_or_default();
-    value.split_whitespace().collect()
-}
-
 fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
+    let text = |key: &str| cfg[key].as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>();
     let format = cfg["format"].as_str().unwrap_or("mp3");
     let bitrate = cfg["bitrate"].as_str().unwrap_or("auto");
     let selectors = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
@@ -231,7 +226,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     if cfg["sponsor_block"] == true {
         y.args(["--sponsorblock-remove", "all"]);
     }
-    y.args(text(cfg, "yt_dlp_args"));
+    y.args(text("yt_dlp_args"));
     search::deno_args(&mut y);
     let res = search::yt(y.arg(url), cfg)?;
     let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
@@ -257,7 +252,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         if !keep {
             f.args(["-b:a", bitrate]);
         }
-        let res = f.args(text(cfg, "ffmpeg_args")).arg(&temp).output();
+        let res = f.args(text("ffmpeg_args")).arg(&temp).output();
         let _ = fs::remove_file(&got);
         match res {
             Ok(res) if res.status.success() => Ok(()),
@@ -302,12 +297,6 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn source_url(file: &Path) -> Option<String> {
-    let tags = lofty::read_from_path(file).ok()?;
-    let item = tags.primary_tag()?.get(&ItemKey::AudioFileUrl)?;
-    item.value().locator().map(String::from)
-}
-
 static SCAN: std::sync::OnceLock<std::collections::HashMap<String, PathBuf>> = std::sync::OnceLock::new();
 
 fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
@@ -324,7 +313,14 @@ fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
     let scan = || {
         let mut files = Vec::new();
         audio_files(&output_root(cfg), &mut files);
-        files.into_iter().filter_map(|file| Some((source_url(&file)?, file))).collect()
+        files
+            .into_iter()
+            .filter_map(|file| {
+                let tags = lofty::read_from_path(&file).ok()?;
+                let item = tags.primary_tag()?.get(&ItemKey::AudioFileUrl)?;
+                Some((item.value().locator()?.to_string(), file))
+            })
+            .collect()
     };
     let scanned = (cfg["scan_for_songs"] == true && op != "save").then(|| SCAN.get_or_init(scan).get(&s.url).cloned());
     let mut target =
