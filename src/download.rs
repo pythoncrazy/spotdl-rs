@@ -267,9 +267,6 @@ fn finish(s: &mut Song, op: &str, cfg: &Settings) -> R<PathBuf> {
         return Ok(target);
     }
     let metadata_only = exists && cfg.overwrite == "metadata" && !cfg.redownload;
-    if !matches!(op, "save" | "url") {
-        crate::spotify::enrich(s).ok();
-    }
     let candidates = match &s.download_url {
         Some(u) => vec![u.clone()],
         None if metadata_only && op != "save" && op != "url" => Vec::new(),
@@ -344,8 +341,7 @@ pub fn meta(files: &[String], cfg: &Settings) -> R<()> {
                 tg.artist().unwrap_or_default(),
                 tg.title().unwrap_or_default()
             ));
-            let mut song = crate::spotify::resolve(&q, cfg, true)?.into_iter().next().ok_or("no match")?;
-            crate::spotify::enrich(&mut song).ok();
+            let song = crate::spotify::resolve(&q, cfg, true)?.into_iter().next().ok_or("no match")?;
             tag(&f, &Song { lyrics: lyrics(&song, cfg), download_url: tg.comment().map(String::from), ..song }, cfg)
         });
         println!("{}: {}", f.display(), res.map_or_else(|e| e.to_string(), |_| "updated".into()));

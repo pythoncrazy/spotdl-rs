@@ -92,15 +92,13 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
         .body_mut()
         .read_json()?;
     let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
-    let shelves = tab["sectionListRenderer"]["contents"].as_array().cloned().unwrap_or_default();
-    let items =
-        shelves.into_iter().flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().cloned().unwrap_or_default());
+    let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
+    let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
     Ok(items
         .filter_map(|i| {
             let r = &i["musicResponsiveListItemRenderer"];
-            let runs =
-                |c: usize| r["flexColumns"][c]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].clone();
-            let meta = runs(1).as_array().cloned().unwrap_or_default();
+            let columns = &r["flexColumns"];
+            let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
             let kind = |t: &str| -> Vec<String> {
                 let typed = meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
                 typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
@@ -112,7 +110,9 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
                 .or(Some(vec![meta.first()?["text"].as_str()?.into()]))?;
             Some(Hit {
                 url: format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
-                name: runs(0)[0]["text"].as_str()?.into(),
+                name: columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"]
+                    .as_str()?
+                    .into(),
                 album: kind("ALBUM").first().cloned().unwrap_or_default(),
                 artists,
                 duration: time.ok()?,
@@ -128,13 +128,9 @@ fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
     cmd.args(["--flat-playlist", "-J", "--no-warnings", search]);
     let out = yt_output(&mut cmd)?;
     let mut v: Value = serde_json::from_slice(&out.stdout)?;
-    let entries = if v["entries"].is_array() {
-        match v["entries"].take() {
-            Value::Array(entries) => entries,
-            _ => unreachable!(),
-        }
-    } else {
-        vec![v]
+    let entries = match v["entries"].take() {
+        Value::Array(entries) => entries,
+        _ => vec![v],
     };
     Ok(entries
         .iter()

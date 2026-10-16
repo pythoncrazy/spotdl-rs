@@ -2,7 +2,7 @@ use crate::{home, Settings, Song, R};
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,10 +21,6 @@ static DEEZER: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::
 static DEEZER_RATE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(Default::default);
 
 const PAGE: usize = 343;
-
-fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().find_map(|key| value.get(*key).filter(|value| !value.is_null()))
-}
 
 fn totp(secret: &[u8]) -> R<String> {
     let key: Vec<u8> = secret
@@ -164,101 +160,67 @@ fn query(op: &str, vars: Value, cfg: &Settings) -> R<Value> {
     Ok(v)
 }
 
-fn deezer(url: &str, query: Option<(&str, &str)>) -> R<Value> {
-    let mut reserved = None;
-    let value = crate::retry(
-        3,
-        |attempt| {
-            if reserved == Some(attempt) {
-                return Ok(None);
-            }
-            reserved = Some(attempt);
-            let mut next = DEEZER_RATE.lock().map_err(|e| e.to_string())?;
-            let now = Instant::now();
-            let wait = next.map_or(Duration::ZERO, |at| at.saturating_duration_since(now));
-            *next = Some(now + wait + Duration::from_millis(100));
-            Ok(Some(wait))
-        },
-        |_| -> R<Value> {
-            let mut request = HTTP.get(url);
-            if let Some((key, value)) = query {
-                request = request.query(key, value);
-            }
-            Ok(request.call()?.body_mut().read_json()?)
-        },
-        |_, result| result.as_ref().is_ok_and(|value| value["error"]["code"] == 4).then_some(Duration::from_secs(5)),
-    )?;
-    if value["error"]["code"] == 4 {
-        Err("Deezer rate limit".into())
-    } else {
-        Ok(value)
-    }
-}
-
-fn high_match(left: &str, right: &str) -> bool {
-    let left = crate::search::slug(left);
-    let right = crate::search::slug(right);
-    crate::search::ratio(&left, &right) > 80.0
-}
-
 fn deezer_album(uri: &str, album: &Value) -> Option<Value> {
-    if let Some(v) = DEEZER.lock().ok()?.get(uri).cloned() {
-        return Some(v);
+    if let Some(cached) = DEEZER.lock().ok()?.get(uri).cloned() {
+        return Some(cached);
     }
-    let artist =
-        album["artists"]["items"][0]["profile"]["name"].as_str().or(album["artists"]["items"][0]["name"].as_str())?;
-    let title = field(album, &["name", "title"])?.as_str()?;
-    let term = format!("{artist} {title}");
-    let hits = deezer("https://api.deezer.com/search/album", Some(("q", &term))).ok()?;
-    let hit = hits["data"].as_array()?.iter().find(|h| {
-        high_match(title, field(h, &["title", "name"]).and_then(Value::as_str).unwrap_or_default())
-            && high_match(
-                artist,
-                h["artist"]["profile"]["name"].as_str().or(h["artist"]["name"].as_str()).unwrap_or_default(),
-            )
+    let fetch = |url: &str, query: Option<(&str, &str)>| -> R<Value> {
+        crate::retry(
+            3,
+            |_| Ok(None),
+            |_| {
+                let mut next = DEEZER_RATE.lock().map_err(|error| error.to_string())?;
+                let now = Instant::now();
+                let wait = next.map_or(Duration::ZERO, |at| at.saturating_duration_since(now));
+                *next = Some(now + wait + Duration::from_millis(100));
+                drop(next);
+                std::thread::sleep(wait);
+                let request = query.map_or_else(|| HTTP.get(url), |(key, value)| HTTP.get(url).query(key, value));
+                Ok(request.call()?.body_mut().read_json()?)
+            },
+            |_, result| {
+                result.as_ref().is_ok_and(|v: &Value| v["error"]["code"] == 4).then_some(Duration::from_secs(5))
+            },
+        )
+    };
+    let artist = album["artists"]["items"][0]["profile"]["name"].as_str()?;
+    let title = album["name"].as_str()?;
+    let hits = fetch("https://api.deezer.com/search/album", Some(("q", &format!("{artist} {title}")))).ok()?;
+    let matches = |expected: &str, found: &str| {
+        crate::search::ratio(&crate::search::slug(expected), &crate::search::slug(found)) > 80.0
+    };
+    let hit = hits["data"].as_array()?.iter().find(|hit| {
+        matches(title, hit["title"].as_str().unwrap_or_default())
+            && matches(artist, hit["artist"]["name"].as_str().unwrap_or_default())
     })?;
     let id = hit["id"].as_u64()?;
-    let v = deezer(&format!("https://api.deezer.com/album/{id}"), None).ok()?;
-    DEEZER.lock().ok()?.insert(uri.into(), v.clone());
-    Some(v)
-}
-
-fn deezer_track<'a>(album: &'a Value, track: &Value) -> Option<&'a Value> {
-    let tracks = album["tracks"]["data"].as_array()?;
-    let disc = field(track, &["discNumber", "disc_number"]).and_then(Value::as_u64).unwrap_or(1);
-    let number = field(track, &["trackNumber", "track_number"]).and_then(Value::as_u64).unwrap_or(1);
-    tracks
-        .iter()
-        .find(|t| {
-            field(t, &["disk_number"]).and_then(Value::as_u64) == Some(disc)
-                && field(t, &["track_position"]).and_then(Value::as_u64) == Some(number)
+    let details = fetch(&format!("https://api.deezer.com/album/{id}"), Some(("limit", "100"))).ok()?;
+    let tracks: HashMap<String, Value> = details["tracks"]["data"]
+        .as_array()?
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            let detail = if track["isrc"].as_str().is_some() && track["bpm"].as_f64().is_some() {
+                track.clone()
+            } else {
+                track["id"]
+                    .as_u64()
+                    .and_then(|id| fetch(&format!("https://api.deezer.com/track/{id}"), None).ok())
+                    .unwrap_or_else(|| track.clone())
+            };
+            let position = format!(
+                "{}:{}",
+                detail["disk_number"].as_u64().unwrap_or(1),
+                detail["track_position"].as_u64().unwrap_or(index as u64 + 1)
+            );
+            Some((position, json!({"isrc": detail["isrc"], "bpm": detail["bpm"], "gain": detail["gain"]})))
         })
-        .or_else(|| {
-            let title = field(track, &["name", "title"]).and_then(Value::as_str).unwrap_or_default();
-            tracks
-                .iter()
-                .filter(|t| high_match(title, field(t, &["title", "name"]).and_then(Value::as_str).unwrap_or_default()))
-                .max_by_key(|t| {
-                    crate::search::ratio(
-                        title,
-                        field(t, &["title", "name"]).and_then(Value::as_str).unwrap_or_default(),
-                    ) as u32
-                })
-        })
-}
-
-pub fn enrich(song: &mut Song) -> R<()> {
-    if song.deezer_track_id.is_empty() {
-        return Ok(());
-    }
-    let v = deezer(&format!("https://api.deezer.com/track/{}", song.deezer_track_id), None)?;
-    let missing_isrc = song.isrc.as_ref().is_none_or(|isrc| isrc.is_empty());
-    if missing_isrc {
-        song.isrc = v["isrc"].as_str().filter(|isrc| !isrc.is_empty()).map(String::from);
-    }
-    song.bpm = v["bpm"].as_f64().unwrap_or_default();
-    song.gain = v["gain"].as_f64().unwrap_or_default();
-    Ok(())
+        .collect::<HashMap<_, _>>();
+    let genres = details["genres"]["data"].as_array().into_iter().flatten().filter_map(|g| g["name"].as_str());
+    let result = json!({"genres": genres.collect::<Vec<_>>(), "upc": details["upc"], "label": details["label"],
+        "release_date": details["release_date"], "tracks": tracks});
+    DEEZER.lock().ok()?.insert(uri.into(), result.clone());
+    Some(result)
 }
 
 fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
@@ -281,24 +243,43 @@ fn official(url: &str, cfg: &Settings) -> R<Vec<Value>> {
     Ok(items)
 }
 
+fn pathfinder_track(mut track: Value) -> Value {
+    let artists: Vec<Value> = track["artists"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|artist| json!({"profile": {"name": artist["name"]}, "uri": artist["uri"]}))
+        .collect();
+    track["firstArtist"] = json!({"items": artists.first().cloned().into_iter().collect::<Vec<_>>()});
+    track["otherArtists"] = json!({"items": artists.into_iter().skip(1).collect::<Vec<_>>()});
+    track["duration"] = json!({"totalMilliseconds": track["duration_ms"]});
+    track["discNumber"] = track["disc_number"].clone();
+    track["trackNumber"] = track["track_number"].clone();
+    track["contentRating"] = json!({"label": if track["explicit"] == true { "EXPLICIT" } else { "NONE" }});
+    track["isrc"] = track["external_ids"]["isrc"].clone();
+    track["playcount"] = json!(track["popularity"].as_u64().map(|count| count.to_string()));
+    track
+}
+
+fn variables(uri: &str, offset: usize, limit: usize) -> Value {
+    json!({
+        "uri": uri,
+        "locale": "",
+        "offset": offset,
+        "limit": limit,
+        "order": "DATE_DESC",
+        "enableWatchFeedEntrypoint": false
+    })
+}
+
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Settings) -> R<(Value, Vec<Value>)> {
-    let variables = |offset| {
-        json!({
-            "uri": uri,
-            "locale": "",
-            "offset": offset,
-            "limit": limit,
-            "order": "DATE_DESC",
-            "enableWatchFeedEntrypoint": false
-        })
-    };
     let items = |v: &Value| v.pointer(&format!("{list}/items")).and_then(Value::as_array).cloned().unwrap_or_default();
-    let first = query(op, variables(0), cfg)?;
+    let first = query(op, variables(uri, 0, limit), cfg)?;
     let total =
         first.pointer(&format!("{list}/totalCount")).and_then(Value::as_u64).ok_or(format!("{uri} unavailable"))?;
     let offsets: Vec<usize> = (limit..total as usize).step_by(limit).collect();
     let rest: Vec<Vec<Value>> =
-        offsets.par_iter().map(|o| query(op, variables(*o), cfg).map(|v| items(&v))).collect::<R<_>>()?;
+        offsets.par_iter().map(|o| query(op, variables(uri, *o, limit), cfg).map(|v| items(&v))).collect::<R<_>>()?;
     let meta = first["data"].as_object().and_then(|d| d.values().next()).cloned().unwrap_or_default();
     Ok((meta, std::iter::once(items(&first)).chain(rest).flatten().collect()))
 }
@@ -313,13 +294,7 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
             let keep = ["name", "artists", "date", "discs", "tracksV2", "label", "coverArt", "copyright", "type"];
             let cached = ALBUMS.lock().ok()?.get(*u).cloned();
             let album = cached.or_else(|| {
-                let mut album = query(
-                    "getAlbum",
-                    json!({"uri": u, "locale": "", "offset": 0, "limit": 1, "order": "DATE_DESC", "enableWatchFeedEntrypoint": false}),
-                    cfg,
-                )
-                .ok()?["data"]["albumUnion"]
-                    .take();
+                let mut album = query("getAlbum", variables(u, 0, 1), cfg).ok()?["data"]["albumUnion"].take();
                 album.as_object_mut()?.retain(|key, _| keep.contains(&key.as_str()));
                 ALBUMS.lock().ok()?.insert((*u).clone(), album.clone());
                 Some(album)
@@ -338,64 +313,64 @@ fn build(tracks: Vec<(Value, String)>, list: Option<(&str, &str)>, cfg: &Setting
             let al = pair.map_or(&Value::Null, |v| &v.0);
             let dz = pair.map_or(&Value::Null, |v| &v.1);
             let artists: Vec<String> =
-                [&t["artists"]["items"], &t["firstArtist"]["items"], &t["otherArtists"]["items"], &t["artists"]]
+                [&t["artists"]["items"], &t["firstArtist"]["items"], &t["otherArtists"]["items"]]
                     .into_iter()
                     .flat_map(|value| value.as_array().into_iter().flatten())
-                    .filter_map(|artist| {
-                        artist["profile"]["name"].as_str().or(artist["name"].as_str()).map(String::from)
-                    })
+                    .filter_map(|artist| artist["profile"]["name"].as_str().map(String::from))
                     .collect();
             let date = al["date"]["isoString"].as_str().unwrap_or_default().get(..10).unwrap_or_default().to_string();
-            let dur = |k: &str| t[k]["totalMilliseconds"].as_f64();
             let covers = al["coverArt"]["sources"].as_array().into_iter().flatten();
-            let dz_track = deezer_track(dz, t);
+            let track_key =
+                format!("{}:{}", t["discNumber"].as_u64().unwrap_or(1), t["trackNumber"].as_u64().unwrap_or(1));
+            let dz_track = &dz["tracks"][&track_key];
+            let isrc = t["isrc"]
+                .as_str()
+                .filter(|isrc| !isrc.is_empty())
+                .or(dz_track["isrc"].as_str())
+                .filter(|isrc| !isrc.is_empty())
+                .map(String::from);
             let song_id = t["uri"].as_str().unwrap_or_default().rsplit(':').next().unwrap_or_default().to_string();
             let url = format!("https://open.spotify.com/track/{song_id}");
             let artist_uri = al["artists"]["items"][0]["uri"].as_str().unwrap_or_default();
             Song {
-                name: field(t, &["name", "title"]).and_then(Value::as_str).unwrap_or_default().into(),
+                name: t["name"].as_str().unwrap_or_default().into(),
                 artist: artists.first().cloned().unwrap_or_default(),
-                album_artist: al["artists"]["items"][0]["profile"]["name"]
-                    .as_str()
-                    .or(al["artists"]["items"][0]["name"].as_str())
-                    .unwrap_or_default()
-                    .into(),
+                album_artist: al["artists"]["items"][0]["profile"]["name"].as_str().unwrap_or_default().into(),
                 artist_id: artist_uri.rsplit(':').next().unwrap_or_default().into(),
                 artists,
-                disc_number: field(t, &["discNumber", "disc_number"]).and_then(Value::as_u64).unwrap_or(1) as u32,
-                disc_count: field(&al["discs"], &["totalCount"]).and_then(Value::as_u64).unwrap_or(1) as u32,
-                album_name: field(al, &["name", "title"]).and_then(Value::as_str).unwrap_or_default().into(),
-                duration: dur("duration").or(dur("trackDuration")).or(t["duration_ms"].as_f64()).unwrap_or_default()
+                disc_number: t["discNumber"].as_u64().unwrap_or(1) as u32,
+                disc_count: al["discs"]["totalCount"].as_u64().unwrap_or(1) as u32,
+                album_name: al["name"].as_str().unwrap_or_default().into(),
+                duration: t["duration"]["totalMilliseconds"]
+                    .as_f64()
+                    .or(t["trackDuration"]["totalMilliseconds"].as_f64())
+                    .unwrap_or_default()
                     / 1000.0,
                 year: date.get(..4).and_then(|y| y.parse().ok()).unwrap_or_default(),
                 date,
-                track_number: field(t, &["trackNumber", "track_number"]).and_then(Value::as_u64).unwrap_or(1) as u32,
-                tracks_count: field(&al["tracksV2"], &["totalCount"])
-                    .or_else(|| field(&al["tracks"], &["totalCount"]))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u32,
+                track_number: t["trackNumber"].as_u64().unwrap_or(1) as u32,
+                tracks_count: al["tracksV2"]["totalCount"].as_u64().unwrap_or(1) as u32,
                 song_id,
                 url,
-                explicit: t["contentRating"]["label"] == "EXPLICIT" || t["explicit"] == true,
+                explicit: t["contentRating"]["label"] == "EXPLICIT",
                 publisher: dz["label"].as_str().or(al["label"].as_str()).unwrap_or_default().into(),
-                isrc: t["external_ids"]["isrc"].as_str().map(String::from),
+                isrc,
                 cover_url: covers.max_by_key(|x| x["width"].as_u64()).and_then(|x| x["url"].as_str().map(String::from)),
                 copyright_text: al["copyright"]["items"][0]["text"].as_str().map(String::from),
                 popularity: t["playcount"].as_str().and_then(|p| p.parse().ok()),
                 album_id: a.rsplit(':').next().unwrap_or_default().into(),
-                album_type: field(al, &["type"]).and_then(Value::as_str).unwrap_or_default().to_lowercase(),
-                genres: dz["genres"]["data"]
+                album_type: al["type"].as_str().unwrap_or_default().to_lowercase(),
+                genres: dz["genres"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|g| field(g, &["name"]).and_then(Value::as_str).map(String::from))
+                    .filter_map(Value::as_str)
+                    .map(String::from)
                     .collect(),
                 original_date: dz["release_date"].as_str().unwrap_or_default().into(),
                 upc: dz["upc"].as_str().unwrap_or_default().into(),
-                deezer_track_id: dz_track
-                    .and_then(|d| field(d, &["id"]).and_then(Value::as_u64))
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
+                bpm: dz_track["bpm"].as_f64().unwrap_or_default(),
+                gain: dz_track["gain"].as_f64().unwrap_or_default(),
                 list_name: list.map(|l| l.0.into()),
                 list_url: list.map(|l| l.1.into()),
                 list_position: list.map(|_| i + 1),
@@ -415,7 +390,12 @@ fn album(uri: &str, cfg: &Settings) -> R<Vec<(Value, String)>> {
 
 fn artist(uri: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
     let (_, releases) = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50, cfg)?;
-    let albums: Vec<&str> = releases.iter().filter_map(|x| x["releases"]["items"][0]["uri"].as_str()).collect();
+    let mut seen = HashSet::new();
+    let albums: Vec<&str> = releases
+        .iter()
+        .filter_map(|x| x["releases"]["items"][0]["uri"].as_str())
+        .filter(|uri| seen.insert(*uri))
+        .collect();
     let tracks: Vec<(Value, String)> = albums.par_iter().flat_map(|a| album(a, cfg).unwrap_or_default()).collect();
     let mut seen = std::collections::HashSet::new();
     let songs = build(tracks, None, cfg, enrich)?.into_iter();
@@ -446,8 +426,19 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
     }
     let short = q.contains("spotify.link").then(|| HTTP.get(q).call()).transpose()?;
     let q = short.map_or(q.to_string(), |r| ureq::ResponseExt::get_uri(&r).to_string());
-    let lib =
-        |path: &str, key: &str| -> R<Vec<Value>> { Ok(official(path, cfg)?.iter().map(|x| x[key].clone()).collect()) };
+    let lib = |path: &str, key: &str| -> R<Vec<Value>> {
+        Ok(official(path, cfg)?
+            .into_iter()
+            .map(|mut x| {
+                let value = x[key].take();
+                if key == "track" {
+                    pathfinder_track(value)
+                } else {
+                    value
+                }
+            })
+            .collect())
+    };
     let uris = match q.as_str() {
         "saved" => {
             let tracks = lib("me/tracks?limit=50", "track")?.into_iter();
@@ -482,13 +473,14 @@ pub fn resolve(q: &str, cfg: &Settings, enrich: bool) -> R<Vec<Song>> {
     let uri = match uri(&q) {
         Some(u) => u,
         None => {
-            let vars = json!({"searchTerm": term, "offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": false, "includeArtistHasConcertsField": false, "includePreReleases": false, "includeLocalConcertsField": false});
+            let search_term = if kind == "track" { term.replace(" - ", " ") } else { term.to_string() };
+            let vars = json!({"searchTerm": &search_term, "offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": false, "includeArtistHasConcertsField": false, "includePreReleases": false, "includeLocalConcertsField": false});
             let mut response = query("searchDesktop", vars, cfg)?;
             let s = response["data"]["searchV2"].take();
             let first =
                 &s[format!("{kind}s{}", if kind == "track" || kind == "album" { "V2" } else { "" })]["items"][0];
             let name = first["item"]["data"]["name"].as_str().unwrap_or_default();
-            if kind == "track" && crate::search::ratio(term, name) < 25.0 {
+            if kind == "track" && crate::search::ratio(&search_term, name) < 25.0 {
                 return Err("no Spotify results".into());
             }
             first["item"]["data"]["uri"]

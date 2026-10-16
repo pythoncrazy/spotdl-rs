@@ -142,8 +142,6 @@ pub struct Song {
     pub bpm: f64,
     #[serde(skip)]
     pub gain: f64,
-    #[serde(skip)]
-    pub deezer_track_id: String,
 }
 
 pub fn home() -> PathBuf {
