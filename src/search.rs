@@ -57,15 +57,15 @@ fn backoff(retry: usize) {
 }
 
 pub fn yt_output(cmd: &mut Command) -> R<Output> {
-    for retry in 0..=3 {
-        wait_youtube();
-        let output = cmd.output()?;
-        if !blocked(&output) || retry == 3 {
-            return Ok(output);
-        }
-        backoff(retry);
-    }
-    Err("YouTube retry limit".into())
+    crate::retry(
+        4,
+        |_| {
+            wait_youtube();
+            Ok(cmd.output()?)
+        },
+        |result| result.as_ref().is_ok_and(blocked),
+        |attempt, _| backoff(attempt),
+    )
 }
 
 pub fn slug(s: &str) -> String {
@@ -134,8 +134,15 @@ fn ytdlp(search: &str, cfg: &Settings) -> R<Vec<Hit>> {
     let mut cmd = Command::new(&cfg.yt_dlp);
     cmd.args(["--flat-playlist", "-J", "--no-warnings", search]);
     let out = yt_output(&mut cmd)?;
-    let v: Value = serde_json::from_slice(&out.stdout)?;
-    let entries = v["entries"].as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+    let mut v: Value = serde_json::from_slice(&out.stdout)?;
+    let entries = if v["entries"].is_array() {
+        match v["entries"].take() {
+            Value::Array(entries) => entries,
+            _ => unreachable!(),
+        }
+    } else {
+        vec![v]
+    };
     Ok(entries
         .iter()
         .filter_map(|e| {

@@ -16,6 +16,22 @@ use std::{
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub(crate) fn retry<T>(
+    attempts: usize,
+    mut run: impl FnMut(usize) -> R<T>,
+    mut should_retry: impl FnMut(&R<T>) -> bool,
+    mut wait: impl FnMut(usize, &R<T>),
+) -> R<T> {
+    for attempt in 0..attempts {
+        let result = run(attempt);
+        if attempt + 1 == attempts || !should_retry(&result) {
+            return result;
+        }
+        wait(attempt, &result);
+    }
+    Err("retry limit reached".into())
+}
+
 const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"mp3","bitrate":"128k","overwrite":"skip","threads":16,"meta_threads":32,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"auth_token":null,"client_id":"","client_secret":"","no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"cache_path":null,"use_cache_file":false,"max_retries":3,"headless":false,"keep_sessions":false,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"user_auth":false,"use_official_api":false,"load_config":true}"#;
 
 const ALIASES: [(&str, &str); 4] = [
@@ -171,8 +187,9 @@ fn settings() -> R<(String, Vec<String>, Settings)> {
 fn number(mut songs: Vec<Song>, cfg: &Settings) -> Vec<Song> {
     let len = songs.len();
     songs.iter_mut().enumerate().filter(|(_, s)| cfg.playlist_numbering && s.list_name.is_some()).for_each(|(i, s)| {
-        (s.album_name, s.album_artist) =
-            (s.list_name.clone().unwrap_or_default(), s.list_name.clone().unwrap_or_default());
+        let list_name = s.list_name.as_deref().unwrap_or_default().to_string();
+        s.album_name = list_name.clone();
+        s.album_artist = list_name;
         (s.track_number, s.tracks_count, s.disc_number, s.disc_count) = (i as u32 + 1, len as u32, 1, 1);
         s.cover_url = s.cover_url.clone().filter(|_| cfg.playlist_retain_track_cover);
     });
@@ -205,8 +222,9 @@ fn run() -> R<()> {
     let sync = (op == "sync" && original.len() == 1 && original[0].ends_with(".spotdl"))
         .then(|| serde_json::from_slice::<Value>(&fs::read(&original[0]).ok()?).ok())
         .flatten();
+    let sync_path = sync.as_ref().map(|_| original[0].clone());
     let queries: Vec<String> =
-        sync.as_ref().map_or(original.clone(), |s| serde_json::from_value(s["query"].clone()).unwrap_or_default());
+        sync.as_ref().map_or_else(|| original, |s| serde_json::from_value(s["query"].clone()).unwrap_or_default());
     let errors = Mutex::new(Vec::new());
     let mut songs: Vec<Song> = queries
         .par_iter()
@@ -220,14 +238,15 @@ fn run() -> R<()> {
         })
         .collect();
     if cfg.fetch_albums {
-        let ids: HashSet<_> = songs.iter().map(|s| s.album_id.clone()).filter(|id| !id.is_empty()).collect();
+        let ids: HashSet<_> = songs.iter().map(|s| s.album_id.as_str()).filter(|id| !id.is_empty()).collect();
         let album = |id| {
             number(
                 spotify::resolve(&format!("spotify:album:{id}"), &cfg, op != "save" && op != "url").unwrap_or_default(),
                 &cfg,
             )
         };
-        songs.extend(ids.par_iter().flat_map_iter(album).collect::<Vec<_>>());
+        let albums = ids.par_iter().flat_map_iter(album).collect::<Vec<_>>();
+        songs.extend(albums);
     }
     let mut seen = HashSet::new();
     songs.retain(|s| {
@@ -246,7 +265,7 @@ fn run() -> R<()> {
         .extend(done.iter().filter_map(|(s, r)| r.as_ref().err().map(|e| format!("{} - {}: {e}", s.artist, s.name))));
     let saved: Vec<&Song> = done.iter().map(|(s, _)| s).collect();
     if op == "sync" {
-        let path = sync.as_ref().map(|_| original[0].clone()).or(cfg.save_file.clone());
+        let path = sync_path.or(cfg.save_file.clone());
         let path = path.unwrap_or_else(|| format!("{}.spotdl", download::clean(&queries[0])));
         fs::write(&path, serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": &saved}))?)?;
     }
