@@ -334,18 +334,6 @@ fn audio_url(tag: &Tag, format: TagType) -> Option<String> {
         .find_map(|key| tag_value(tag, key).filter(|value| !value.is_empty()))
 }
 
-fn yt_dlp(cfg: &Value) -> Command {
-    let mut command = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
-    for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
-        if let Some(value) = cfg[key].as_str() {
-            command.args([flag, value]);
-        }
-    }
-    command.args(cfg["yt_dlp_args"].as_str().unwrap_or_default().split_whitespace());
-    search::js_runtime_args(&mut command);
-    command
-}
-
 fn download<'a>(command: &'a mut Command, selector: &str, template: &Path, cfg: &Value) -> &'a mut Command {
     command
         .args(["-f", selector])
@@ -391,7 +379,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio/best", |entry| entry.1);
     let template = out.with_extension(format!("{id}.%(ext)s"));
     let extracted = search::yt(
-        yt_dlp(cfg).args(["-f", selector, "--no-playlist", "--no-warnings", "-q", "-j"]).arg(url),
+        search::yt_dlp(cfg).args(["-f", selector, "--no-playlist", "--no-warnings", "-q", "-j"]).arg(url),
         cfg,
         &search::DOWNLOAD_GATE,
     )?;
@@ -405,7 +393,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         let _ = fs::remove_file(&info_file);
         return Err(error.into());
     }
-    let mut y = yt_dlp(cfg);
+    let mut y = search::yt_dlp(cfg);
     y.args(["--load-info-json"]).arg(&info_file);
     let result = download(&mut y, selector, &template, cfg).output();
     let _ = fs::remove_file(&info_file);
@@ -413,7 +401,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         Some(got) => got,
         None => {
             remove_partial_download(out, id);
-            let mut y = yt_dlp(cfg);
+            let mut y = search::yt_dlp(cfg);
             let res = search::yt(download(&mut y, selector, &template, cfg).arg(url), cfg, &search::DOWNLOAD_GATE)?;
             match downloaded(&res) {
                 Some(got) => got,

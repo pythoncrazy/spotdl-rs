@@ -119,7 +119,7 @@ pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
     )
 }
 
-pub fn js_runtime_args(cmd: &mut Command) {
+fn js_runtime_args(cmd: &mut Command) {
     let deno = crate::HOME.join(if cfg!(windows) { "deno.exe" } else { "deno" });
     if deno.is_file() {
         cmd.args(["--js-runtimes", &format!("deno:{}", deno.display())]);
@@ -136,6 +136,18 @@ pub fn js_runtime_args(cmd: &mut Command) {
     }) {
         cmd.args(["--js-runtimes", &format!("{name}:{}", path.display())]);
     }
+}
+
+pub(crate) fn yt_dlp(cfg: &Value) -> Command {
+    let mut command = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
+    for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
+        if let Some(value) = cfg[key].as_str() {
+            command.args([flag, value]);
+        }
+    }
+    command.args(cfg["yt_dlp_args"].as_str().unwrap_or_default().split_whitespace());
+    js_runtime_args(&mut command);
+    command
 }
 
 pub fn slug(s: &str, sep: &str) -> String {
@@ -267,9 +279,8 @@ pub(crate) fn first_hit(song: &Song, cfg: &Value) -> R<String> {
 }
 
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
-    let mut cmd = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
+    let mut cmd = yt_dlp(cfg);
     cmd.args(["--flat-playlist", "-J", "--no-warnings"]);
-    js_runtime_args(&mut cmd);
     let out = yt(cmd.arg(search), cfg, &SEARCH_GATE)?;
     if !out.status.success() {
         return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
@@ -293,6 +304,29 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
         })
     };
     Ok(entries.iter().filter_map(hit).collect())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn yt_dlp_command_includes_proxy_cookies_and_custom_args() {
+        let cfg = serde_json::json!({
+            "yt_dlp": "yt-dlp-test",
+            "cookie_file": "/tmp/cookies.txt",
+            "proxy": "http://proxy.example:8080",
+            "yt_dlp_args": "--no-warnings --verbose"
+        });
+        let args = yt_dlp(&cfg).get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert!(args.starts_with(&[
+            "--cookies".into(),
+            "/tmp/cookies.txt".into(),
+            "--proxy".into(),
+            "http://proxy.example:8080".into(),
+        ]));
+        assert!(args.windows(2).any(|pair| pair[0] == "--no-warnings" && pair[1] == "--verbose"));
+    }
 }
 
 fn score(s: &Song, h: &Hit) -> f64 {
