@@ -644,7 +644,11 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
     if text.contains("soundcloud.com/") {
         return crate::search::source(text, cfg, false);
     }
-    let text = if text.contains("spotify.link") { crate::http_uri(text, cfg)? } else { text.to_string() };
+    let text = if text.contains("spotify.link") {
+        ureq::ResponseExt::get_uri(&crate::init_agent(cfg).get(text).call()?).to_string()
+    } else {
+        text.to_string()
+    };
     if let Some(songs) = library(&text, cfg)? {
         return Ok(songs);
     }

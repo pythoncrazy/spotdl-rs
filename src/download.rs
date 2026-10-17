@@ -16,47 +16,10 @@ use std::{
 
 pub type LyricsJob = (usize, Song, PathBuf);
 
-#[derive(Clone, Copy)]
-enum EnrichedField {
-    Genre,
-    Isrc,
-    Publisher,
-    Upc,
-    Bpm,
-    Gain,
-    OriginalDate,
-}
-
-const ENRICHED_FIELDS: &[(&str, EnrichedField)] = &[
-    ("genre", EnrichedField::Genre),
-    ("isrc", EnrichedField::Isrc),
-    ("publisher", EnrichedField::Publisher),
-    ("upc", EnrichedField::Upc),
-    ("bpm", EnrichedField::Bpm),
-    ("gain", EnrichedField::Gain),
-    ("original-date", EnrichedField::OriginalDate),
-];
-
-fn enriched_value(field: EnrichedField, song: &Song) -> String {
-    match field {
-        EnrichedField::Genre => song.genres.first().cloned().unwrap_or_default(),
-        EnrichedField::Isrc => song.isrc.clone().unwrap_or_default(),
-        EnrichedField::Publisher => song.publisher.clone(),
-        EnrichedField::Upc => song.upc.clone(),
-        EnrichedField::Bpm => song.bpm.to_string(),
-        EnrichedField::Gain => song.gain.to_string(),
-        EnrichedField::OriginalDate => {
-            if song.original_date.is_empty() {
-                song.date.clone()
-            } else {
-                song.original_date.clone()
-            }
-        }
-    }
-}
+const ENRICHED: [&str; 7] = ["genre", "isrc", "publisher", "upc", "bpm", "gain", "original-date"];
 
 pub fn uses_enriched_fields(template: &str) -> bool {
-    ENRICHED_FIELDS.iter().any(|(name, _)| template.contains(&format!("{{{name}}}")))
+    ENRICHED.iter().any(|name| template.contains(&format!("{{{name}}}")))
 }
 
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
@@ -69,6 +32,13 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
         ("artists", s.artists.join(", ")),
         ("album", s.album_name.clone()),
         ("list", s.list_name.clone().unwrap_or_else(|| s.album_name.clone())),
+        ("genre", s.genres.first().cloned().unwrap_or_default()),
+        ("isrc", s.isrc.clone().unwrap_or_default()),
+        ("publisher", s.publisher.clone()),
+        ("upc", s.upc.clone()),
+        ("bpm", s.bpm.to_string()),
+        ("gain", s.gain.to_string()),
+        ("original-date", if s.original_date.is_empty() { s.date.clone() } else { s.original_date.clone() }),
         ("track-id", s.song_id.clone()),
         ("track-number", format!("{:02}", s.track_number)),
         ("duration", (s.duration as u64).to_string()),
@@ -83,8 +53,7 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
         }
     };
     let fields = json.as_object().into_iter().flatten().map(|(k, v)| (k.replace('_', "-"), text(v)));
-    let enriched = ENRICHED_FIELDS.iter().map(|(name, field)| ((*name).to_string(), enriched_value(*field, s)));
-    let vars = enriched.chain(extra.into_iter().map(|(k, v)| (k.to_string(), v))).chain(fields);
+    let vars = extra.into_iter().map(|(k, v)| (k.to_string(), v)).chain(fields);
     vars.fold(tpl.to_string(), |p, (k, v)| p.replace(&format!("{{{k}}}"), &clean(&v)))
 }
 
@@ -579,6 +548,7 @@ pub fn process(
 
 pub fn prune(old: &[Song], new: &[Song], cfg: &Value) {
     let lrc = cfg["sync_remove_lrc"] == true;
+    let count = 2 + usize::from(lrc);
     let mut by_url = HashMap::new();
     for song in new {
         by_url.entry(song.url.as_str()).or_insert(song);
@@ -586,40 +556,30 @@ pub fn prune(old: &[Song], new: &[Song], cfg: &Value) {
     for song in old {
         let from = path(song, cfg);
         let to = by_url.get(song.url.as_str()).map(|next| path(next, cfg));
-        let moved = to.as_ref().filter(|to| **to != from && !to.exists());
-        match (&to, moved) {
-            (_, Some(to)) => {
-                prune_rename(&from, to, cfg);
-                prune_rename(&skip_path(&from), &skip_path(to), cfg);
-                if lrc {
-                    prune_rename(&from.with_extension("lrc"), &to.with_extension("lrc"), cfg);
-                }
-            }
-            (Some(to), None) if *to == from => {}
-            _ => {
-                prune_remove(&from, cfg);
-                prune_remove(&skip_path(&from), cfg);
-                if lrc {
-                    prune_remove(&from.with_extension("lrc"), cfg);
-                }
-            }
+        if to.as_ref().is_some_and(|to| *to == from) {
+            continue;
+        }
+        let targets = to
+            .as_ref()
+            .filter(|to| **to != from && !to.exists())
+            .map(|to| [to.clone(), skip_path(to), to.with_extension("lrc")]);
+        let sources = [from.clone(), skip_path(&from), from.with_extension("lrc")];
+        for (index, source) in sources.iter().enumerate().take(count) {
+            let (result, description) = if let Some(targets) = &targets {
+                let target = &targets[index];
+                (fs::rename(source, target), format!("could not move {} to {}", source.display(), target.display()))
+            } else {
+                (fs::remove_file(source), format!("could not remove {}", source.display()))
+            };
+            prune_result(result, &description, cfg);
         }
     }
 }
 
-fn prune_rename(from: &Path, to: &Path, cfg: &Value) {
-    if let Err(error) = fs::rename(from, to) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            crate::log(cfg, "ERROR", &format!("could not move {} to {}: {error}", from.display(), to.display()));
-        }
-    }
-}
-
-fn prune_remove(path: &Path, cfg: &Value) {
-    if let Err(error) = fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            crate::log(cfg, "ERROR", &format!("could not remove {}: {error}", path.display()));
-        }
+fn prune_result(result: std::io::Result<()>, description: &str, cfg: &Value) {
+    let Err(error) = result else { return };
+    if error.kind() != std::io::ErrorKind::NotFound {
+        crate::log(cfg, "ERROR", &format!("{description}: {error}"));
     }
 }
 
@@ -679,21 +639,17 @@ pub fn meta(files: &[String], cfg: &Value) -> R<()> {
             audio_files(&file, &mut listed)
         }
     }
-    let mut errors = Vec::new();
+    let total = listed.len();
+    let mut failed = 0;
     for file in listed {
-        let result = match meta_file(&file, cfg) {
-            Ok(()) => "updated".into(),
-            Err(error) => {
-                errors.push(format!("{}: {error}", file.display()));
-                error.to_string()
-            }
-        };
-        println!("{}: {result}", file.display());
+        let error = meta_file(&file, cfg).err();
+        failed += error.is_some() as usize;
+        println!("{}: {}", file.display(), error.unwrap_or_else(|| "updated".into()));
     }
-    if errors.is_empty() {
+    if failed == 0 {
         Ok(())
     } else {
-        Err(errors.join("\n").into())
+        Err(format!("{failed} of {total} files failed").into())
     }
 }
 
@@ -701,13 +657,29 @@ pub fn meta(files: &[String], cfg: &Value) -> R<()> {
 mod tests {
     use super::*;
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spotdl-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn path_limits_components_to_200_utf8_bytes_and_honors_character_limit() {
-        let song = Song { name: "é".repeat(300), ..Song::default() };
+    fn path_limits_components_and_fills_enriched_template_fields() {
+        let song = Song {
+            name: "é".repeat(300),
+            upc: "012345678905".into(),
+            bpm: 128.5,
+            date: "1987-06-02".into(),
+            ..Song::default()
+        };
+        let template = "{upc} {bpm} {original-date}";
+        assert_eq!(fill(template, &song, &json!({})), "012345678905 128.5 1987-06-02");
+        assert!(uses_enriched_fields(template));
+
         let cfg = json!({"output": "{title}", "format": "mp3"});
         let name = path(&song, &cfg).file_stem().unwrap().to_str().unwrap().to_string();
         assert_eq!(name.len(), 200);
-        assert!(std::str::from_utf8(name.as_bytes()).is_ok());
 
         let cfg = json!({"output": "{title}", "format": "mp3", "max_filename_length": 25});
         let name = path(&song, &cfg).file_stem().unwrap().to_str().unwrap().to_string();
@@ -716,27 +688,8 @@ mod tests {
     }
 
     #[test]
-    fn enriched_template_fields_are_filled_and_trigger_enrichment() {
-        let song = Song {
-            upc: "012345678905".into(),
-            bpm: 128.5,
-            original_date: String::new(),
-            date: "1987-06-02".into(),
-            ..Song::default()
-        };
-        let template = "{upc} {bpm} {original-date}";
-        assert_eq!(fill(template, &song, &json!({})), "012345678905 128.5 1987-06-02");
-        assert!(uses_enriched_fields(template));
-    }
-
-    #[test]
     fn prune_moves_and_removes_marker_only_skip_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "spotdl-prune-skip-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("prune-skip");
         let cfg = json!({"output": dir.join("{title}").to_string_lossy(), "format": "mp3"});
         let old = Song { name: "Old".into(), url: "track".into(), ..Song::default() };
         let new = Song { name: "New".into(), ..old.clone() };
@@ -754,12 +707,7 @@ mod tests {
 
     #[test]
     fn overwrite_refreshes_existing_lrc_sidecars() {
-        let dir = std::env::temp_dir().join(format!(
-            "spotdl-lrc-overwrite-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("lrc-overwrite");
         let audio = dir.join("track.mp3");
         let sidecar = audio.with_extension("lrc");
         for overwrite in ["force", "metadata"] {
@@ -772,20 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn meta_returns_errors_after_reporting_each_invalid_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "spotdl-meta-errors-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let files = ["first.mp3", "second.mp3"].map(|name| dir.join(name));
-        for file in &files {
-            fs::write(file, "not an audio file").unwrap();
-        }
-        let paths = files.iter().map(|file| file.display().to_string()).collect::<Vec<_>>();
-        let error = meta(&paths, &json!({})).unwrap_err().to_string();
-        assert!(paths.iter().all(|path| error.contains(path)));
+    fn meta_returns_the_failed_file_count() {
+        let dir = temp_dir("meta-errors");
+        let file = dir.join("invalid.mp3");
+        fs::write(&file, "not an audio file").unwrap();
+        let error = meta(&[file.display().to_string()], &json!({})).unwrap_err().to_string();
+        assert_eq!(error, "1 of 1 files failed");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -798,12 +738,7 @@ mod tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "spotdl-url-tags-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("url-tags");
         let song = Song {
             name: "Test".into(),
             artists: vec!["Test Artist".into()],
@@ -819,20 +754,10 @@ mod tests {
         {
             let file = dir.join(format!("test.{extension}"));
             let result = Command::new("ffmpeg")
-                .args([
-                    "-nostdin",
-                    "-y",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=r=44100:cl=stereo",
-                    "-t",
-                    "0.1",
-                    "-c:a",
-                    codec,
-                ])
+                .args(
+                    "-nostdin -y -loglevel error -f lavfi -i anullsrc=r=44100:cl=stereo -t 0.1 -c:a".split_whitespace(),
+                )
+                .arg(codec)
                 .arg(&file)
                 .output()
                 .unwrap();

@@ -128,20 +128,6 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
     }
 }
 
-pub fn http_uri(url: &str, cfg: &Value) -> R<String> {
-    let agent = init_agent(cfg);
-    let request = ureq::http::Request::builder().method("GET").uri(url).body(Vec::new())?;
-    let request = match cfg["timeout"].as_u64() {
-        Some(timeout) => agent.configure_request(request).timeout_global(Some(Duration::from_secs(timeout))).build(),
-        None => request,
-    };
-    let response = agent.run(request)?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {} for {url}", response.status()).into());
-    }
-    Ok(ureq::ResponseExt::get_uri(&response).to_string())
-}
-
 pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b: Option<&[u8]>, cfg: &Value) -> R<T> {
     Ok(serde_json::from_slice(&http(m, url, h, b, cfg)?)?)
 }

@@ -91,14 +91,17 @@ fn strike(gate: &Gate) {
     gate.until.fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
 }
 
-fn youtube_blocked(error: &str) -> bool {
-    ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
-        .iter()
-        .any(|sign| error.contains(sign))
-}
-
-fn youtube_retryable(error: &str, gate: &Gate) -> bool {
-    youtube_blocked(error) || gate.name == "downloads" && error.contains("Requested format is not available")
+fn youtube_retryable(error: &str) -> bool {
+    [
+        "Sign in to confirm",
+        "HTTP Error 403",
+        "HTTP Error 429",
+        "HTTP 429",
+        "Too Many Requests",
+        "Requested format is not available",
+    ]
+    .iter()
+    .any(|pattern| error.contains(pattern))
 }
 
 pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
@@ -108,13 +111,13 @@ pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
         || {
             let output = cmd.output().map_err(|error| error.to_string())?;
             let error = String::from_utf8_lossy(&output.stderr);
-            if youtube_retryable(&error, gate) {
+            if youtube_retryable(&error) {
                 Err(error.trim().to_string())
             } else {
                 Ok(output)
             }
         },
-        |error| youtube_retryable(error, gate),
+        youtube_retryable,
     )
 }
 
@@ -456,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn first_retry_stays_local() {
+    fn backoff_delays_a_first_retry_and_strikes_on_a_second_failure() {
         let gate = Gate::new("test");
         let cfg = serde_json::json!({"max_retries": 1});
         let mut attempts = 0;
@@ -475,12 +478,7 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(gate.until.load(Relaxed), 0);
-    }
 
-    #[test]
-    fn final_retryable_failure_sets_the_gate() {
-        let gate = Gate::new("test");
-        let cfg = serde_json::json!({"max_retries": 1});
         let result = with_backoff(&gate, &cfg, || Err::<(), _>("HTTP 403".into()), |_| true);
         assert!(result.is_err());
         assert_eq!(gate.strikes.load(Relaxed), 1);
@@ -488,10 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_download_format_is_retryable_only_for_downloads() {
+    fn unavailable_download_format_is_retryable() {
         let error = "ERROR: Requested format is not available";
-        assert!(youtube_retryable(error, &DOWNLOAD_GATE));
-        assert!(!youtube_retryable(error, &SEARCH_GATE));
+        assert!(youtube_retryable(error));
     }
 
     #[test]
