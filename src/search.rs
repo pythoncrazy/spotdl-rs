@@ -94,8 +94,12 @@ fn with_backoff<T>(
 }
 
 fn strike(gate: &Gate) {
-    let strike = gate.strikes.fetch_add(1, Relaxed).min(2) as usize;
-    gate.until.fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
+    let now = UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
+    let until = gate.until.load(Relaxed);
+    let wait = [30, 60, 120][gate.strikes.load(Relaxed).min(2) as usize];
+    if until <= now && gate.until.compare_exchange(until, now + wait, Relaxed, Relaxed).is_ok() {
+        gate.strikes.fetch_add(1, Relaxed);
+    }
 }
 
 fn transient(error: &str) -> bool {
