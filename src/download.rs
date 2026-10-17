@@ -158,7 +158,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                 let url = format!(
                     "https://lrclib.net/api/search?artist_name={}&track_name={}",
                     encode(&song.artist),
-                    encode(&song.name)
+                    encode(search::versionless(&song.name))
                 );
                 let bytes = lrclib_request(&url, &lyrics_cfg)?;
                 let tracks: Vec<Value> = serde_json::from_slice(&bytes).ok()?;
@@ -170,17 +170,26 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
             "genius" => {
                 let url = format!(
                     "https://genius.com/api/search/song?q={}",
-                    encode(&format!("{} {}", song.artist, song.name))
+                    encode(&format!("{} {}", song.artist, search::versionless(&song.name)))
                 );
                 let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
                 let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
                 let reply: Value = crate::http_json("GET", &url, headers, None, &lyrics_cfg).ok()?;
-                let url = reply["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
+                let artist = search::slug(&song.artist, "");
+                let hits = reply["response"]["sections"][0]["hits"].as_array()?;
+                let url = hits.iter().find(|hit| {
+                    let primary =
+                        search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
+                    !artist.is_empty()
+                        && !primary.is_empty()
+                        && (primary == artist || primary.contains(&artist) || artist.contains(&primary))
+                })?["result"]["url"]
+                    .as_str()?;
                 html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
             }
             "azlyrics" => {
                 let artist = search::slug(&song.artist, "");
-                let title = search::slug(&song.name, "");
+                let title = search::slug(search::versionless(&song.name), "");
                 html(
                     &page(&format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html"), &[])?,
                     "<!-- Usage of azlyrics.com",
@@ -191,7 +200,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                 let url = format!(
                     "https://www.musixmatch.com/lyrics/{}/{}",
                     search::slug(&song.artist, "-"),
-                    search::slug(&song.name, "-")
+                    search::slug(search::versionless(&song.name), "-")
                 );
                 let body = page(&url, &[])?.split_once("\"body\":")?.1.to_string();
                 serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?

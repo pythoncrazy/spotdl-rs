@@ -169,6 +169,10 @@ fn is_version_suffix(suffix: &str) -> bool {
         })
 }
 
+pub(crate) fn versionless(name: &str) -> &str {
+    name.rsplit_once(" - ").filter(|(_, suffix)| is_version_suffix(suffix)).map_or(name, |(title, _)| title)
+}
+
 fn ytm_retryable(error: &str) -> bool {
     let status = error
         .strip_prefix("HTTP ")
@@ -296,11 +300,7 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
-    let version = s.name.rsplit_once(" - ");
-    let versionless = version
-        .filter(|(_, suffix)| is_version_suffix(suffix))
-        .map(|(name, _)| slug(name, "-"))
-        .unwrap_or_else(|| sname.clone());
+    let versionless = slug(versionless(&s.name), "-");
     let found = |a: &String| {
         hit.artists.iter().any(|r| ratio(&slug(a, "-"), &slug(r, "-")) > 85.0) || rname.contains(&slug(a, "-"))
     };
@@ -441,6 +441,13 @@ mod tests {
         for suffix in ["Take 2", "Live At The BBC 1964", "Instrumental"] {
             assert!(!is_version_suffix(suffix), "{suffix}");
         }
+    }
+
+    #[test]
+    fn versionless_strips_only_recognized_suffixes() {
+        assert_eq!(versionless("Taxman - Remastered 2009"), "Taxman");
+        assert_eq!(versionless("Love Me Do - Mono"), "Love Me Do");
+        assert_eq!(versionless("Bad - Live at Wembley"), "Bad - Live at Wembley");
     }
 
     #[test]
