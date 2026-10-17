@@ -2,7 +2,7 @@
 
 Use this program to get audio for Spotify songs, albums, playlists, and artists.
 
-The program needs `yt-dlp` and FFmpeg. Put both tools in `PATH`.
+The program needs `yt-dlp` and FFmpeg. Put both tools in `PATH`, or use the local installers below.
 
 ```sh
 spotdl <Spotify URL>
@@ -16,7 +16,9 @@ Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an act
 
 Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`.
 
-Use `--download-ffmpeg` or `--download-deno` to install a local tool in `~/.spotdl`. The program uses the local FFmpeg file when you do not set `--ffmpeg`. It uses the local Deno file for YouTube work.
+Use `--download-ffmpeg`, `--download-deno`, or `--download-yt-dlp` to install a local tool in `~/.spotdl`. The yt-dlp installer uses the platform's onedir release in `~/.spotdl/yt-dlp_dist`; existing `~/.spotdl/yt-dlp` installs are still detected. The standalone yt-dlp build includes a YouTube challenge solver. For reliable YouTube downloads, have Deno, Node.js, or Bun in `PATH`, or run `--download-deno`. The program uses local FFmpeg and yt-dlp files when you do not set `--ffmpeg` or `--yt-dlp`. A local yt-dlp plugin avoids logged-out YouTube pre-roll ad waits when supported.
+
+Use `--key=value` when a value starts with `--`. For example, use `--yt-dlp-args="--js-runtimes node"`.
 
 Use `--check-for-updates` to check the latest release. Use `--max-retries 3` to set the number of retries after a failed request.
 
