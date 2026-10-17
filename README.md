@@ -35,3 +35,5 @@ Use `--playlist-numbering` to use the playlist name as the album name and the pl
 Use `--print-errors` to print all errors at the end. Use `--save-errors errors.txt` to save them to a file. Set `--log-level` and `--log-format` to change log output.
 
 You can use `--redownload` with `meta` to save the local songs again in the selected format. Use `--sync-remove-lrc` to remove or rename lyric files when `sync` changes files. Use `--add-unavailable` to add songs without a download to the archive and playlists.
+
+Run `cargo test` for network tests. Set `SPOTDL_E2E_YT_DLP` and `SPOTDL_E2E_YT_DLP_ARGS` to select yt-dlp.

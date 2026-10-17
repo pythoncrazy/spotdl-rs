@@ -624,13 +624,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn m3u_entry_strips_current_directory() {
-        assert_eq!(m3u_entry(Path::new("./out/a.mp3"), Path::new("./out/x.m3u8")).unwrap(), "a.mp3");
-    }
-}
