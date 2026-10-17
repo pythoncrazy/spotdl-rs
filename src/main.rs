@@ -127,8 +127,7 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
     }
 }
 
-fn settings() -> R<(String, Vec<String>, Value)> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
     let config_flag = args.iter().position(|arg| arg == "--config" || arg.starts_with("--config="));
     let config_path = match config_flag {
         Some(index) => PathBuf::from(
@@ -478,7 +477,7 @@ fn run() -> R<()> {
     if flag("--generate-config") {
         return write_default_config();
     }
-    let (op, original, mut cfg) = settings()?;
+    let (op, original, mut cfg) = settings(&args[1..])?;
     init_agent(&cfg);
     if let Some(tool) = ["ffmpeg", "deno", "yt-dlp"].into_iter().find(|tool| flag(&format!("--download-{tool}"))) {
         return install(tool, &cfg);
