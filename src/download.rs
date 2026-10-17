@@ -159,7 +159,7 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     let bpm = if id3 { s.bpm.round() } else { s.bpm };
     let bpm = if s.bpm > 0.0 { bpm.to_string() } else { String::new() };
     let bpm_key = if id3 { ItemKey::IntegerBpm } else { ItemKey::Bpm };
-    let gain = if s.gain != 0.0 { format!("{} dB", s.gain) } else { String::new() };
+    let gain = if s.gain != 0.0 { format!("{:.2} dB", -18.0 - s.gain) } else { String::new() };
     let compilation = if s.album_type == "compilation" { "1".into() } else { String::new() };
     let artists = if id3 { vec![s.artists.join("\0")] } else { s.artists.clone() };
     let tags = vec![

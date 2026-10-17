@@ -225,7 +225,14 @@ pub fn enrich(song: &mut Song, cfg: &Value) {
         if let Some(label) = deezer["label"].as_str() {
             song.publisher = label.into();
         }
-        song.original_date = deezer["release_date"].as_str().unwrap_or_default().into();
+        let release_date = deezer["release_date"].as_str().unwrap_or_default();
+        song.original_date = if release_date.is_empty() {
+            String::new()
+        } else if song.date.is_empty() || release_date < song.date.as_str() {
+            release_date.into()
+        } else {
+            song.date.clone()
+        };
         if song.isrc.as_deref().is_none_or(str::is_empty) {
             let track = &deezer["tracks"][format!("{}:{}", song.disc_number, song.track_number)];
             song.isrc = track["isrc"].as_str().filter(|isrc| !isrc.is_empty()).map(String::from);
