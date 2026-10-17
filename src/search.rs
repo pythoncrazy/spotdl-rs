@@ -97,7 +97,7 @@ fn transient(error: &str) -> bool {
 
 fn youtube_retryable(error: &str) -> bool {
     transient(error)
-        || ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
+        || ["not a bot", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
             .iter()
             .any(|pattern| error.contains(pattern))
 }
@@ -465,6 +465,9 @@ mod tests {
 
     #[test]
     fn backoff_delays_a_first_retry_and_strikes_on_a_second_failure() {
+        for message in ["Sign in to confirm you're not a bot", "Sign in to confirm you’re not a bot"] {
+            assert!(youtube_retryable(message));
+        }
         let gate = Gate::new("test");
         let cfg = serde_json::json!({"max_retries": 1});
         let mut attempts = 0;
@@ -488,6 +491,14 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(gate.strikes.load(Relaxed), 1);
         assert!(gate.until.load(Relaxed) > 0);
+
+        let gate = Gate::new("downloads");
+        let age_restricted = "Sign in to confirm your age. This video may be inappropriate.";
+        assert!(!youtube_retryable(age_restricted));
+        let result = with_backoff(&gate, &cfg, || Err::<(), _>(age_restricted.into()), youtube_retryable);
+        assert!(result.is_err());
+        assert_eq!(gate.until.load(Relaxed), 0);
+        assert_eq!(gate.strikes.load(Relaxed), 0);
     }
 
     #[test]
