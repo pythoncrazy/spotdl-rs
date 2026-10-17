@@ -128,10 +128,14 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
 
 fn settings() -> R<(String, Vec<String>, Value)> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config_flag = args.iter().position(|arg| arg == "--config");
+    let config_flag = args.iter().position(|arg| arg == "--config" || arg.starts_with("--config="));
     let config_path = match config_flag {
         Some(index) => PathBuf::from(
-            args.get(index + 1).filter(|arg| !arg.starts_with("--")).ok_or("--config requires a file path")?,
+            args[index]
+                .strip_prefix("--config=")
+                .filter(|path| !path.is_empty())
+                .or_else(|| args.get(index + 1).filter(|arg| !arg.starts_with("--")).map(String::as_str))
+                .ok_or("--config requires a file path")?,
         ),
         None => HOME.join("config.json"),
     };
@@ -153,17 +157,25 @@ fn settings() -> R<(String, Vec<String>, Value)> {
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let Some(raw_key) = args[i].strip_prefix("--").map(|s| s.replace('-', "_")) else {
+        let Some(argument) = args[i].strip_prefix("--") else {
             positional.push(args[i].clone());
             i += 1;
             continue;
         };
+        let (raw_key, inline_value) =
+            argument.split_once('=').map_or((argument, None), |(key, value)| (key, Some(value)));
+        let raw_key = raw_key.replace('-', "_");
+        let inline = inline_value.is_some();
         if raw_key == "config" {
-            i += usize::from(args.get(i + 1).is_some_and(|value| !value.starts_with("--"))) + 1;
+            i += usize::from(inline_value.is_none() && args.get(i + 1).is_some_and(|value| !value.starts_with("--")))
+                + 1;
             continue;
         }
         let key = ALIASES.iter().find(|a| a.0 == raw_key.as_str()).map_or(raw_key.as_str(), |a| a.1);
-        let rest = args[i + 1..].iter().map(String::as_str).take_while(|v| !v.starts_with("--")).collect::<Vec<_>>();
+        let rest = inline_value.map_or_else(
+            || args[i + 1..].iter().map(String::as_str).take_while(|v| !v.starts_with("--")).collect(),
+            |value| vec![value],
+        );
         let values =
             rest.iter().flat_map(|v| v.split(',')).map(str::trim).filter(|v| !v.is_empty()).collect::<Vec<_>>();
         let (take, value) = match (raw.get(key), rest.first().copied()) {
@@ -175,13 +187,16 @@ fn settings() -> R<(String, Vec<String>, Value)> {
             (Some(Value::Number(_)), Some(v)) => (1, json!(v.parse::<usize>()?)),
             (Some(_), Some(v)) => (1, json!(v)),
             (Some(_), _) => (0, json!("")),
-            (None, _) if !["help", "check_for_updates", "download_ffmpeg", "download_deno"].contains(&key) => {
+            (None, _)
+                if !["help", "check_for_updates", "download_ffmpeg", "download_deno", "download_yt_dlp"]
+                    .contains(&key) =>
+            {
                 return Err(format!("unknown option --{raw_key}").into());
             }
             (None, _) => (0, json!(true)),
         };
         raw[key] = value;
-        i += take + 1;
+        i += if inline { 1 } else { take + 1 };
     }
     if raw["m3u"].is_boolean() {
         let enabled = raw["m3u"] == true;
@@ -191,6 +206,11 @@ fn settings() -> R<(String, Vec<String>, Value)> {
     let local_ffmpeg = HOME.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
     if !explicit_ffmpeg && raw["ffmpeg"] == "ffmpeg" && local_ffmpeg.is_file() {
         raw["ffmpeg"] = json!(local_ffmpeg.to_string_lossy());
+    }
+    let explicit_yt_dlp = args.iter().any(|arg| arg == "--yt-dlp" || arg.starts_with("--yt-dlp="));
+    let local_yt_dlp = HOME.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+    if !explicit_yt_dlp && raw["yt_dlp"] == "yt-dlp" && local_yt_dlp.is_file() {
+        raw["yt_dlp"] = json!(local_yt_dlp.to_string_lossy());
     }
     let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
     let op = if known { positional.remove(0) } else { "download".into() };
@@ -234,20 +254,30 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
         ("macos-aarch64", "darwin-arm64", Some("aarch64-apple-darwin")),
     ];
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let name = table.iter().find(|entry| entry.0 == target).and_then(|entry| {
-        if tool == "ffmpeg" {
-            (!entry.1.is_empty()).then_some(entry.1)
-        } else {
-            entry.2
+    let name = if tool == "yt-dlp" {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "yt-dlp_linux",
+            ("linux", "aarch64") => "yt-dlp_linux_aarch64",
+            ("macos", "x86_64" | "aarch64") => "yt-dlp_macos",
+            ("windows", "x86_64") => "yt-dlp.exe",
+            _ => return Err(format!("{tool} binary is not available for this system").into()),
         }
-    });
-    let name = name.ok_or(format!("{tool} binary is not available for your system"))?;
+    } else {
+        table
+            .iter()
+            .find(|entry| entry.0 == target)
+            .and_then(|entry| if tool == "ffmpeg" { (!entry.1.is_empty()).then_some(entry.1) } else { entry.2 })
+            .ok_or(format!("{tool} binary is not available for this system"))?
+    };
     let member = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
     let file = HOME.join(&member);
     fs::create_dir_all(&*HOME)?;
     let binary = if tool == "ffmpeg" {
         let url = format!("https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/{name}");
         http("GET", &url, &[], None, cfg)?
+    } else if tool == "yt-dlp" {
+        let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}");
+        http("GET", &url, &[("User-Agent", "spotdl-rs")], None, cfg)?
     } else {
         let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
         let url = format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim());
@@ -452,7 +482,7 @@ fn run() -> R<()> {
     }
     let (op, original, mut cfg) = settings()?;
     init_agent(&cfg);
-    if let Some(tool) = ["ffmpeg", "deno"].into_iter().find(|tool| flag(&format!("--download-{tool}"))) {
+    if let Some(tool) = ["ffmpeg", "deno", "yt-dlp"].into_iter().find(|tool| flag(&format!("--download-{tool}"))) {
         return install(tool, &cfg);
     }
     if flag("--check-for-updates") {

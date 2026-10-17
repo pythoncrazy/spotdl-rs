@@ -57,7 +57,14 @@ pub fn path(s: &Song, cfg: &Value) -> PathBuf {
         if value == "." || value == ".." {
             "_".to_string()
         } else {
-            value.chars().take(max).collect()
+            let mut component = String::new();
+            for character in value.chars().take(max) {
+                if component.len() + character.len_utf8() > 200 {
+                    break;
+                }
+                component.push(character);
+            }
+            component
         }
     };
     let parts = tpl.trim_start_matches('/').trim_end_matches(".{output-ext}").split('/').map(part);
@@ -145,6 +152,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
 fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     let mut f = lofty::read_from_path(file)?;
     let format = f.primary_tag_type();
+    let url_key = audio_url_key(format);
     let mut t = Tag::new(format);
     t.set_title(s.name.clone());
     t.set_artist(s.artists.join(cfg["id3_separator"].as_str().unwrap_or("/")));
@@ -162,7 +170,7 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     let gain = if s.gain != 0.0 { format!("{:.2} dB", -18.0 - s.gain) } else { String::new() };
     let compilation = if s.album_type == "compilation" { "1".into() } else { String::new() };
     let artists = if id3 { vec![s.artists.join("\0")] } else { s.artists.clone() };
-    let tags = vec![
+    let mut tags = vec![
         (ItemKey::AlbumArtist, vec![s.album_artist.clone()]),
         (ItemKey::RecordingDate, vec![s.date.clone()]),
         (ItemKey::ReleaseDate, vec![s.date.clone()]),
@@ -180,9 +188,11 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
         (ItemKey::TrackArtists, artists),
         (ItemKey::Genre, s.genres.clone()),
         (ItemKey::Unknown("RELEASETYPE".into()), vec![s.album_type.clone()]),
-        (ItemKey::AudioFileUrl, vec![s.url.clone()]),
-        (ItemKey::AudioSourceUrl, vec![s.url.clone()]),
     ];
+    if id3 {
+        tags.push((ItemKey::AudioSourceUrl, vec![s.url.clone()]));
+    }
+    tags.push((url_key, vec![s.url.clone()]));
     tags.into_iter().for_each(|(key, values)| {
         values.into_iter().filter(|value| !value.is_empty()).for_each(|value| {
             let item_value = if key == ItemKey::AudioFileUrl || key == ItemKey::AudioSourceUrl {
@@ -191,7 +201,7 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
                 ItemValue::Text(value)
             };
             let item = TagItem::new(key.clone(), item_value);
-            if key == ItemKey::Unknown("RELEASETYPE".into()) {
+            if matches!(key, ItemKey::Unknown(_)) {
                 t.insert_unchecked(item);
             } else {
                 t.push(item);
@@ -213,6 +223,24 @@ fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
     f.save_to_path(file, WriteOptions::default()).map_err(Into::into)
 }
 
+fn audio_url_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::Id3v2 => ItemKey::AudioFileUrl,
+        TagType::Mp4Ilst => ItemKey::Unknown("----:com.apple.iTunes:WWWAUDIOFILE".into()),
+        _ => ItemKey::Unknown("WWWAUDIOFILE".into()),
+    }
+}
+
+fn tag_value(tag: &Tag, key: &ItemKey) -> Option<String> {
+    tag.get(key).and_then(|item| item.value().text().or(item.value().locator())).map(String::from)
+}
+
+fn audio_url(tag: &Tag, format: TagType) -> Option<String> {
+    [audio_url_key(format), ItemKey::AudioFileUrl, ItemKey::AudioSourceUrl]
+        .iter()
+        .find_map(|key| tag_value(tag, key).filter(|value| !value.is_empty()))
+}
+
 fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let text = |key: &str| cfg[key].as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>();
     let format = cfg["format"].as_str().unwrap_or("mp3");
@@ -232,7 +260,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         y.args(["--sponsorblock-remove", "all"]);
     }
     y.args(text("yt_dlp_args"));
-    search::deno_args(&mut y);
+    search::js_runtime_args(&mut y);
     let res = search::yt(y.arg(url), cfg)?;
     let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
     if !res.status.success() || !got.is_file() {
@@ -447,10 +475,9 @@ pub fn prune(old: &[Song], new: &[Song], cfg: &Value) {
 
 fn meta_file(file: &Path, cfg: &Value) -> R<()> {
     let tags = lofty::read_from_path(file)?;
+    let format = tags.primary_tag_type();
     let primary = tags.primary_tag().ok_or("no tags")?;
-    let value = |key: &ItemKey| {
-        primary.get(key).and_then(|item| item.value().text().or(item.value().locator())).map(String::from)
-    };
+    let value = |key: &ItemKey| tag_value(primary, key);
     let filled = |key: &ItemKey| value(key).is_some_and(|value| !value.is_empty());
     let complete = primary.title().is_some_and(|title| !title.is_empty())
         && primary.artist().is_some_and(|artist| !artist.is_empty())
@@ -467,7 +494,7 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
         }
         return Ok(());
     }
-    let url = value(&ItemKey::AudioFileUrl).filter(|url| url.contains("spotify"));
+    let url = audio_url(primary, format).filter(|url| url.contains("spotify"));
     let query = url.unwrap_or_else(|| {
         format!("{} - {}", primary.artist().unwrap_or_default(), primary.title().unwrap_or_default())
     });
@@ -507,4 +534,72 @@ pub fn meta(files: &[String], cfg: &Value) -> R<()> {
         println!("{}: {result}", file.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_limits_components_to_200_utf8_bytes_and_honors_character_limit() {
+        let song = Song { name: "é".repeat(300), ..Song::default() };
+        let cfg = json!({"output": "{title}", "format": "mp3"});
+        let name = path(&song, &cfg).file_stem().unwrap().to_str().unwrap().to_string();
+        assert_eq!(name.len(), 200);
+        assert!(std::str::from_utf8(name.as_bytes()).is_ok());
+
+        let cfg = json!({"output": "{title}", "format": "mp3", "max_filename_length": 25});
+        let name = path(&song, &cfg).file_stem().unwrap().to_str().unwrap().to_string();
+        assert_eq!(name.chars().count(), 25);
+        assert_eq!(name.len(), 50);
+    }
+
+    #[test]
+    fn spotify_url_round_trips_for_supported_audio_formats() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotdl-url-tags-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let song = Song {
+            name: "Test".into(),
+            artists: vec!["Test Artist".into()],
+            url: "https://open.spotify.com/track/test".into(),
+            ..Song::default()
+        };
+        let cfg = json!({"skip_album_art": true});
+
+        for (extension, codec) in
+            [("mp3", "libmp3lame"), ("m4a", "aac"), ("opus", "libopus"), ("ogg", "libvorbis"), ("flac", "flac")]
+        {
+            let file = dir.join(format!("test.{extension}"));
+            let result = Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=44100:cl=stereo",
+                    "-t",
+                    "0.1",
+                    "-c:a",
+                    codec,
+                ])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{extension}: {}", String::from_utf8_lossy(&result.stderr));
+            tag(&file, &song, &cfg).unwrap();
+            let tags = lofty::read_from_path(&file).unwrap();
+            let format = tags.primary_tag_type();
+            let primary = tags.primary_tag().unwrap();
+            assert_eq!(audio_url(primary, format).as_deref(), Some(song.url.as_str()), "{extension}");
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

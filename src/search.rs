@@ -49,7 +49,7 @@ pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
         std::thread::sleep(Duration::from_secs(wait));
         let output = cmd.output()?;
         let error = String::from_utf8_lossy(&output.stderr);
-        let signs = ["Sign in to confirm", "HTTP Error 429", "HTTP 429", "Too Many Requests"];
+        let signs = ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"];
         if !signs.iter().any(|sign| error.contains(sign)) {
             STRIKES.store(0, Relaxed);
             return Ok(output);
@@ -58,19 +58,27 @@ pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
             return Err(error.trim().to_string().into());
         }
         let strike = STRIKES.fetch_add(1, Relaxed).min(2) as usize;
-        let test = std::env::var("SPOTDL_TEST_BACKOFF_SECONDS").ok().and_then(|value| value.parse().ok());
-        BLOCKED_UNTIL.fetch_max(
-            UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + test.unwrap_or([30, 60, 120][strike]),
-            Relaxed,
-        );
+        BLOCKED_UNTIL.fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
     }
     Err("YouTube blocked downloads".into())
 }
 
-pub fn deno_args(cmd: &mut Command) {
+pub fn js_runtime_args(cmd: &mut Command) {
     let deno = crate::HOME.join(if cfg!(windows) { "deno.exe" } else { "deno" });
     if deno.is_file() {
         cmd.args(["--js-runtimes", &format!("deno:{}", deno.display())]);
+        return;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    if let Some((name, path)) = ["deno", "node", "bun"].into_iter().find_map(|name| {
+        let executable = format!("{name}{suffix}");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&executable))
+            .find(|path| path.is_file())
+            .map(|path| (name, path))
+    }) {
+        cmd.args(["--js-runtimes", &format!("{name}:{}", path.display())]);
     }
 }
 
@@ -93,6 +101,28 @@ pub fn ratio(a: &str, b: &str) -> f64 {
     } else {
         200.0 * row[b.len()] as f64 / n
     }
+}
+
+fn is_version_suffix(suffix: &str) -> bool {
+    let words = slug(suffix, "-");
+    !words.is_empty()
+        && words.split('-').all(|word| {
+            word.bytes().all(|byte| byte.is_ascii_digit())
+                || matches!(
+                    word,
+                    "remaster"
+                        | "remastered"
+                        | "mono"
+                        | "stereo"
+                        | "mix"
+                        | "version"
+                        | "edit"
+                        | "single"
+                        | "radio"
+                        | "deluxe"
+                        | "anniversary"
+                )
+        })
 }
 
 fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
@@ -139,7 +169,7 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
     let mut cmd = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
     cmd.args(["--flat-playlist", "-J", "--no-warnings"]);
-    deno_args(&mut cmd);
+    js_runtime_args(&mut cmd);
     let out = yt(cmd.arg(search), cfg)?;
     if !out.status.success() {
         return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
@@ -168,6 +198,12 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
+    let versionless = s
+        .name
+        .rsplit_once(" - ")
+        .filter(|(_, suffix)| is_version_suffix(suffix))
+        .map(|(name, _)| slug(name, "-"))
+        .unwrap_or_else(|| sname.clone());
     let found = |a: &String| {
         hit.artists.iter().any(|r| ratio(&slug(a, "-"), &slug(r, "-")) > 85.0) || rname.contains(&slug(a, "-"))
     };
@@ -178,14 +214,26 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
     let fwords = FORBIDDEN.split(' ').filter(|w| rname.contains(w) && !sname.contains(w)).count() as f64;
     let stripped = s.artists.iter().fold(slug(&hit.name, "-"), |n, a| n.replace(&slug(a, "-"), ""));
-    let name = ratio(&sname, &rname).max(ratio(&sname, stripped.trim_matches('-'))) - 15.0 * fwords;
+    let stripped = stripped.trim_matches('-');
+    let name = ratio(&sname, &rname)
+        .max(ratio(&sname, stripped))
+        .max(ratio(&versionless, &rname))
+        .max(ratio(&versionless, stripped))
+        - 15.0 * fwords;
+    let suffix_matches = s
+        .name
+        .rsplit_once(" - ")
+        .filter(|(_, suffix)| !is_version_suffix(suffix))
+        .map(|(_, suffix)| slug(suffix, "-"))
+        .filter(|suffix| !suffix.is_empty())
+        .is_none_or(|suffix| rname.contains(&suffix) || stripped.contains(&suffix));
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
     let album =
         if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
     let avg = (artists + name) / 2.0;
     let avg =
         if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
-    let skip = name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
+    let skip = !suffix_matches || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
@@ -253,4 +301,62 @@ pub fn source(url: &str, cfg: &Value, lookup: bool) -> R<Vec<Song>> {
         Some(song)
     };
     Ok(ytdlp(url, cfg)?.into_iter().take(count).filter_map(song).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn song(name: &str) -> Song {
+        Song {
+            name: name.into(),
+            artist: "The Beatles".into(),
+            artists: vec!["The Beatles".into()],
+            duration: 140.0,
+            ..Song::default()
+        }
+    }
+
+    fn hit(name: &str) -> Hit {
+        Hit {
+            song: hit_song(
+                "https://youtube.com/watch?v=test".into(),
+                name.into(),
+                vec!["The Beatles".into()],
+                "".into(),
+                140.0,
+            ),
+            ..Hit::default()
+        }
+    }
+
+    #[test]
+    fn version_suffixes_allow_a_remastered_title_match() {
+        assert!(score(&song("I Feel Fine - Remastered 2015"), &hit("I Feel Fine")) > 0.0);
+    }
+
+    #[test]
+    fn unrecognized_suffixes_are_not_removed_from_a_match() {
+        assert_eq!(score(&song("I Feel Fine - Take 2"), &hit("I Feel Fine")), 0.0);
+        assert!(score(&song("I Feel Fine - Take 2"), &hit("I Feel Fine - Take 2")) > 0.0);
+    }
+
+    #[test]
+    fn only_recognized_version_suffix_words_are_allowed() {
+        for suffix in [
+            "Remastered 2009",
+            "2009 Remaster",
+            "Mono",
+            "Stereo",
+            "2018 Mix",
+            "Single Version",
+            "Radio Edit",
+            "Deluxe Anniversary",
+        ] {
+            assert!(is_version_suffix(suffix), "{suffix}");
+        }
+        for suffix in ["Take 2", "Live At The BBC 1964", "Instrumental"] {
+            assert!(!is_version_suffix(suffix), "{suffix}");
+        }
+    }
 }
