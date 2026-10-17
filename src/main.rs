@@ -347,11 +347,9 @@ pub fn log(cfg: &Value, level: &str, message: &str) {
 }
 
 pub fn url_encode(value: &str) -> String {
-    let encode = |byte: u8| match byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-        true => (byte as char).to_string(),
-        false => format!("%{byte:02X}"),
-    };
-    value.bytes().map(encode).collect()
+    const UNRESERVED: &percent_encoding::AsciiSet =
+        &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+    percent_encoding::utf8_percent_encode(value, UNRESERVED).to_string()
 }
 
 fn number(mut songs: Vec<Song>, cfg: &Value) -> Vec<Song> {
