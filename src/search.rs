@@ -239,16 +239,16 @@ pub(crate) fn apply_ytm_data(song: &mut Song, source: Song, copy: bool) {
     song.download_url = source.download_url;
 }
 
-pub fn source(url: &str, cfg: &Value, lookup: Option<bool>) -> R<Vec<Song>> {
+pub fn source(url: &str, cfg: &Value, lookup: bool) -> R<Vec<Song>> {
     let count =
         if url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?")) { 1 } else { usize::MAX };
     let music = url.contains("music.youtube.com");
     let song = |hit: Hit| {
-        let Some(enrich) = lookup.filter(|_| music) else {
+        if !lookup || !music {
             return Some(hit.song);
-        };
+        }
         let query = format!("{} - {}", hit.song.artists.join(", "), hit.song.name);
-        let mut song = crate::spotify::resolve(&query, cfg, enrich).ok()?.into_iter().next()?;
+        let mut song = crate::spotify::resolve(&query, cfg).ok()?.into_iter().next()?;
         apply_ytm_data(&mut song, hit.song, cfg["ytm_data"] == true);
         Some(song)
     };

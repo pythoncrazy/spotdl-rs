@@ -78,16 +78,22 @@ pub struct Song {
     pub gain: f64,
 }
 
-pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
-    let agent = AGENT.get_or_init(|| {
+fn init_agent(cfg: &Value) -> &'static ureq::Agent {
+    AGENT.get_or_init(|| {
         let proxy = cfg["proxy"].as_str().and_then(|proxy| ureq::Proxy::new(proxy).ok());
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
+            .max_idle_connections(256)
+            .max_idle_connections_per_host(64)
             .proxy(proxy)
             .build();
         ureq::Agent::new_with_config(config)
-    });
+    })
+}
+
+pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
+    let agent = init_agent(cfg);
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3).max(1);
     let mut attempt = 1;
     loop {
@@ -95,7 +101,14 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
         for (key, value) in headers {
             request = request.header(*key, *value);
         }
-        let response = agent.run(request.body(body.unwrap_or_default().to_vec())?);
+        let request = request.body(body.unwrap_or_default().to_vec())?;
+        let request = match cfg["timeout"].as_u64() {
+            Some(timeout) => {
+                agent.configure_request(request).timeout_global(Some(Duration::from_secs(timeout))).build()
+            }
+            None => request,
+        };
+        let response = agent.run(request);
         let retry = match &response {
             Ok(reply) => reply.status() == 429 || reply.status().is_server_error(),
             Err(_) => true,
@@ -338,8 +351,7 @@ fn number(mut songs: Vec<Song>, cfg: &Value) -> Vec<Song> {
 }
 
 fn resolve(queries: &[String], op: &str, cfg: &Value) -> (Vec<Song>, Vec<String>) {
-    let enrich = op != "save" && op != "url";
-    let fetch = |query: &String| match spotify::resolve(query, cfg, enrich) {
+    let fetch = |query: &String| match spotify::resolve(query, cfg) {
         Ok(songs) => (number(songs, cfg), Vec::new()),
         Err(error) => (Vec::new(), vec![format!("{query}: {error}")]),
     };
@@ -364,6 +376,14 @@ fn resolve(queries: &[String], op: &str, cfg: &Value) -> (Vec<Song>, Vec<String>
     (songs, errors)
 }
 
+fn m3u_entry(song: &Path, playlist: &Path) -> R<String> {
+    let song = std::path::absolute(song)?;
+    let dir = std::path::absolute(playlist)?.parent().map(PathBuf::from).unwrap_or_default();
+    let shared = song.components().zip(dir.components()).take_while(|(a, b)| a == b).count();
+    let up = std::iter::repeat_n(std::path::Component::ParentDir, dir.components().count() - shared);
+    Ok(up.chain(song.components().skip(shared)).collect::<PathBuf>().display().to_string())
+}
+
 fn write_m3u(done: &[(Song, R<PathBuf>)], op: &str, cfg: &Value) -> R<()> {
     let Some(pattern) = cfg["m3u"].as_str().filter(|_| op != "url") else {
         return Ok(());
@@ -376,13 +396,16 @@ fn write_m3u(done: &[(Song, R<PathBuf>)], op: &str, cfg: &Value) -> R<()> {
     };
     let first = done.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song, cfg));
     let mut files = std::collections::BTreeMap::<String, String>::new();
-    let keep = |result: &R<PathBuf>| op != "download" || cfg["add_unavailable"] == true || result.is_ok();
+    let keep = |result: &R<PathBuf>| {
+        op != "download" || cfg["add_unavailable"] == true || result.as_ref().is_ok_and(|path| path.is_file())
+    };
     for (song, result) in done.iter().filter(|(_, result)| keep(result)) {
         let path = result.as_ref().map_or_else(|_| download::path(song, cfg), Clone::clone);
         let name = download::fill(&format!("{pattern}{suffix}"), song, cfg).replace("{list[0]}", &first);
         let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", song, cfg);
+        let entry = m3u_entry(&path, Path::new(&name))?;
         let file = files.entry(name).or_insert_with(|| "#EXTM3U\n".into());
-        file.push_str(&format!("{line}\n{}\n", path.display()));
+        file.push_str(&format!("{line}\n{entry}\n"));
     }
     for (name, text) in files {
         let parent = Path::new(&name).parent().filter(|parent| !parent.as_os_str().is_empty());
@@ -428,6 +451,7 @@ fn run() -> R<()> {
         return write_default_config();
     }
     let (op, original, mut cfg) = settings()?;
+    init_agent(&cfg);
     if let Some(tool) = ["ffmpeg", "deno"].into_iter().find(|tool| flag(&format!("--download-{tool}"))) {
         return install(tool, &cfg);
     }
@@ -491,5 +515,15 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m3u_entry_strips_current_directory() {
+        assert_eq!(m3u_entry(Path::new("./out/a.mp3"), Path::new("./out/x.m3u8")).unwrap(), "a.mp3");
     }
 }

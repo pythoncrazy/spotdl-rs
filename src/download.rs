@@ -6,9 +6,11 @@ use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
@@ -83,8 +85,11 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
 }
 
 pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
+    let mut lyrics_cfg = cfg.clone();
+    lyrics_cfg["max_retries"] = json!(1);
+    lyrics_cfg["timeout"] = json!(10);
     let page = |url: &str, headers: &[(&str, &str)]| {
-        let bytes = crate::http("GET", url, headers, None, &json!({"max_retries": 1})).ok()?;
+        let bytes = crate::http("GET", url, headers, None, &lyrics_cfg).ok()?;
         String::from_utf8(bytes).ok()
     };
     let encode = crate::url_encode;
@@ -275,20 +280,9 @@ fn append(path: Option<&str>, line: &str) -> R<()> {
     Ok(())
 }
 
-fn output_root(cfg: &Value) -> PathBuf {
-    let output = Path::new(cfg["output"].as_str().unwrap_or_default());
-    let root: PathBuf =
-        output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect();
-    if root.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        root
-    }
-}
-
 fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
     for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()) {
-        let extension = path.extension().map(|value| value.to_string_lossy().to_string()).unwrap_or_default();
+        let extension = path.extension().map(|value| value.to_string_lossy().to_lowercase()).unwrap_or_default();
         if path.is_dir() {
             audio_files(&path, files);
         } else if ["mp3", "flac", "ogg", "opus", "m4a", "wav"].contains(&extension.as_str()) {
@@ -298,21 +292,38 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 static SCAN: std::sync::OnceLock<std::collections::HashMap<String, PathBuf>> = std::sync::OnceLock::new();
+static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 
 fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
-    if let Some(lyrics) = song.lyrics.as_deref().filter(|text| cfg["generate_lrc"] == true && text.starts_with('[')) {
-        fs::write(file.with_extension("lrc"), lyrics)?;
+    let sidecar = file.with_extension("lrc");
+    if let Some(lyrics) =
+        song.lyrics.as_deref().filter(|text| cfg["generate_lrc"] == true && !sidecar.exists() && text.starts_with('['))
+    {
+        fs::write(sidecar, lyrics)?;
     }
     Ok(())
 }
 
 fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
+    let should_enrich = op != "save" && op != "url";
+    let enriched_for_output = should_enrich
+        && cfg["output"].as_str().is_some_and(|output| {
+            ["{genre", "{isrc}", "{publisher}", "{upc}", "{bpm}", "{gain}", "{original_date}"]
+                .iter()
+                .any(|field| output.contains(field))
+        });
+    if enriched_for_output {
+        crate::spotify::enrich(s, cfg);
+    }
     let out = path(s, cfg);
     let formats = cfg["detect_formats"].as_array().into_iter().flatten().filter_map(Value::as_str);
     let detected = formats.map(|format| out.with_extension(format)).find(|path| path.is_file());
     let scan = || {
         let mut files = Vec::new();
-        audio_files(&output_root(cfg), &mut files);
+        let output = Path::new(cfg["output"].as_str().unwrap_or_default());
+        let root: PathBuf =
+            output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect();
+        audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
         files
             .into_iter()
             .filter_map(|file| {
@@ -333,9 +344,11 @@ fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
         return Ok(target);
     }
     let archive = cfg["archive"].as_str();
-    let archived = archive
-        .and_then(|file| fs::read_to_string(file).ok())
-        .is_some_and(|text| text.lines().any(|line| line == s.url));
+    let archived = archive.is_some_and(|file| {
+        ARCHIVED
+            .get_or_init(|| fs::read_to_string(file).unwrap_or_default().lines().map(String::from).collect())
+            .contains(&s.url)
+    });
     let skip = cfg["respect_skip_file"] == true && Path::new(&format!("{}.skip", target.display())).exists();
     let exists = target.is_file();
     let overwrite = cfg["overwrite"].as_str().unwrap_or("skip");
@@ -345,37 +358,50 @@ fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
         }
         return Ok(target);
     }
-    let candidates = match &s.download_url {
-        Some(url) => vec![url.clone()],
-        None if exists && overwrite == "metadata" && op != "url" => Vec::new(),
-        None => search::find(s, cfg)?,
-    };
-    if op == "url" {
-        s.download_url = candidates.first().cloned();
-        return Ok(target);
+    if should_enrich && !enriched_for_output {
+        crate::spotify::enrich(s, cfg);
     }
-    if !exists || overwrite == "force" {
-        fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-        let id = if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
-        let mut error = String::from("no match");
-        let mut fetched =
-            candidates.iter().filter(|url| fetch(url, &out, &id, cfg).map_err(|e| error = e.to_string()).is_ok());
-        s.download_url = Some(fetched.next().ok_or(error)?.clone());
-        if target != out && target.is_file() {
-            fs::remove_file(&target)?;
+    let will_download = op != "url" && (!exists || overwrite == "force");
+    std::thread::scope(|scope| -> R<PathBuf> {
+        let pending = (will_download && s.lyrics.is_none()).then(|| {
+            let song = s.clone();
+            scope.spawn(move || lyrics(&song, cfg))
+        });
+        let candidates = match &s.download_url {
+            Some(url) => vec![url.clone()],
+            None if exists && overwrite == "metadata" && op != "url" => Vec::new(),
+            None => search::find(s, cfg)?,
+        };
+        if op == "url" {
+            s.download_url = candidates.first().cloned();
+            return Ok(target);
         }
-        target = out;
-    }
-    if s.lyrics.is_none() {
-        s.lyrics = lyrics(s, cfg);
-    }
-    tag(&target, s, cfg)?;
-    write_lrc(&target, s, cfg)?;
-    if cfg["create_skip_file"] == true {
-        fs::write(format!("{}.skip", target.display()), "")?;
-    }
-    append(archive, &s.url)?;
-    Ok(target)
+        if will_download {
+            fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+            let id =
+                if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
+            let mut error = String::from("no match");
+            let mut fetched =
+                candidates.iter().filter(|url| fetch(url, &out, &id, cfg).map_err(|e| error = e.to_string()).is_ok());
+            s.download_url = Some(fetched.next().ok_or(error)?.clone());
+            if target != out && target.is_file() {
+                fs::remove_file(&target)?;
+            }
+            target = out.clone();
+        }
+        if let Some(task) = pending {
+            s.lyrics = task.join().ok().flatten();
+        } else if s.lyrics.is_none() {
+            s.lyrics = lyrics(s, cfg);
+        }
+        tag(&target, s, cfg)?;
+        write_lrc(&target, s, cfg)?;
+        if cfg["create_skip_file"] == true {
+            fs::write(format!("{}.skip", target.display()), "")?;
+        }
+        append(archive, &s.url)?;
+        Ok(target)
+    })
 }
 
 pub fn process(mut s: Song, op: &str, cfg: &Value) -> (Song, R<PathBuf>) {
@@ -397,9 +423,13 @@ pub fn process(mut s: Song, op: &str, cfg: &Value) -> (Song, R<PathBuf>) {
 
 pub fn prune(old: &[Song], new: &[Song], cfg: &Value) {
     let lrc = cfg["sync_remove_lrc"] == true;
+    let mut by_url = HashMap::new();
+    for song in new {
+        by_url.entry(song.url.as_str()).or_insert(song);
+    }
     for song in old {
         let from = path(song, cfg);
-        let to = new.iter().find(|next| next.url == song.url).map(|next| path(next, cfg));
+        let to = by_url.get(song.url.as_str()).map(|next| path(next, cfg));
         let moved = to.as_ref().filter(|to| **to != from && !to.exists());
         match (&to, moved) {
             (_, Some(to)) => {
@@ -422,22 +452,27 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
         primary.get(key).and_then(|item| item.value().text().or(item.value().locator())).map(String::from)
     };
     let filled = |key: &ItemKey| value(key).is_some_and(|value| !value.is_empty());
-    let complete = primary.title().is_some()
-        && primary.artist().is_some()
+    let complete = primary.title().is_some_and(|title| !title.is_empty())
+        && primary.artist().is_some_and(|artist| !artist.is_empty())
         && filled(&ItemKey::TrackArtists)
         && filled(&ItemKey::Lyrics)
         && !primary.pictures().is_empty();
     let force = cfg["force_update_metadata"] == true;
     let redownload = cfg["redownload"] == true;
     let needs_lrc = cfg["generate_lrc"] == true && !file.with_extension("lrc").exists();
-    if complete && !force && !redownload && !needs_lrc {
+    if complete && !force && !redownload {
+        if needs_lrc {
+            let song = Song { lyrics: value(&ItemKey::Lyrics), ..Song::default() };
+            write_lrc(file, &song, cfg)?;
+        }
         return Ok(());
     }
     let url = value(&ItemKey::AudioFileUrl).filter(|url| url.contains("spotify"));
     let query = url.unwrap_or_else(|| {
         format!("{} - {}", primary.artist().unwrap_or_default(), primary.title().unwrap_or_default())
     });
-    let mut song = crate::spotify::resolve(&query, cfg, true)?.into_iter().next().ok_or("no match")?;
+    let mut song = crate::spotify::resolve(&query, cfg)?.into_iter().next().ok_or("no match")?;
+    crate::spotify::enrich(&mut song, cfg);
     song.lyrics = value(&ItemKey::Lyrics).or_else(|| lyrics(&song, cfg));
     if !complete || force {
         tag(file, &song, cfg)?;
@@ -446,7 +481,14 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
     if redownload {
         let mut cfg = cfg.clone();
         cfg["overwrite"] = json!("force");
-        process(song, "download", &cfg).1?;
+        let songs = if cfg["fetch_albums"] == true {
+            crate::spotify::resolve(&format!("https://open.spotify.com/album/{}", song.album_id), &cfg)?
+        } else {
+            vec![song]
+        };
+        for song in songs {
+            process(song, "download", &cfg).1?;
+        }
     }
     Ok(())
 }
