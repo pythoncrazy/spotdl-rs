@@ -437,6 +437,9 @@ fn is_synced(text: &str) -> bool {
 }
 
 fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&Sender<LyricsJob>>) -> R<PathBuf> {
+    if op != "save" && s.name.trim().is_empty() {
+        return Err(format!("Spotify has no metadata for {}", s.url).into());
+    }
     let should_enrich = op != "save" && op != "url";
     let enriched_for_output = should_enrich && cfg["output"].as_str().is_some_and(uses_enriched_fields);
     if enriched_for_output {
@@ -696,6 +699,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn empty_track_names_fail_before_download_search() {
+        let dir = temp_dir("empty-track");
+        let song = Song { url: "https://open.spotify.com/track/empty".into(), ..Song::default() };
+        let cfg = json!({"output": dir.join("{title}").to_string_lossy(), "overwrite": "skip"});
+        fs::write(path(&song, &cfg), "").unwrap();
+        assert_eq!(
+            process(song, "download", &cfg, 0, None).1.unwrap_err().to_string(),
+            "Spotify has no metadata for https://open.spotify.com/track/empty"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
