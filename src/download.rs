@@ -441,7 +441,7 @@ pub fn process(mut s: Song, op: &str, cfg: &Value) -> (Song, R<PathBuf>) {
         Ok(path) => crate::log(cfg, "INFO", &format!("{label}: {}", path.display())),
         Err(error) => {
             crate::log(cfg, "ERROR", &format!("{label}: {error}"));
-            if cfg["add_unavailable"] == true {
+            if cfg["add_unavailable"] == true && error.to_string().starts_with("no match for ") {
                 let _ = append(cfg["archive"].as_str(), &s.url);
             }
         }

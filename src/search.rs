@@ -37,10 +37,10 @@ static BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 static STRIKES: AtomicU64 = AtomicU64::new(0);
 
-pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
+fn with_backoff<T>(cfg: &Value, mut attempt: impl FnMut() -> Result<T, String>, retry: impl Fn(&str) -> bool) -> R<T> {
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3) + 1;
     let mut announced = 0;
-    for attempt in 1..=attempts {
+    for number in 1..=attempts {
         let until = BLOCKED_UNTIL.load(Relaxed);
         let wait = until.saturating_sub(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
         if wait > 0 && announced != until {
@@ -48,20 +48,42 @@ pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
             announced = until;
         }
         std::thread::sleep(Duration::from_secs(wait));
-        let output = cmd.output()?;
-        let error = String::from_utf8_lossy(&output.stderr);
-        let signs = ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"];
-        if !signs.iter().any(|sign| error.contains(sign)) {
-            STRIKES.store(0, Relaxed);
-            return Ok(output);
+        match attempt() {
+            Ok(value) => {
+                STRIKES.store(0, Relaxed);
+                return Ok(value);
+            }
+            Err(error) if !retry(&error) || number == attempts => return Err(error.into()),
+            Err(_) => {
+                let strike = STRIKES.fetch_add(1, Relaxed).min(2) as usize;
+                BLOCKED_UNTIL
+                    .fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
+            }
         }
-        if attempt == attempts {
-            return Err(error.trim().to_string().into());
-        }
-        let strike = STRIKES.fetch_add(1, Relaxed).min(2) as usize;
-        BLOCKED_UNTIL.fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
     }
     Err("YouTube blocked downloads".into())
+}
+
+fn youtube_blocked(error: &str) -> bool {
+    ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
+        .iter()
+        .any(|sign| error.contains(sign))
+}
+
+pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
+    with_backoff(
+        cfg,
+        || {
+            let output = cmd.output().map_err(|error| error.to_string())?;
+            let error = String::from_utf8_lossy(&output.stderr);
+            if youtube_blocked(&error) {
+                Err(error.trim().to_string())
+            } else {
+                Ok(output)
+            }
+        },
+        youtube_blocked,
+    )
 }
 
 pub fn js_runtime_args(cmd: &mut Command) {
@@ -112,45 +134,68 @@ fn is_version_suffix(suffix: &str) -> bool {
         })
 }
 
+fn ytm_retryable(error: &str) -> bool {
+    let status = error
+        .strip_prefix("HTTP ")
+        .and_then(|error| error.split_whitespace().next())
+        .and_then(|status| status.parse::<u16>().ok());
+    status.is_some_and(|status| status == 403 || status == 429 || status >= 500)
+        || ["timeout", "timed out", "connection", "connect", "network", "transport"]
+            .iter()
+            .any(|sign| error.to_ascii_lowercase().contains(sign))
+}
+
 fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
     let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-    let reply = http("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)?;
-    let v: Value = serde_json::from_slice(&reply)?;
-    let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
-    let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
-    let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
-    Ok(items
-        .filter_map(|i| {
-            let r = &i["musicResponsiveListItemRenderer"];
-            let columns = &r["flexColumns"];
-            let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
-            let kind = |t: &str| -> Vec<String> {
-                let typed = meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
-                typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
-            };
-            let time =
-                meta.last()?["text"].as_str()?.split(':').try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
-            let artists = kind("ARTIST");
-            let artists = match artists.first() {
-                Some(_) => artists,
-                None => vec![meta.first()?["text"].as_str()?.into()],
-            };
-            Some(Hit {
-                song: hit_song(
-                    format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
-                    columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"].as_str()?.into(),
-                    artists,
-                    kind("ALBUM").first().cloned().unwrap_or_default(),
-                    time.ok()?,
-                ),
-                verified: songs,
-                isrc,
-            })
-        })
-        .collect())
+    with_backoff(
+        cfg,
+        || {
+            let reply = http("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
+                .map_err(|error| error.to_string())?;
+            let v: Value = serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
+            let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
+            let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
+            let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
+            Ok(items
+                .filter_map(|i| {
+                    let r = &i["musicResponsiveListItemRenderer"];
+                    let columns = &r["flexColumns"];
+                    let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
+                    let kind = |t: &str| -> Vec<String> {
+                        let typed =
+                            meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
+                        typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
+                    };
+                    let time = meta.last()?["text"]
+                        .as_str()?
+                        .split(':')
+                        .try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
+                    let artists = kind("ARTIST");
+                    let artists = match artists.first() {
+                        Some(_) => artists,
+                        None => vec![meta.first()?["text"].as_str()?.into()],
+                    };
+                    Some(Hit {
+                        song: hit_song(
+                            format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
+                            columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"]
+                                .as_str()?
+                                .into(),
+                            artists,
+                            kind("ALBUM").first().cloned().unwrap_or_default(),
+                            time.ok()?,
+                        ),
+                        verified: songs,
+                        isrc,
+                    })
+                })
+                .collect())
+        },
+        ytm_retryable,
+    )
 }
 
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
@@ -225,8 +270,16 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     let providers: Vec<&str> = providers.collect();
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
     let mut found: Vec<(f64, String)> = Vec::new();
+    let mut first_error = None;
     if let Some(isrc) = song.isrc.as_ref().filter(|_| providers.contains(&"youtube-music")) {
-        let hits = ytm(isrc, true, true, cfg).unwrap_or_default().into_iter();
+        let hits = match ytm(isrc, true, true, cfg) {
+            Ok(hits) => hits,
+            Err(error) => {
+                first_error.get_or_insert(error.to_string());
+                Vec::new()
+            }
+        };
+        let hits = hits.into_iter();
         let hits = hits.filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0);
         let best = hits.max_by(|a, b| rank(a).total_cmp(&rank(b)));
         found.extend(best.map(|hit| (f64::INFINITY, hit.song.url)));
@@ -237,10 +290,21 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
             "youtube" => ytdlp(&format!("ytsearch10:{query}"), cfg),
             _ => ytdlp(&format!("scsearch10:{query}"), cfg),
         };
-        let mut hits = hits.unwrap_or_default();
+        let mut hits = match hits {
+            Ok(hits) => hits,
+            Err(error) => {
+                first_error.get_or_insert(error.to_string());
+                Vec::new()
+            }
+        };
         let best = hits.iter().map(rank).max_by(f64::total_cmp);
         if *provider == "youtube-music" && !verified && best.is_none_or(|best| best < 80.0) {
-            hits.extend(ytm(&query, false, false, cfg).unwrap_or_default());
+            match ytm(&query, false, false, cfg) {
+                Ok(extra) => hits.extend(extra),
+                Err(error) => {
+                    first_error.get_or_insert(error.to_string());
+                }
+            }
         }
         let hits = hits.into_iter().filter(|hit| !verified || hit.verified);
         found.extend(hits.map(|hit| (rank(&hit), hit.song.url)).filter(|candidate| candidate.0 > 0.0));
@@ -250,7 +314,9 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     let found: Vec<String> =
         found.into_iter().map(|candidate| candidate.1).filter(|url| seen.insert(url.clone())).take(3).collect();
     if found.is_empty() {
-        return Err(format!("no match for {query}").into());
+        return Err(first_error
+            .map_or_else(|| format!("no match for {query}"), |error| format!("search failed for {query}: {error}"))
+            .into());
     }
     Ok(found)
 }
@@ -331,5 +397,18 @@ mod tests {
         for suffix in ["Take 2", "Live At The BBC 1964", "Instrumental"] {
             assert!(!is_version_suffix(suffix), "{suffix}");
         }
+    }
+
+    #[test]
+    fn failed_search_reports_provider_error() {
+        BLOCKED_UNTIL.store(0, Relaxed);
+        STRIKES.store(0, Relaxed);
+        let mut cfg: Value = serde_json::from_str(crate::DEFAULTS).unwrap();
+        cfg["audio_providers"] = serde_json::json!(["youtube-music"]);
+        cfg["max_retries"] = serde_json::json!(0);
+        cfg["proxy"] = serde_json::json!("http://127.0.0.1:9");
+        let error = find(&song("Test"), &cfg).unwrap_err().to_string();
+        assert!(error.contains("search failed"));
+        assert!(!error.contains("no match"));
     }
 }
