@@ -35,9 +35,10 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
     }
 }
 
-const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
+const FORBIDDEN: &str =
+    "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore karaoke";
 const VERSION_SUFFIXES: &str =
-    "remaster remastered mono stereo mix version edit single radio deluxe anniversary original";
+    "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
 
 pub(crate) struct Gate {
     name: &'static str,
@@ -342,22 +343,36 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 }
 
 fn clean_name(name: &str, artists: &[String]) -> String {
-    let mut depth = 0usize;
-    let name = name
-        .chars()
-        .filter(|character| match *character {
+    let mut clean = String::new();
+    let mut rest = name;
+    while let Some((start, _)) = rest.char_indices().find(|(_, c)| matches!(*c, '(' | '[')) {
+        clean.push_str(&rest[..start]);
+        let mut depth = 1;
+        let Some(end) = rest[start + 1..].char_indices().find_map(|(offset, c)| match c {
             '(' | '[' => {
                 depth += 1;
-                false
+                None
             }
             ')' | ']' => {
-                depth = depth.saturating_sub(1);
-                false
+                depth -= 1;
+                (depth == 0).then_some(start + 1 + offset)
             }
-            _ => depth == 0,
-        })
-        .collect::<String>();
-    let mut name = format!("-{}-", slug(&name, "-"));
+            _ => None,
+        }) else {
+            clean.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let group = &rest[start + 1..end];
+        let words = slug(group, "-");
+        let feature = matches!(words.split('-').next(), Some("feat" | "ft" | "featuring" | "with"));
+        if !feature && !is_version_suffix(group) {
+            clean.push_str(&rest[start..=end]);
+        }
+        rest = &rest[end + 1..];
+    }
+    clean.push_str(rest);
+    let mut name = format!("-{}-", slug(&clean, "-"));
     for artist in artists {
         name = name.replace(&format!("-{}-", slug(artist, "-")), "-");
     }
@@ -385,7 +400,8 @@ fn score(s: &Song, h: &Hit) -> f64 {
         .map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-")))
         .fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
-    let fwords = FORBIDDEN.split(' ').filter(|w| rname.contains(w) && !sname.contains(w)).count() as f64;
+    let (rname_flat, sname_flat) = (rname.replace('-', ""), sname.replace('-', ""));
+    let fwords = FORBIDDEN.split(' ').filter(|w| rname_flat.contains(w) && !sname_flat.contains(w)).count() as f64;
     let stripped = clean_name(&hit.name, &s.artists);
     let bare = clean_name(versionless_name, &s.artists);
     let name = ratio(&sname, &rname)
@@ -530,11 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn version_suffixes_allow_a_remastered_title_match() {
-        assert!(score(&song("I Feel Fine - Remastered 2015"), &hit("I Feel Fine")) > 0.0);
-    }
-
-    #[test]
     fn score_cleans_title_groups_and_matches_combined_artists() {
         let billie = &["Billie Eilish", "Khalid"][..];
         let zedd = &["Zedd", "Alessia Cara"][..];
@@ -542,6 +553,8 @@ mod tests {
         let individual = &["Ida Paul", "Kalle Lindroth"][..];
         let lovely = "lovely (with Khalid)";
         let finnish = "Kun tää loppuu";
+        let christina = &["Christina Aguilera"][..];
+        let ella = &["Ella Henderson"][..];
 
         for (source, hit, minimum) in [
             ((lovely, billie, 200.185), ("lovely", billie, 201.0), 80.0),
@@ -550,14 +563,30 @@ mod tests {
         ] {
             assert!(score_case(source, hit) >= minimum, "{}", source.0);
         }
-        for (name, hit_name) in
-            [("Fly", "Fly (feat. Rihanna)"), ("Dior", "Dior (Bonus)"), ("Flashlight - Original Edit", "Flashlight")]
-        {
+        for (name, hit_name) in [
+            ("I Feel Fine - Remastered 2015", "I Feel Fine"),
+            ("Fly", "Fly (feat. Rihanna)"),
+            ("Dior", "Dior (Bonus)"),
+            ("Flashlight - Original Edit", "Flashlight"),
+        ] {
             assert!(score(&song(name), &hit(hit_name)) > 0.0, "{name}");
         }
         let banda = &["Banda Supernova MN"][..];
         for hit in [("Lovely (Cover)", banda, 195.0), ("lovely", billie, 225.185)] {
             assert_eq!(score_case((lovely, billie, 200.185), hit), 0.0);
+        }
+        let hurt = ("Hurt", christina, 243.6);
+        let ghost = ("Ghost", ella, 200.0);
+        let off_record = &["Off The Record"][..];
+        let karaoke = &["Karaoke Instrumental"][..];
+        let hurt_decoy = "Hurt (In the style of Christina Aguilera) (Karaoke Version with Lead Vocal)";
+        let ghost_decoy = "Ghost (Karaoke Instrumental Version) (Originally Performed By Ella Henderson)";
+        for (source, result, trusted) in [
+            (hurt, (hurt_decoy, off_record, 243.0), ("Hurt", christina, 243.0)),
+            (ghost, (ghost_decoy, karaoke, 200.0), ("Ghost", ella, 200.0)),
+            (hurt, ("Hurt (Bass Boosted)", christina, 243.6), ("Hurt", christina, 243.6)),
+        ] {
+            assert!(score_case(source, result) < score_case(source, trusted), "{}", result.0);
         }
     }
 
@@ -572,10 +601,11 @@ mod tests {
             "Single Version",
             "Radio Edit",
             "Deluxe Anniversary",
+            "Bonus",
         ] {
             assert!(is_version_suffix(suffix), "{suffix}");
         }
-        for suffix in ["Take 2", "Live At The BBC 1964", "Instrumental"] {
+        for suffix in ["Take 2", "Live At The BBC 1964", "Instrumental", "Karaoke Version"] {
             assert!(!is_version_suffix(suffix), "{suffix}");
         }
     }
