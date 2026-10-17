@@ -144,10 +144,11 @@ fn downloads_revolver_tracks_and_updates_metadata() {
     let output = format!("{}/{{album-artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}", dir.display());
     let archive = dir.join("archive.txt").display().to_string();
     let m3u = dir.join("list.m3u").display().to_string();
+    let downloads = REVOLVER.iter().map(|(youtube, spotify)| format!("{youtube}|{spotify}")).collect::<Vec<_>>();
     let args = [
         "download",
-        REVOLVER[0].1,
-        REVOLVER[1].1,
+        downloads[0].as_str(),
+        downloads[1].as_str(),
         "--format",
         "opus",
         "--bitrate",
@@ -161,7 +162,7 @@ fn downloads_revolver_tracks_and_updates_metadata() {
         "--generate-lrc",
         "--create-skip-file",
         "--max-retries",
-        "0",
+        "2",
     ];
     assert_success(&spotdl(&dir, &args));
 
@@ -187,7 +188,8 @@ fn downloads_revolver_tracks_and_updates_metadata() {
         assert!(!tag.pictures().is_empty());
         assert!((audio.properties().duration().as_secs_f64() - expected["duration"].as_f64().unwrap()).abs() < 5.0);
         let source = tag.get_string(&ItemKey::Unknown("WWWAUDIOFILE".into())).unwrap_or_default();
-        assert_eq!(source, expected_video);
+        assert_eq!(source, spotify);
+        assert_eq!(tag.comment().as_deref(), Some(expected_video));
         assert!(skip_file(file).is_file());
     }
 
