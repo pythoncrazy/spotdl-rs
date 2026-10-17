@@ -132,6 +132,10 @@ pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b:
     Ok(serde_json::from_slice(&http(m, url, h, b, cfg)?)?)
 }
 
+pub(crate) fn string_values(value: &Value) -> impl Iterator<Item = &str> {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str)
+}
+
 fn exe(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
@@ -251,13 +255,7 @@ fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
         ("lyrics_providers", "lyrics", &["genius", "azlyrics", "musixmatch", "synced"][..]),
     ];
     for (key, label, allowed) in providers {
-        if let Some(provider) = raw[key]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .find(|provider| !allowed.contains(provider))
-        {
+        if let Some(provider) = string_values(&raw[key]).find(|provider| !allowed.contains(provider)) {
             return Err(format!("unknown {label} provider: {provider}").into());
         }
     }
@@ -286,12 +284,11 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
         ("macos-aarch64", "darwin-arm64", Some("aarch64-apple-darwin")),
     ];
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let platform_entry = || table.iter().find(|entry| entry.0 == target);
     fs::create_dir_all(&*HOME)?;
     let file = match tool {
         "ffmpeg" => {
-            let name = table
-                .iter()
-                .find(|entry| entry.0 == target)
+            let name = platform_entry()
                 .map(|entry| entry.1)
                 .filter(|name| !name.is_empty())
                 .ok_or(format!("{tool} binary is not available for this system"))?;
@@ -310,9 +307,7 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
             distribution.join(executable)
         }
         "deno" => {
-            let name = table
-                .iter()
-                .find(|entry| entry.0 == target)
+            let name = platform_entry()
                 .and_then(|entry| entry.2)
                 .ok_or(format!("{tool} binary is not available for this system"))?;
             let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
@@ -403,7 +398,7 @@ fn number(mut songs: Vec<Song>, cfg: &Value) -> Vec<Song> {
             }
         }
     }
-    let ignored = cfg["ignore_albums"].as_array().into_iter().flatten().filter_map(Value::as_str);
+    let ignored = string_values(&cfg["ignore_albums"]);
     let ignored = ignored.map(str::to_lowercase).collect::<Vec<_>>();
     songs.retain(|song| {
         let album = song.album_name.to_lowercase();

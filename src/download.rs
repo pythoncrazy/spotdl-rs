@@ -127,14 +127,13 @@ fn wait_turn(next: &Mutex<Option<Instant>>, interval: Duration) {
     std::thread::sleep(slot.saturating_duration_since(Instant::now()));
 }
 
-fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<u8>> {
+fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<Value>> {
     let mut request_cfg = cfg.clone();
     request_cfg["max_retries"] = json!(0);
     for attempt in 0..5 {
         wait_turn(&LRCLIB_NEXT, LRCLIB_INTERVAL);
-        let response = crate::http("GET", url, &[], None, &request_cfg);
-        match response {
-            Ok(bytes) => return Some(bytes),
+        match crate::http_json::<Vec<Value>>("GET", url, &[], None, &request_cfg) {
+            Ok(tracks) => return Some(tracks),
             Err(error) => {
                 let status = error.to_string().split_whitespace().nth(1).and_then(|status| status.parse::<u16>().ok());
                 let status = status.filter(|status| *status == 429 || (500..600).contains(status))?;
@@ -166,8 +165,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                     encode(&song.artist),
                     encode(search::versionless(&song.name))
                 );
-                let bytes = lrclib_request(&url, &lyrics_cfg)?;
-                let tracks: Vec<Value> = serde_json::from_slice(&bytes).ok()?;
+                let tracks = lrclib_request(&url, &lyrics_cfg)?;
                 let hit = tracks
                     .iter()
                     .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
@@ -216,7 +214,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
         };
         Some(text.trim().to_string()).filter(|text| !text.is_empty())
     };
-    cfg["lyrics_providers"].as_array().into_iter().flatten().filter_map(Value::as_str).find_map(provider)
+    crate::string_values(&cfg["lyrics_providers"]).find_map(provider)
 }
 
 pub fn add_lyrics(song: &Song, file: &Path, cfg: &Value) -> Option<String> {

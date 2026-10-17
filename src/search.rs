@@ -293,8 +293,8 @@ fn hits_or_note(first_error: &mut Option<String>, result: R<Vec<Hit>>) -> Vec<Hi
 }
 
 pub fn isrc_hit(song: &Song, cfg: &Value) -> R<Option<String>> {
-    let Some(isrc) = song.isrc.as_ref().filter(|_| audio_providers(cfg).any(|provider| provider == "youtube-music"))
-    else {
+    let youtube_music = crate::string_values(&cfg["audio_providers"]).any(|provider| provider == "youtube-music");
+    let Some(isrc) = song.isrc.as_ref().filter(|_| youtube_music) else {
         return Ok(None);
     };
     let filter = cfg["filter_results"] != false;
@@ -408,10 +408,6 @@ fn score(s: &Song, h: &Hit) -> f64 {
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
 
-fn audio_providers(cfg: &Value) -> impl Iterator<Item = &str> {
-    cfg["audio_providers"].as_array().into_iter().flatten().filter_map(Value::as_str)
-}
-
 pub fn find(song: &Song, cfg: &Value, prior_error: Option<String>) -> R<Vec<String>> {
     let query = crate::download::fill(cfg["search_query"].as_str().unwrap_or("{artists} - {title}"), song, cfg);
     let filter = cfg["filter_results"] != false;
@@ -419,7 +415,7 @@ pub fn find(song: &Song, cfg: &Value, prior_error: Option<String>) -> R<Vec<Stri
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
     let mut found: Vec<(f64, String)> = Vec::new();
     let mut first_error = prior_error;
-    for provider in audio_providers(cfg) {
+    for provider in crate::string_values(&cfg["audio_providers"]) {
         let hits = match provider {
             "youtube-music" => ytm(&query, true, false, cfg),
             "youtube" => ytdlp(&format!("ytsearch10:{query}"), cfg),
