@@ -10,8 +10,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Condvar, Mutex, OnceLock},
-    time::Duration,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
@@ -92,40 +92,22 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
 
-const LRCLIB_LIMIT: usize = 4;
-static LRCLIB_REQUESTS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
-
-struct LrclibPermit;
-
-impl LrclibPermit {
-    fn acquire() -> Self {
-        let (active, ready) = LRCLIB_REQUESTS.get_or_init(|| (Mutex::new(0), Condvar::new()));
-        let mut active = active.lock().unwrap_or_else(|error| error.into_inner());
-        while *active >= LRCLIB_LIMIT {
-            active = ready.wait(active).unwrap_or_else(|error| error.into_inner());
-        }
-        *active += 1;
-        Self
-    }
-}
-
-impl Drop for LrclibPermit {
-    fn drop(&mut self) {
-        let (active, ready) = LRCLIB_REQUESTS.get_or_init(|| (Mutex::new(0), Condvar::new()));
-        let mut active = active.lock().unwrap_or_else(|error| error.into_inner());
-        *active -= 1;
-        ready.notify_one();
-    }
-}
+const LRCLIB_INTERVAL: Duration = Duration::from_millis(750);
+static LRCLIB_NEXT: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<u8>> {
     let mut request_cfg = cfg.clone();
     request_cfg["max_retries"] = json!(0);
     for attempt in 0..5 {
-        let response = {
-            let _permit = LrclibPermit::acquire();
-            crate::http("GET", url, &[], None, &request_cfg)
+        let now = Instant::now();
+        let slot = {
+            let mut next = LRCLIB_NEXT.lock().unwrap_or_else(|error| error.into_inner());
+            let slot = next.map_or(now, |next| now.max(next));
+            *next = Some(slot + LRCLIB_INTERVAL);
+            slot
         };
+        std::thread::sleep(slot.saturating_duration_since(Instant::now()));
+        let response = crate::http("GET", url, &[], None, &request_cfg);
         match response {
             Ok(bytes) => return Some(bytes),
             Err(error) => {
