@@ -780,6 +780,21 @@ mod tests {
     }
 
     #[test]
+    fn installed_yt_dlp_prefers_onedir_and_retains_legacy() {
+        let Ok((_, executable)) = crate::yt_dlp_release() else { return };
+        let home = temp_dir("yt-dlp");
+        let onedir = home.join("yt-dlp_dist").join(executable);
+        let legacy = home.join(crate::exe("yt-dlp"));
+        fs::create_dir_all(onedir.parent().unwrap()).unwrap();
+        fs::write(&onedir, b"").unwrap();
+        fs::write(&legacy, b"").unwrap();
+        assert_eq!(crate::installed_yt_dlp(&home), Some(onedir.clone()));
+        fs::remove_file(&onedir).unwrap();
+        assert_eq!(crate::installed_yt_dlp(&home), Some(legacy));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn path_limits_components_and_fills_enriched_template_fields() {
         let song = Song {
             name: "é".repeat(300),

@@ -306,29 +306,6 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
     Ok(entries.iter().filter_map(hit).collect())
 }
 
-#[cfg(test)]
-mod command_tests {
-    use super::*;
-
-    #[test]
-    fn yt_dlp_command_includes_proxy_cookies_and_custom_args() {
-        let cfg = serde_json::json!({
-            "yt_dlp": "yt-dlp-test",
-            "cookie_file": "/tmp/cookies.txt",
-            "proxy": "http://proxy.example:8080",
-            "yt_dlp_args": "--no-warnings --verbose"
-        });
-        let args = yt_dlp(&cfg).get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        assert!(args.starts_with(&[
-            "--cookies".into(),
-            "/tmp/cookies.txt".into(),
-            "--proxy".into(),
-            "http://proxy.example:8080".into(),
-        ]));
-        assert!(args.windows(2).any(|pair| pair[0] == "--no-warnings" && pair[1] == "--verbose"));
-    }
-}
-
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
@@ -427,6 +404,24 @@ pub fn source(url: &str, cfg: &Value, lookup: bool) -> R<Vec<Song>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yt_dlp_command_includes_proxy_and_custom_args() {
+        let cfg = serde_json::json!({
+            "yt_dlp": "yt-dlp-test",
+            "cookie_file": "/tmp/cookies.txt",
+            "proxy": "http://proxy.example:8080",
+            "yt_dlp_args": "--no-warnings --verbose"
+        });
+        let args = yt_dlp(&cfg).get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert!(args.starts_with(&[
+            "--cookies".into(),
+            "/tmp/cookies.txt".into(),
+            "--proxy".into(),
+            "http://proxy.example:8080".into(),
+        ]));
+        assert!(args.windows(2).any(|pair| pair[0] == "--no-warnings" && pair[1] == "--verbose"));
+    }
 
     fn song(name: &str) -> Song {
         Song {
