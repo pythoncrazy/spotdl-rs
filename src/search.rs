@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Default)]
@@ -33,35 +33,66 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
 const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
 const VERSION_SUFFIXES: &str = "remaster remastered mono stereo mix version edit single radio deluxe anniversary";
 
-static BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
+pub(crate) struct Gate {
+    until: AtomicU64,
+    strikes: AtomicU64,
+}
 
-static STRIKES: AtomicU64 = AtomicU64::new(0);
+impl Gate {
+    const fn new() -> Self {
+        Self { until: AtomicU64::new(0), strikes: AtomicU64::new(0) }
+    }
+}
 
-fn with_backoff<T>(cfg: &Value, mut attempt: impl FnMut() -> Result<T, String>, retry: impl Fn(&str) -> bool) -> R<T> {
+pub(crate) static SEARCH_GATE: Gate = Gate::new();
+pub(crate) static DOWNLOAD_GATE: Gate = Gate::new();
+
+fn short_retry_delay() -> Duration {
+    let jitter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 3;
+    Duration::from_secs(3 + u64::from(jitter))
+}
+
+fn with_backoff<T>(
+    gate: &Gate,
+    cfg: &Value,
+    message: &str,
+    mut attempt: impl FnMut() -> Result<T, String>,
+    retry: impl Fn(&str) -> bool,
+    wait_before_retry: impl Fn(),
+) -> R<T> {
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3) + 1;
     let mut announced = 0;
     for number in 1..=attempts {
-        let until = BLOCKED_UNTIL.load(Relaxed);
+        let until = gate.until.load(Relaxed);
         let wait = until.saturating_sub(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
         if wait > 0 && announced != until {
-            eprintln!("YouTube blocked downloads. Waiting {wait} s.");
+            eprintln!("YouTube blocked {message}. Waiting {wait} s.");
             announced = until;
         }
         std::thread::sleep(Duration::from_secs(wait));
         match attempt() {
             Ok(value) => {
-                STRIKES.store(0, Relaxed);
+                gate.strikes.store(0, Relaxed);
                 return Ok(value);
             }
-            Err(error) if !retry(&error) || number == attempts => return Err(error.into()),
-            Err(_) => {
-                let strike = STRIKES.fetch_add(1, Relaxed).min(2) as usize;
-                BLOCKED_UNTIL
-                    .fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
+            Err(error) if !retry(&error) => return Err(error.into()),
+            Err(_) if number == 1 && number < attempts => {
+                wait_before_retry();
+                continue;
+            }
+            Err(error) => {
+                if number > 1 {
+                    let strike = gate.strikes.fetch_add(1, Relaxed).min(2) as usize;
+                    gate.until
+                        .fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
+                }
+                if number == attempts {
+                    return Err(error.into());
+                }
             }
         }
     }
-    Err("YouTube blocked downloads".into())
+    Err(format!("YouTube blocked {message}").into())
 }
 
 fn youtube_blocked(error: &str) -> bool {
@@ -70,9 +101,12 @@ fn youtube_blocked(error: &str) -> bool {
         .any(|sign| error.contains(sign))
 }
 
-pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
+pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
+    let message = if std::ptr::eq(gate, &SEARCH_GATE) { "searches" } else { "downloads" };
     with_backoff(
+        gate,
         cfg,
+        message,
         || {
             let output = cmd.output().map_err(|error| error.to_string())?;
             let error = String::from_utf8_lossy(&output.stderr);
@@ -83,6 +117,7 @@ pub fn yt(cmd: &mut Command, cfg: &Value) -> R<Output> {
             }
         },
         youtube_blocked,
+        || std::thread::sleep(short_retry_delay()),
     )
 }
 
@@ -186,12 +221,15 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
     let v = with_backoff(
+        &SEARCH_GATE,
         cfg,
+        "searches",
         || {
             crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
                 .map_err(|error| error.to_string())
         },
         ytm_retryable,
+        || std::thread::sleep(short_retry_delay()),
     )?;
     Ok(ytm_hits(&v, songs, isrc))
 }
@@ -207,7 +245,7 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
     let mut cmd = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
     cmd.args(["--flat-playlist", "-J", "--no-warnings"]);
     js_runtime_args(&mut cmd);
-    let out = yt(cmd.arg(search), cfg)?;
+    let out = yt(cmd.arg(search), cfg, &SEARCH_GATE)?;
     if !out.status.success() {
         return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
     }
@@ -388,8 +426,10 @@ mod tests {
 
     #[test]
     fn failed_search_reports_provider_error() {
-        BLOCKED_UNTIL.store(0, Relaxed);
-        STRIKES.store(0, Relaxed);
+        SEARCH_GATE.until.store(0, Relaxed);
+        SEARCH_GATE.strikes.store(0, Relaxed);
+        DOWNLOAD_GATE.until.store(0, Relaxed);
+        DOWNLOAD_GATE.strikes.store(0, Relaxed);
         let mut cfg: Value = serde_json::from_str(crate::DEFAULTS).unwrap();
         cfg["audio_providers"] = serde_json::json!(["youtube-music"]);
         cfg["max_retries"] = serde_json::json!(0);
@@ -397,5 +437,29 @@ mod tests {
         let error = find(&song("Test"), &cfg).unwrap_err().to_string();
         assert!(error.contains("search failed"));
         assert!(!error.contains("no match"));
+    }
+
+    #[test]
+    fn first_retry_stays_local_and_repeated_failures_set_gate() {
+        let gate = Gate::new();
+        let cfg = serde_json::json!({"max_retries": 1});
+        let mut attempts = 0;
+        let result = with_backoff(
+            &gate,
+            &cfg,
+            "searches",
+            || {
+                attempts += 1;
+                if attempts == 1 { Err("HTTP 403".into()) } else { Ok(()) }
+            },
+            |_| true,
+            || {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(gate.until.load(Relaxed), 0);
+
+        let error = with_backoff::<()>(&gate, &cfg, "searches", || Err("HTTP 403".into()), |_| true, || {});
+        assert!(error.is_err());
+        assert!(gate.until.load(Relaxed) > UNIX_EPOCH.elapsed().unwrap().as_secs());
     }
 }

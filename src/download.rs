@@ -308,7 +308,7 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     }
     y.args(text("yt_dlp_args"));
     search::js_runtime_args(&mut y);
-    let res = search::yt(y.arg(url), cfg)?;
+    let res = search::yt(y.arg(url), cfg, &search::DOWNLOAD_GATE)?;
     let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
     if !res.status.success() || !got.is_file() {
         let _ = fs::remove_file(&got);
