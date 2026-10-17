@@ -16,7 +16,7 @@ Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an act
 
 Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`.
 
-Use `--download-ffmpeg`, `--download-deno`, or `--download-yt-dlp` to install a local tool in `~/.spotdl`. The standalone yt-dlp build includes a YouTube challenge solver. For reliable YouTube downloads, have Deno, Node.js, or Bun in `PATH`, or run `--download-deno`. The program uses local FFmpeg and yt-dlp files when you do not set `--ffmpeg` or `--yt-dlp`.
+Use `--download-ffmpeg`, `--download-deno`, or `--download-yt-dlp` to install a local tool in `~/.spotdl`. The yt-dlp installer uses the platform's onedir release in `~/.spotdl/yt-dlp_dist`; existing `~/.spotdl/yt-dlp` installs are still detected. The standalone yt-dlp build includes a YouTube challenge solver. For reliable YouTube downloads, have Deno, Node.js, or Bun in `PATH`, or run `--download-deno`. The program uses local FFmpeg and yt-dlp files when you do not set `--ffmpeg` or `--yt-dlp`.
 
 Use `--key=value` when a value starts with `--`. For example, use `--yt-dlp-args="--js-runtimes node"`.
 

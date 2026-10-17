@@ -132,6 +132,25 @@ pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b:
     Ok(serde_json::from_slice(&http(m, url, h, b, cfg)?)?)
 }
 
+fn yt_dlp_release() -> R<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok(("yt-dlp_linux.zip", "yt-dlp_linux")),
+        ("linux", "aarch64") => Ok(("yt-dlp_linux_aarch64.zip", "yt-dlp_linux_aarch64")),
+        ("macos", "x86_64" | "aarch64") => Ok(("yt-dlp_macos.zip", "yt-dlp_macos")),
+        ("windows", "x86_64") => Ok(("yt-dlp_win.zip", "yt-dlp.exe")),
+        _ => Err("yt-dlp onedir build is not available for this system".into()),
+    }
+}
+
+fn installed_yt_dlp(home: &Path) -> Option<PathBuf> {
+    let legacy = home.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+    yt_dlp_release()
+        .ok()
+        .map(|(_, executable)| home.join("yt-dlp_dist").join(executable))
+        .filter(|path| path.is_file())
+        .or_else(|| legacy.is_file().then_some(legacy))
+}
+
 fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
     let config_flag = args.iter().position(|arg| arg == "--config" || arg.starts_with("--config="));
     let config_path = match config_flag {
@@ -212,9 +231,10 @@ fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
         raw["ffmpeg"] = json!(local_ffmpeg.to_string_lossy());
     }
     let explicit_yt_dlp = args.iter().any(|arg| arg == "--yt-dlp" || arg.starts_with("--yt-dlp="));
-    let local_yt_dlp = HOME.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
-    if !explicit_yt_dlp && raw["yt_dlp"] == "yt-dlp" && local_yt_dlp.is_file() {
-        raw["yt_dlp"] = json!(local_yt_dlp.to_string_lossy());
+    if !explicit_yt_dlp && raw["yt_dlp"] == "yt-dlp" {
+        if let Some(path) = installed_yt_dlp(&HOME) {
+            raw["yt_dlp"] = json!(path.to_string_lossy());
+        }
     }
     let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
     let op = if known { positional.remove(0) } else { "download".into() };
@@ -258,42 +278,65 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
         ("macos-aarch64", "darwin-arm64", Some("aarch64-apple-darwin")),
     ];
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let name = if tool == "yt-dlp" {
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "yt-dlp_linux",
-            ("linux", "aarch64") => "yt-dlp_linux_aarch64",
-            ("macos", "x86_64" | "aarch64") => "yt-dlp_macos",
-            ("windows", "x86_64") => "yt-dlp.exe",
-            _ => return Err(format!("{tool} binary is not available for this system").into()),
-        }
+    let (name, executable) = if tool == "yt-dlp" {
+        yt_dlp_release()?
     } else {
-        table
+        let name = table
             .iter()
             .find(|entry| entry.0 == target)
             .and_then(|entry| if tool == "ffmpeg" { (!entry.1.is_empty()).then_some(entry.1) } else { entry.2 })
-            .ok_or(format!("{tool} binary is not available for this system"))?
+            .ok_or(format!("{tool} binary is not available for this system"))?;
+        (name, "")
     };
-    let member = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
-    let file = HOME.join(&member);
-    fs::create_dir_all(&*HOME)?;
-    let binary = if tool == "ffmpeg" {
-        let url = format!("https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/{name}");
-        http("GET", &url, &[], None, cfg)?
-    } else if tool == "yt-dlp" {
-        let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}");
-        http("GET", &url, &[("User-Agent", "spotdl-rs")], None, cfg)?
+    let member = if tool == "yt-dlp" {
+        executable.to_string()
+    } else if cfg!(windows) {
+        format!("{tool}.exe")
     } else {
-        let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
-        let url = format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim());
-        let mut archive = ZipArchive::new(Cursor::new(http("GET", &url, &[], None, cfg)?))?;
-        let mut binary = Vec::new();
-        archive.by_name(&member)?.read_to_end(&mut binary)?;
-        binary
+        tool.to_string()
     };
-    if binary.is_empty() {
+    let mut file = HOME.join(&member);
+    fs::create_dir_all(&*HOME)?;
+    if tool == "ffmpeg" {
+        let url = format!("https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/{name}");
+        let binary = http("GET", &url, &[], None, cfg)?;
+        if binary.is_empty() {
+            return Err(format!("Could not install {tool}").into());
+        }
+        fs::write(&file, binary)?;
+    } else {
+        let url = if tool == "yt-dlp" {
+            format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}")
+        } else {
+            let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
+            format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim())
+        };
+        let bytes = if tool == "yt-dlp" {
+            http("GET", &url, &[("User-Agent", "spotdl-rs")], None, cfg)?
+        } else {
+            http("GET", &url, &[], None, cfg)?
+        };
+        let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+        if tool == "yt-dlp" {
+            let distribution = HOME.join("yt-dlp_dist");
+            if distribution.exists() {
+                fs::remove_dir_all(&distribution)?;
+            }
+            fs::create_dir_all(&distribution)?;
+            archive.extract(&distribution)?;
+            file = distribution.join(&member);
+        } else {
+            let mut binary = Vec::new();
+            archive.by_name(&member)?.read_to_end(&mut binary)?;
+            if binary.is_empty() {
+                return Err(format!("Could not install {tool}").into());
+            }
+            fs::write(&file, binary)?;
+        }
+    }
+    if !file.is_file() || file.metadata()?.len() == 0 {
         return Err(format!("Could not install {tool}").into());
     }
-    fs::write(&file, binary)?;
     #[cfg(unix)]
     fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     println!("{tool} installed at {}", file.display());
@@ -592,6 +635,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_yt_dlp_prefers_onedir_and_retains_legacy() {
+        let Ok((_, executable)) = yt_dlp_release() else { return };
+        let home = std::env::temp_dir().join(format!("spotdl-yt-dlp-{}", std::process::id()));
+        let distribution = home.join("yt-dlp_dist");
+        let onedir = distribution.join(executable);
+        let legacy = home.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&distribution).unwrap();
+        fs::write(&onedir, b"").unwrap();
+        fs::write(&legacy, b"").unwrap();
+        assert_eq!(installed_yt_dlp(&home), Some(onedir.clone()));
+        fs::remove_file(&onedir).unwrap();
+        assert_eq!(installed_yt_dlp(&home), Some(legacy));
+        fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn m3u_entry_strips_current_directory() {
