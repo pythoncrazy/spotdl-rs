@@ -3,6 +3,7 @@ mod search;
 mod spotify;
 
 use rayon::prelude::*;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -93,7 +94,13 @@ fn init_agent(cfg: &Value) -> &'static ureq::Agent {
     })
 }
 
-pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
+fn http_response(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    cfg: &Value,
+) -> R<ureq::http::Response<ureq::Body>> {
     let agent = init_agent(cfg);
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3).max(1);
     let mut attempt = 1;
@@ -119,12 +126,28 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
             attempt += 1;
             continue;
         }
-        let mut reply = response?;
+        let reply = response?;
         if !reply.status().is_success() {
             return Err(format!("HTTP {} for {url}", reply.status()).into());
         }
-        return Ok(reply.body_mut().with_config().limit(1 << 28).read_to_vec()?);
+        return Ok(reply);
     }
+}
+
+pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
+    let mut response = http_response(method, url, headers, body, cfg)?;
+    Ok(response.body_mut().with_config().limit(1 << 28).read_to_vec()?)
+}
+
+pub fn http_json<T: DeserializeOwned>(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    cfg: &Value,
+) -> R<T> {
+    let mut response = http_response(method, url, headers, body, cfg)?;
+    Ok(response.body_mut().with_config().limit(1 << 28).read_json()?)
 }
 
 fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
@@ -298,15 +321,14 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
 
 fn check_for_updates(cfg: &Value) -> R<()> {
     let url = "https://api.github.com/repos/pythoncrazy/spotdl-rs/releases/latest";
-    let bytes = match http("GET", url, &[("User-Agent", "spotdl-rs")], None, cfg) {
-        Ok(bytes) => bytes,
+    let release: Value = match http_json("GET", url, &[("User-Agent", "spotdl-rs")], None, cfg) {
+        Ok(release) => release,
         Err(error) if error.to_string().starts_with("HTTP 404") => {
             println!("No release found.");
             return Ok(());
         }
         Err(error) => return Err(error),
     };
-    let release: Value = serde_json::from_slice(&bytes)?;
     let latest = release["tag_name"].as_str().ok_or("GitHub release has no tag_name")?;
     let current = env!("CARGO_PKG_VERSION");
     let parts = |version: &str| {

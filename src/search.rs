@@ -1,4 +1,4 @@
-use crate::{http, Song, R};
+use crate::{Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -188,9 +188,8 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let v = with_backoff(
         cfg,
         || {
-            let reply = http("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
-                .map_err(|error| error.to_string())?;
-            serde_json::from_slice(&reply).map_err(|error| error.to_string())
+            crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
+                .map_err(|error| error.to_string())
         },
         ytm_retryable,
     )?;

@@ -108,7 +108,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                     encode(&song.artist),
                     encode(&song.name)
                 );
-                let tracks: Vec<Value> = serde_json::from_str(&page(&url, &[])?).ok()?;
+                let tracks: Vec<Value> = crate::http_json("GET", &url, &[], None, &lyrics_cfg).ok()?;
                 let hit = tracks
                     .iter()
                     .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
@@ -121,7 +121,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                 );
                 let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
                 let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
-                let reply: Value = serde_json::from_str(&page(&url, headers)?).ok()?;
+                let reply: Value = crate::http_json("GET", &url, headers, None, &lyrics_cfg).ok()?;
                 let url = reply["response"]["sections"][0]["hits"][0]["result"]["url"].as_str()?;
                 html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
             }

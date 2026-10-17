@@ -81,12 +81,11 @@ fn state(cfg: &Value, rejected: Option<&str>) -> R<Value> {
         *STATE.lock().map_err(|e| e.to_string())? = Some(v.clone());
         return Ok(v);
     }
-    let secrets = http("GET", SECRETS_URL, &[UA], None, cfg)?;
-    let secrets: HashMap<String, Vec<u8>> = serde_json::from_slice(&secrets)?;
+    let secrets: HashMap<String, Vec<u8>> = crate::http_json("GET", SECRETS_URL, &[UA], None, cfg)?;
     let (ver, secret) = secrets.iter().max_by_key(|(k, _)| k.parse::<u32>().unwrap_or(0)).ok_or("no TOTP secret")?;
     let code = totp(secret)?;
     let url = format!("https://open.spotify.com/api/token?reason=init&productType=web-player&totp={code}&totpVer={ver}&totpServer={code}");
-    let tok: Value = serde_json::from_slice(&http("GET", &url, &[UA], None, cfg)?)?;
+    let tok: Value = crate::http_json("GET", &url, &[UA], None, cfg)?;
     let v = json!({
         "token": tok["accessToken"].as_str().ok_or("Spotify token missing")?,
         "exp": tok["accessTokenExpirationTimestampMs"],
@@ -137,8 +136,7 @@ fn query(op: &str, vars: Value, cfg: &Value) -> R<Value> {
             "https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}"
         );
             let auth = format!("Bearer {token}");
-            let reply = http("GET", &url, &[UA, ("Authorization", &auth)], None, cfg);
-            let value = reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?));
+            let value = crate::http_json::<Value>("GET", &url, &[UA, ("Authorization", &auth)], None, cfg);
             match value {
                 Ok(value) if value.get("data").is_some() => {
                     return Ok(value);
@@ -161,7 +159,7 @@ static DEEZER: LazyLock<Mutex<DeezerCache>> = LazyLock::new(Default::default);
 fn deezer_get(url: &str, cfg: &Value) -> R<Value> {
     for wait in [0, 2, 5] {
         std::thread::sleep(std::time::Duration::from_secs(wait));
-        let reply: Value = serde_json::from_slice(&http("GET", url, &[], None, cfg)?)?;
+        let reply: Value = crate::http_json("GET", url, &[], None, cfg)?;
         if reply["error"]["code"] != 4 {
             return Ok(reply);
         }
@@ -264,8 +262,7 @@ fn token_request(cfg: &Value, fields: &[(&str, &str)]) -> R<Value> {
     let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(id.as_bytes()));
     let form = fields.iter().map(|(key, value)| format!("{key}={}", crate::url_encode(value))).collect::<Vec<_>>();
     let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/x-www-form-urlencoded")];
-    let reply = http("POST", "https://accounts.spotify.com/api/token", &headers, Some(form.join("&").as_bytes()), cfg)?;
-    Ok(serde_json::from_slice(&reply)?)
+    crate::http_json("POST", "https://accounts.spotify.com/api/token", &headers, Some(form.join("&").as_bytes()), cfg)
 }
 
 fn authorization_code(cfg: &Value, state: &str) -> R<String> {
@@ -349,8 +346,7 @@ fn official(path: &str, cfg: &Value) -> R<Vec<Value>> {
     let mut next = Some(format!("https://api.spotify.com/v1/{path}"));
     let mut items = Vec::new();
     while let Some(url) = next {
-        let reply = http("GET", &url, &[("Authorization", &auth)], None, cfg)?;
-        let page: Value = serde_json::from_slice(&reply)?;
+        let page: Value = crate::http_json("GET", &url, &[("Authorization", &auth)], None, cfg)?;
         let keys = ["tracks", "albums", "artists", "playlists", "shows"];
         let result = keys.iter().find_map(|key| page.get(key)).unwrap_or(&page);
         items.extend(result["items"].as_array().cloned().unwrap_or_default());
