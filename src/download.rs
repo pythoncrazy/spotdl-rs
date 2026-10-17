@@ -185,15 +185,15 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
     cfg["lyrics_providers"].as_array().into_iter().flatten().filter_map(Value::as_str).find_map(provider)
 }
 
-pub fn add_lyrics(song: &Song, file: &Path, cfg: &Value) -> R<Option<String>> {
-    let Some(text) = lyrics(song, cfg) else {
-        return Ok(None);
-    };
+pub fn add_lyrics(song: &Song, file: &Path, cfg: &Value) -> Option<String> {
+    let text = lyrics(song, cfg)?;
     let mut song = song.clone();
     song.lyrics = Some(text.clone());
-    tag(file, &song, cfg)?;
-    write_lrc(file, &song, cfg)?;
-    Ok(Some(text))
+    if let Err(error) = tag(file, &song, cfg).and_then(|_| write_lrc(file, &song, cfg)) {
+        crate::log(cfg, "ERROR", &format!("{} - {}: {error}", song.artists.join(", "), song.name));
+        return None;
+    }
+    Some(text)
 }
 
 fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
@@ -379,16 +379,6 @@ fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
     Ok(())
 }
 
-fn try_fetch(url: &str, out: &Path, id: &str, cfg: &Value, error: &mut String) -> bool {
-    match fetch(url, out, id, cfg) {
-        Ok(()) => true,
-        Err(fetch_error) => {
-            *error = fetch_error.to_string();
-            false
-        }
-    }
-}
-
 fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&Sender<LyricsJob>>) -> R<PathBuf> {
     let should_enrich = op != "save" && op != "url";
     let enriched_for_output = should_enrich
@@ -447,9 +437,6 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
         crate::spotify::enrich(s, cfg);
     }
     let will_download = op != "url" && (!exists || overwrite == "force");
-    if !will_download && op != "url" && s.download_url.is_none() && overwrite != "metadata" {
-        let _ = search::first_hit(s, cfg)?;
-    }
     if op == "url" {
         if s.download_url.is_none() {
             s.download_url = Some(search::first_hit(s, cfg)?);
@@ -460,45 +447,35 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
         fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
         let id = if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
         let mut error = String::from("no match");
-        let mut tried = None;
-        let mut downloaded = None;
-        let mut isrc_error = None;
-        if let Some(url) = s.download_url.as_ref() {
-            tried = Some(url.clone());
-            if try_fetch(url, &out, &id, cfg, &mut error) {
-                downloaded = Some(url.clone());
-            }
-        }
-        if downloaded.is_none() {
-            match search::isrc_hit(s, cfg) {
-                Ok(Some(url)) if tried.as_ref() != Some(&url) => {
-                    tried = Some(url.clone());
-                    if try_fetch(&url, &out, &id, cfg, &mut error) {
-                        downloaded = Some(url);
-                    }
+        let mut tried = HashSet::new();
+        let mut fetch_first = |urls: Vec<String>| {
+            urls.into_iter().find_map(|url| {
+                if !tried.insert(url.clone()) {
+                    return None;
                 }
-                Ok(Some(_)) | Ok(None) => {}
-                Err(search_error) => isrc_error = Some(search_error.to_string()),
-            }
+                fetch(&url, &out, &id, cfg).map(|()| Some(url)).unwrap_or_else(|fetch_error| {
+                    error = fetch_error.to_string();
+                    None
+                })
+            })
+        };
+        let mut downloaded = fetch_first(s.download_url.clone().into_iter().collect());
+        let isrc = if downloaded.is_none() { search::isrc_hit(s, cfg) } else { Ok(None) };
+        if let Ok(Some(url)) = isrc.as_ref() {
+            downloaded = fetch_first(vec![url.clone()]);
         }
         if downloaded.is_none() {
-            let candidates = match search::text_hits_after_isrc_error(s, cfg, isrc_error) {
+            let candidates = match search::find(s, cfg, isrc.err().map(|error| error.to_string())) {
                 Ok(candidates) => candidates,
-                Err(search_error) if error != "no match" && search_error.to_string().starts_with("no match for ") => {
-                    return Err(error.into());
+                Err(search_error) if search_error.to_string().starts_with("no match for ") => {
+                    drop(fetch_first);
+                    return Err(if error == "no match" { search_error } else { error.into() });
                 }
                 Err(search_error) => return Err(search_error),
             };
-            for url in candidates {
-                if tried.as_ref().is_some_and(|tried| tried == &url) {
-                    continue;
-                }
-                if try_fetch(&url, &out, &id, cfg, &mut error) {
-                    downloaded = Some(url);
-                    break;
-                }
-            }
+            downloaded = fetch_first(candidates);
         }
+        drop(fetch_first);
         s.download_url = Some(downloaded.ok_or(error)?);
         if target != out && target.is_file() {
             fs::remove_file(&target)?;
@@ -508,16 +485,13 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
     if lyrics_tx.is_none() && s.lyrics.is_none() {
         s.lyrics = lyrics(s, cfg);
     }
-    tag(&target, s, cfg)?;
-    write_lrc(&target, s, cfg)?;
+    tag(&target, s, cfg).and_then(|_| write_lrc(&target, s, cfg))?;
     if cfg["create_skip_file"] == true {
         fs::write(format!("{}.skip", target.display()), "")?;
     }
     append(archive, &s.url)?;
-    if s.lyrics.is_none() {
-        if let Some(sender) = lyrics_tx {
-            sender.send((index, s.clone(), target.clone()))?;
-        }
+    if let Some(sender) = lyrics_tx.filter(|_| s.lyrics.is_none()) {
+        sender.send((index, s.clone(), target.clone()))?;
     }
     Ok(target)
 }

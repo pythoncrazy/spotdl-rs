@@ -545,32 +545,24 @@ fn run() -> R<()> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let lyrics_stage = matches!(op.as_str(), "download" | "sync")
         && cfg["lyrics_providers"].as_array().is_some_and(|providers| !providers.is_empty());
-    let done: Vec<(Song, R<PathBuf>)> = if lyrics_stage {
+    let done = if lyrics_stage {
         let lyrics_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
         let (sender, receiver) = std::sync::mpsc::channel::<download::LyricsJob>();
-        let lyrics_cfg = &cfg;
         std::thread::scope(|scope| -> R<_> {
-            let lyrics = scope.spawn(move || {
+            let lyrics = scope.spawn(|| {
                 lyrics_pool.install(|| {
                     receiver
                         .into_iter()
                         .par_bridge()
-                        .map(|(index, song, path)| (index, download::add_lyrics(&song, &path, lyrics_cfg)))
+                        .map(|(index, song, path)| (index, download::add_lyrics(&song, &path, &cfg)))
                         .collect::<Vec<_>>()
                 })
             });
-            let done = process_songs(songs, &op, &cfg, &pool, Some(&sender));
+            let mut done = process_songs(songs, &op, &cfg, &pool, Some(&sender));
             drop(sender);
-            let mut done = done;
-            for (index, result) in lyrics.join().map_err(|_| "lyrics stage panicked")? {
-                match result {
-                    Ok(Some(text)) => done[index].0.lyrics = Some(text),
-                    Ok(None) => {}
-                    Err(error) => {
-                        let (song, result) = &mut done[index];
-                        crate::log(&cfg, "ERROR", &format!("{} - {}: {error}", song.artists.join(", "), song.name));
-                        *result = Err(error);
-                    }
+            for (index, text) in lyrics.join().map_err(|_| "lyrics stage panicked")? {
+                if let Some(text) = text {
+                    done[index].0.lyrics = Some(text);
                 }
             }
             Ok(done)
