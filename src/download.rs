@@ -10,7 +10,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::{Condvar, Mutex, OnceLock},
+    time::Duration,
 };
 
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
@@ -91,6 +92,56 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
 
+const LRCLIB_LIMIT: usize = 4;
+static LRCLIB_REQUESTS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+struct LrclibPermit;
+
+impl LrclibPermit {
+    fn acquire() -> Self {
+        let (active, ready) = LRCLIB_REQUESTS.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = active.lock().unwrap_or_else(|error| error.into_inner());
+        while *active >= LRCLIB_LIMIT {
+            active = ready.wait(active).unwrap_or_else(|error| error.into_inner());
+        }
+        *active += 1;
+        Self
+    }
+}
+
+impl Drop for LrclibPermit {
+    fn drop(&mut self) {
+        let (active, ready) = LRCLIB_REQUESTS.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = active.lock().unwrap_or_else(|error| error.into_inner());
+        *active -= 1;
+        ready.notify_one();
+    }
+}
+
+fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<u8>> {
+    let mut request_cfg = cfg.clone();
+    request_cfg["max_retries"] = json!(0);
+    for attempt in 0..5 {
+        let response = {
+            let _permit = LrclibPermit::acquire();
+            crate::http("GET", url, &[], None, &request_cfg)
+        };
+        match response {
+            Ok(bytes) => return Some(bytes),
+            Err(error) => {
+                let status = error.to_string().split_whitespace().nth(1).and_then(|status| status.parse::<u16>().ok());
+                let status = status.filter(|status| *status == 429 || (500..600).contains(status))?;
+                crate::log(cfg, "DEBUG", &format!("LRCLIB HTTP {status} on attempt {}/5", attempt + 1));
+                if attempt == 4 {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_secs(1 << (attempt + 1)));
+            }
+        }
+    }
+    None
+}
+
 pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
     let mut lyrics_cfg = cfg.clone();
     lyrics_cfg["max_retries"] = json!(1);
@@ -108,7 +159,8 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                     encode(&song.artist),
                     encode(&song.name)
                 );
-                let tracks: Vec<Value> = crate::http_json("GET", &url, &[], None, &lyrics_cfg).ok()?;
+                let bytes = lrclib_request(&url, &lyrics_cfg)?;
+                let tracks: Vec<Value> = serde_json::from_slice(&bytes).ok()?;
                 let hit = tracks
                     .iter()
                     .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
