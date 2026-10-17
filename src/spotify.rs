@@ -18,9 +18,9 @@ const UA: (&str, &str) = (
 
 const SECRETS_URL: &str = "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json";
 
-static STATE: Mutex<Option<Value>> = Mutex::new(None);
+static STATE: Mutex<Option<Arc<Value>>> = Mutex::new(None);
 
-static ALBUMS: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::default);
+static ALBUMS: LazyLock<Mutex<HashMap<String, Arc<Value>>>> = LazyLock::new(Default::default);
 
 fn hotp(key: &[u8], counter: u64) -> String {
     let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC accepts keys of any size");
@@ -66,19 +66,19 @@ fn hashes(ops: &[&str], cfg: &Value) -> R<Value> {
     Ok(Value::Object(found.collect()))
 }
 
-fn state(cfg: &Value, rejected: Option<&str>) -> R<Value> {
+fn state(cfg: &Value, rejected: Option<&str>) -> R<Arc<Value>> {
     let path = HOME.join("anon.json");
     let memory = STATE.lock().map_err(|e| e.to_string())?.clone();
     let cached = memory.or_else(|| {
-        (cfg["no_cache"] != true).then(|| serde_json::from_slice::<Value>(&fs::read(&path).ok()?).ok()).flatten()
+        (cfg["no_cache"] != true).then(|| serde_json::from_slice(&fs::read(&path).ok()?).ok()).flatten().map(Arc::new)
     });
     let now = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis() as u64;
-    let fresh = |v: &Value| {
+    let fresh = |v: &Arc<Value>| {
         v["exp"].as_u64() > Some(now + 60_000)
             && rejected.is_none_or(|t| v["at"].as_u64() > Some(now - 60_000) && v["token"].as_str() != Some(t))
     };
     if let Some(v) = cached.filter(fresh) {
-        *STATE.lock().map_err(|e| e.to_string())? = Some(v.clone());
+        *STATE.lock().map_err(|e| e.to_string())? = Some(Arc::clone(&v));
         return Ok(v);
     }
     let secrets: HashMap<String, Vec<u8>> = crate::http_json("GET", SECRETS_URL, &[UA], None, cfg)?;
@@ -86,17 +86,17 @@ fn state(cfg: &Value, rejected: Option<&str>) -> R<Value> {
     let code = totp(secret)?;
     let url = format!("https://open.spotify.com/api/token?reason=init&productType=web-player&totp={code}&totpVer={ver}&totpServer={code}");
     let tok: Value = crate::http_json("GET", &url, &[UA], None, cfg)?;
-    let v = json!({
+    let v = Arc::new(json!({
         "token": tok["accessToken"].as_str().ok_or("Spotify token missing")?,
         "exp": tok["accessTokenExpirationTimestampMs"],
         "at": now,
         "hashes": hashes(&["getTrack", "getAlbum", "fetchPlaylist", "queryArtistDiscographyAll", "searchDesktop"], cfg)?,
-    });
+    }));
     if cfg["no_cache"] != true {
         fs::create_dir_all(&*HOME)?;
         fs::write(path, v.to_string())?;
     }
-    *STATE.lock().map_err(|e| e.to_string())? = Some(v.clone());
+    *STATE.lock().map_err(|e| e.to_string())? = Some(Arc::clone(&v));
     Ok(v)
 }
 
@@ -152,7 +152,7 @@ fn query(op: &str, vars: Value, cfg: &Value) -> R<Value> {
     })
 }
 
-type DeezerCache = HashMap<String, Arc<OnceLock<Option<Value>>>>;
+type DeezerCache = HashMap<String, Arc<OnceLock<Option<Arc<Value>>>>>;
 
 static DEEZER: LazyLock<Mutex<DeezerCache>> = LazyLock::new(Default::default);
 
@@ -210,9 +210,9 @@ fn fetch_deezer_album(album_id: &str, artist: &str, title: &str, cfg: &Value) ->
     })
 }
 
-fn deezer_album(album_id: &str, artist: &str, title: &str, cfg: &Value) -> Option<Value> {
+fn deezer_album(album_id: &str, artist: &str, title: &str, cfg: &Value) -> Option<Arc<Value>> {
     let cell = DEEZER.lock().ok()?.entry(album_id.into()).or_default().clone();
-    cell.get_or_init(|| fetch_deezer_album(album_id, artist, title, cfg).ok()).clone()
+    cell.get_or_init(|| fetch_deezer_album(album_id, artist, title, cfg).ok().map(Arc::new)).clone()
 }
 
 pub fn enrich(song: &mut Song, cfg: &Value) {
@@ -346,32 +346,33 @@ fn official(path: &str, cfg: &Value) -> R<Vec<Value>> {
     let mut next = Some(format!("https://api.spotify.com/v1/{path}"));
     let mut items = Vec::new();
     while let Some(url) = next {
-        let page: Value = crate::http_json("GET", &url, &[("Authorization", &auth)], None, cfg)?;
+        let mut page: Value = crate::http_json("GET", &url, &[("Authorization", &auth)], None, cfg)?;
         let keys = ["tracks", "albums", "artists", "playlists", "shows"];
-        let result = keys.iter().find_map(|key| page.get(key)).unwrap_or(&page);
-        items.extend(result["items"].as_array().cloned().unwrap_or_default());
-        if result["items"].is_null() && result["id"].is_string() {
-            items.push(result.clone());
-        }
+        let mut result =
+            keys.iter().find(|key| page.get(**key).is_some()).map(|key| page[*key].take()).unwrap_or_else(|| page);
         next = result["next"].as_str().map(String::from);
+        items.extend(result["items"].as_array_mut().map(std::mem::take).unwrap_or_default());
+        if result["items"].is_null() && result["id"].is_string() {
+            items.push(result);
+        }
     }
     Ok(items)
 }
 
 fn pages(op: &str, uri: &str, list: &str, limit: usize, cfg: &Value) -> R<(Value, Vec<Value>)> {
     let variables = |offset: usize| json!({"uri": uri, "locale": "", "offset": offset, "limit": limit, "order": "DATE_DESC", "enableWatchFeedEntrypoint": false});
-    let items =
-        |value: &Value| value.pointer(&format!("{list}/items")).and_then(Value::as_array).cloned().unwrap_or_default();
-    let first = query(op, variables(0), cfg)?;
-    let total =
-        first.pointer(&format!("{list}/totalCount")).and_then(Value::as_u64).ok_or(format!("{uri} unavailable"))?;
-    let offsets: Vec<usize> = (limit..total as usize).step_by(limit).collect();
+    let item_path = format!("{list}/items");
+    let take_items =
+        |v: &mut Value| v.pointer_mut(&item_path).and_then(Value::as_array_mut).map(std::mem::take).unwrap_or_default();
+    let mut first = query(op, variables(0), cfg)?;
+    let total = first.pointer(list).and_then(|v| v["totalCount"].as_u64()).ok_or(format!("{uri} unavailable"))?;
+    let (offsets, first_items) = ((limit..total as usize).step_by(limit).collect::<Vec<_>>(), take_items(&mut first));
     let rest: Vec<Vec<Value>> = offsets
         .par_iter()
-        .map(|offset| query(op, variables(*offset), cfg).map(|page| items(&page)))
+        .map(|offset| query(op, variables(*offset), cfg).map(|mut page| take_items(&mut page)))
         .collect::<R<_>>()?;
-    let meta = first["data"].as_object().and_then(|data| data.values().next()).cloned().unwrap_or_default();
-    Ok((meta, std::iter::once(items(&first)).chain(rest).flatten().collect()))
+    let meta = first["data"][list.split('/').nth(2).unwrap_or_default()].take();
+    Ok((meta, std::iter::once(first_items).chain(rest).flatten().collect()))
 }
 
 fn cover(value: &Value) -> Option<&str> {
@@ -386,7 +387,7 @@ fn cover(value: &Value) -> Option<&str> {
 
 type List<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
 
-fn album_meta(uri: &str, cfg: &Value) -> R<Value> {
+fn album_meta(uri: &str, cfg: &Value) -> R<Arc<Value>> {
     let keep = ["name", "artists", "date", "discs", "tracksV2", "label", "coverArt", "copyright", "type"];
     let cached = ALBUMS.lock().map_err(|error| error.to_string())?.get(uri).cloned();
     let album = match cached {
@@ -399,8 +400,7 @@ fn album_meta(uri: &str, cfg: &Value) -> R<Value> {
                 .as_object_mut()
                 .ok_or("Spotify album metadata is missing")?
                 .retain(|key, _| keep.contains(&key.as_str()));
-            ALBUMS.lock().map_err(|error| error.to_string())?.insert(uri.into(), album.clone());
-            album
+            ALBUMS.lock().map_err(|error| error.to_string())?.entry(uri.into()).or_insert(Arc::new(album)).clone()
         }
     };
     Ok(album)
@@ -411,7 +411,7 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> R<Vec<Song>> {
         .iter()
         .filter_map(|track| track["albumOfTrack"]["uri"].as_str().or(track["album"]["uri"].as_str()))
         .collect();
-    let albums: HashMap<&str, Value> =
+    let albums: HashMap<&str, Arc<Value>> =
         uris.into_par_iter().map(|uri| album_meta(uri, cfg).map(|album| (uri, album))).collect::<R<_>>()?;
     let length = tracks.len();
     let empty = Value::Null;
@@ -421,7 +421,7 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> R<Vec<Song>> {
         .filter(|(_, track)| track["uri"].as_str().is_some_and(|uri| uri.starts_with("spotify:track:")));
     let song = |(index, track): (usize, &Value)| {
         let uri = track["albumOfTrack"]["uri"].as_str().or(track["album"]["uri"].as_str()).unwrap_or_default();
-        let album = albums.get(uri).unwrap_or(&empty);
+        let album = albums.get(uri).map_or(&empty, |album| album.as_ref());
         let names = [
             &track["firstArtist"]["items"],
             &track["otherArtists"]["items"],
@@ -486,9 +486,8 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> R<Vec<Song>> {
 }
 
 fn album(uri: &str, cfg: &Value) -> R<Vec<Value>> {
-    let (mut meta, items) = pages("getAlbum", uri, "/data/albumUnion/tracksV2", 343, cfg)?;
-    meta["tracksV2"]["items"] = Value::Null;
-    ALBUMS.lock().map_err(|error| error.to_string())?.insert(uri.into(), meta);
+    let (meta, items) = pages("getAlbum", uri, "/data/albumUnion/tracksV2", 343, cfg)?;
+    ALBUMS.lock().map_err(|error| error.to_string())?.insert(uri.into(), Arc::new(meta));
     Ok(items
         .into_iter()
         .map(|mut item| {
