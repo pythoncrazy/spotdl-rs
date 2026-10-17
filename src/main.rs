@@ -94,13 +94,7 @@ fn init_agent(cfg: &Value) -> &'static ureq::Agent {
     })
 }
 
-fn http_response(
-    method: &str,
-    url: &str,
-    headers: &[(&str, &str)],
-    body: Option<&[u8]>,
-    cfg: &Value,
-) -> R<ureq::http::Response<ureq::Body>> {
+pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
     let agent = init_agent(cfg);
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3).max(1);
     let mut attempt = 1;
@@ -126,28 +120,16 @@ fn http_response(
             attempt += 1;
             continue;
         }
-        let reply = response?;
+        let mut reply = response?;
         if !reply.status().is_success() {
             return Err(format!("HTTP {} for {url}", reply.status()).into());
         }
-        return Ok(reply);
+        return Ok(reply.body_mut().with_config().limit(1 << 28).read_to_vec()?);
     }
 }
 
-pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
-    let mut response = http_response(method, url, headers, body, cfg)?;
-    Ok(response.body_mut().with_config().limit(1 << 28).read_to_vec()?)
-}
-
-pub fn http_json<T: DeserializeOwned>(
-    method: &str,
-    url: &str,
-    headers: &[(&str, &str)],
-    body: Option<&[u8]>,
-    cfg: &Value,
-) -> R<T> {
-    let mut response = http_response(method, url, headers, body, cfg)?;
-    Ok(response.body_mut().with_config().limit(1 << 28).read_json()?)
+pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b: Option<&[u8]>, cfg: &Value) -> R<T> {
+    Ok(serde_json::from_slice(&http(m, url, h, b, cfg)?)?)
 }
 
 fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
