@@ -49,7 +49,7 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
         if v.is_null() {
             String::new()
         } else {
-            v.as_str().map_or(v.to_string(), String::from)
+            v.as_str().map_or_else(|| v.to_string(), String::from)
         }
     };
     let fields = json.as_object().into_iter().flatten().map(|(k, v)| (k.replace('_', "-"), text(v)));
@@ -526,7 +526,7 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
     };
     let scanned = (cfg["scan_for_songs"] == true && op != "save").then(|| SCAN.get_or_init(scan).get(&s.url).cloned());
     let mut target =
-        scanned.flatten().or(Some(out.clone()).filter(|out| out.is_file())).or(detected).unwrap_or(out.clone());
+        scanned.flatten().or_else(|| out.is_file().then(|| out.clone())).or(detected).unwrap_or_else(|| out.clone());
     if op == "save" {
         if cfg["preload"] == true {
             s.download_url = search::first_hit(s, cfg).ok();

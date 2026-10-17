@@ -170,7 +170,6 @@ fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
         let (raw_key, inline_value) =
             argument.split_once('=').map_or((argument, None), |(key, value)| (key, Some(value)));
         let raw_key = raw_key.replace('-', "_");
-        let inline = inline_value.is_some();
         if raw_key == "config" {
             i += usize::from(inline_value.is_none() && args.get(i + 1).is_some_and(|value| !value.starts_with("--")))
                 + 1;
@@ -201,7 +200,7 @@ fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
             (None, _) => (0, json!(true)),
         };
         raw[key] = value;
-        i += if inline { 1 } else { take + 1 };
+        i += if inline_value.is_some() { 1 } else { take + 1 };
     }
     if raw["m3u"].is_boolean() {
         let enabled = raw["m3u"] == true;
