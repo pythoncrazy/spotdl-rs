@@ -379,6 +379,16 @@ fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
     Ok(())
 }
 
+fn try_fetch(url: &str, out: &Path, id: &str, cfg: &Value, error: &mut String) -> bool {
+    match fetch(url, out, id, cfg) {
+        Ok(()) => true,
+        Err(fetch_error) => {
+            *error = fetch_error.to_string();
+            false
+        }
+    }
+}
+
 fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&Sender<LyricsJob>>) -> R<PathBuf> {
     let should_enrich = op != "save" && op != "url";
     let enriched_for_output = should_enrich
@@ -413,7 +423,7 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
         scanned.flatten().or(Some(out.clone()).filter(|out| out.is_file())).or(detected).unwrap_or(out.clone());
     if op == "save" {
         if cfg["preload"] == true {
-            s.download_url = search::find(s, cfg).ok().and_then(|urls| urls.into_iter().next());
+            s.download_url = search::first_hit(s, cfg).ok();
         }
         s.lyrics = lyrics(s, cfg);
         return Ok(target);
@@ -437,23 +447,59 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
         crate::spotify::enrich(s, cfg);
     }
     let will_download = op != "url" && (!exists || overwrite == "force");
-    let candidates = match &s.download_url {
-        Some(url) => vec![url.clone()],
-        None if exists && overwrite == "metadata" && op != "url" => Vec::new(),
-        None => search::find(s, cfg)?,
-    };
+    if !will_download && op != "url" && s.download_url.is_none() && overwrite != "metadata" {
+        let _ = search::first_hit(s, cfg)?;
+    }
     if op == "url" {
-        s.download_url = candidates.first().cloned();
+        if s.download_url.is_none() {
+            s.download_url = Some(search::first_hit(s, cfg)?);
+        }
         return Ok(target);
     }
     if will_download {
         fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-        let id =
-            if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
+        let id = if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
         let mut error = String::from("no match");
-        let mut fetched =
-            candidates.iter().filter(|url| fetch(url, &out, &id, cfg).map_err(|e| error = e.to_string()).is_ok());
-        s.download_url = Some(fetched.next().ok_or(error)?.clone());
+        let mut tried = None;
+        let mut downloaded = None;
+        let mut isrc_error = None;
+        if let Some(url) = s.download_url.as_ref() {
+            tried = Some(url.clone());
+            if try_fetch(url, &out, &id, cfg, &mut error) {
+                downloaded = Some(url.clone());
+            }
+        }
+        if downloaded.is_none() {
+            match search::isrc_hit(s, cfg) {
+                Ok(Some(url)) if tried.as_ref() != Some(&url) => {
+                    tried = Some(url.clone());
+                    if try_fetch(&url, &out, &id, cfg, &mut error) {
+                        downloaded = Some(url);
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(search_error) => isrc_error = Some(search_error.to_string()),
+            }
+        }
+        if downloaded.is_none() {
+            let candidates = match search::text_hits_after_isrc_error(s, cfg, isrc_error) {
+                Ok(candidates) => candidates,
+                Err(search_error) if error != "no match" && search_error.to_string().starts_with("no match for ") => {
+                    return Err(error.into());
+                }
+                Err(search_error) => return Err(search_error),
+            };
+            for url in candidates {
+                if tried.as_ref().is_some_and(|tried| tried == &url) {
+                    continue;
+                }
+                if try_fetch(&url, &out, &id, cfg, &mut error) {
+                    downloaded = Some(url);
+                    break;
+                }
+            }
+        }
+        s.download_url = Some(downloaded.ok_or(error)?);
         if target != out && target.is_file() {
             fs::remove_file(&target)?;
         }

@@ -55,12 +55,12 @@ fn short_retry_delay() -> Duration {
 fn with_backoff<T>(
     gate: &Gate,
     cfg: &Value,
-    message: &str,
     mut attempt: impl FnMut() -> Result<T, String>,
     retry: impl Fn(&str) -> bool,
     wait_before_retry: impl Fn(),
 ) -> R<T> {
     let attempts = cfg["max_retries"].as_u64().unwrap_or(3) + 1;
+    let message = if std::ptr::eq(gate, &SEARCH_GATE) { "searches" } else { "downloads" };
     let mut announced = 0;
     for number in 1..=attempts {
         let until = gate.until.load(Relaxed);
@@ -102,11 +102,9 @@ fn youtube_blocked(error: &str) -> bool {
 }
 
 pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
-    let message = if std::ptr::eq(gate, &SEARCH_GATE) { "searches" } else { "downloads" };
     with_backoff(
         gate,
         cfg,
-        message,
         || {
             let output = cmd.output().map_err(|error| error.to_string())?;
             let error = String::from_utf8_lossy(&output.stderr);
@@ -223,7 +221,6 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let v = with_backoff(
         &SEARCH_GATE,
         cfg,
-        "searches",
         || {
             crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
                 .map_err(|error| error.to_string())
@@ -239,6 +236,41 @@ fn hits_or_note(first_error: &mut Option<String>, result: R<Vec<Hit>>) -> Vec<Hi
         first_error.get_or_insert(error.to_string());
         Vec::new()
     })
+}
+
+pub fn isrc_hit(song: &Song, cfg: &Value) -> R<Option<String>> {
+    let providers = audio_providers(cfg);
+    let Some(isrc) = song.isrc.as_ref().filter(|_| providers.contains(&"youtube-music")) else {
+        return Ok(None);
+    };
+    let filter = cfg["filter_results"] != false;
+    let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
+    let hits = ytm(isrc, true, true, cfg)?;
+    Ok(hits
+        .into_iter()
+        .filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0)
+        .max_by(|a, b| rank(a).total_cmp(&rank(b)))
+        .map(|hit| hit.song.url))
+}
+
+pub(crate) fn text_hits_after_isrc_error(song: &Song, cfg: &Value, isrc_error: Option<String>) -> R<Vec<String>> {
+    match (find(song, cfg), isrc_error) {
+        (Err(error), Some(isrc_error)) if error.to_string().starts_with("no match for ") => {
+            let query = crate::download::fill(cfg["search_query"].as_str().unwrap_or("{artists} - {title}"), song, cfg);
+            Err(format!("search failed for {query}: {isrc_error}").into())
+        }
+        (result, _) => result,
+    }
+}
+
+pub(crate) fn first_hit(song: &Song, cfg: &Value) -> R<String> {
+    match isrc_hit(song, cfg) {
+        Ok(Some(url)) => Ok(url),
+        result => {
+            let error = result.err().map(|error| error.to_string());
+            text_hits_after_isrc_error(song, cfg, error)?.into_iter().next().ok_or("no match".into())
+        }
+    }
 }
 
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
@@ -305,21 +337,18 @@ fn score(s: &Song, h: &Hit) -> f64 {
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
 
+fn audio_providers(cfg: &Value) -> Vec<&str> {
+    cfg["audio_providers"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
 pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     let query = crate::download::fill(cfg["search_query"].as_str().unwrap_or("{artists} - {title}"), song, cfg);
     let filter = cfg["filter_results"] != false;
     let verified = cfg["only_verified_results"] == true;
-    let providers = cfg["audio_providers"].as_array().into_iter().flatten().filter_map(Value::as_str);
-    let providers: Vec<&str> = providers.collect();
+    let providers = audio_providers(cfg);
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
     let mut found: Vec<(f64, String)> = Vec::new();
     let mut first_error = None;
-    if let Some(isrc) = song.isrc.as_ref().filter(|_| providers.contains(&"youtube-music")) {
-        let hits = hits_or_note(&mut first_error, ytm(isrc, true, true, cfg)).into_iter();
-        let hits = hits.filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0);
-        let best = hits.max_by(|a, b| rank(a).total_cmp(&rank(b)));
-        found.extend(best.map(|hit| (f64::INFINITY, hit.song.url)));
-    }
     for provider in &providers {
         let hits = match *provider {
             "youtube-music" => ytm(&query, true, false, cfg),
@@ -437,6 +466,12 @@ mod tests {
         let error = find(&song("Test"), &cfg).unwrap_err().to_string();
         assert!(error.contains("search failed"));
         assert!(!error.contains("no match"));
+
+        let mut isrc_song = song("Test");
+        isrc_song.isrc = Some("USRC17607839".into());
+        let error = first_hit(&isrc_song, &cfg).unwrap_err().to_string();
+        assert!(error.contains("search failed"));
+        assert!(!error.contains("no match"));
     }
 
     #[test]
@@ -447,10 +482,13 @@ mod tests {
         let result = with_backoff(
             &gate,
             &cfg,
-            "searches",
             || {
                 attempts += 1;
-                if attempts == 1 { Err("HTTP 403".into()) } else { Ok(()) }
+                if attempts == 1 {
+                    Err("HTTP 403".into())
+                } else {
+                    Ok(())
+                }
             },
             |_| true,
             || {},
@@ -458,7 +496,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(gate.until.load(Relaxed), 0);
 
-        let error = with_backoff::<()>(&gate, &cfg, "searches", || Err("HTTP 403".into()), |_| true, || {});
+        let error = with_backoff::<()>(&gate, &cfg, || Err("HTTP 403".into()), |_| true, || {});
         assert!(error.is_err());
         assert!(gate.until.load(Relaxed) > UNIX_EPOCH.elapsed().unwrap().as_secs());
     }

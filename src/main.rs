@@ -405,6 +405,23 @@ fn resolve(queries: &[String], op: &str, cfg: &Value) -> (Vec<Song>, Vec<String>
     (songs, errors)
 }
 
+fn process_songs(
+    songs: Vec<Song>,
+    op: &str,
+    cfg: &Value,
+    pool: &rayon::ThreadPool,
+    lyrics_tx: Option<&std::sync::mpsc::Sender<download::LyricsJob>>,
+) -> Vec<(Song, R<PathBuf>)> {
+    pool.install(|| {
+        songs
+            .into_par_iter()
+            .enumerate()
+            .with_max_len(1)
+            .map(|(index, song)| download::process(song, op, cfg, index, lyrics_tx))
+            .collect()
+    })
+}
+
 fn m3u_entry(song: &Path, playlist: &Path) -> R<String> {
     let song = std::path::absolute(song)?;
     let dir = std::path::absolute(playlist)?.parent().map(PathBuf::from).unwrap_or_default();
@@ -542,14 +559,7 @@ fn run() -> R<()> {
                         .collect::<Vec<_>>()
                 })
             });
-            let done = pool.install(|| {
-                songs
-                    .into_par_iter()
-                    .enumerate()
-                    .with_max_len(1)
-                    .map(|(index, song)| download::process(song, &op, &cfg, index, Some(&sender)))
-                    .collect::<Vec<_>>()
-            });
+            let done = process_songs(songs, &op, &cfg, &pool, Some(&sender));
             drop(sender);
             let mut done = done;
             for (index, result) in lyrics.join().map_err(|_| "lyrics stage panicked")? {
@@ -566,14 +576,7 @@ fn run() -> R<()> {
             Ok(done)
         })?
     } else {
-        pool.install(|| {
-            songs
-                .into_par_iter()
-                .enumerate()
-                .with_max_len(1)
-                .map(|(index, song)| download::process(song, &op, &cfg, index, None))
-                .collect()
-        })
+        process_songs(songs, &op, &cfg, &pool, None)
     };
     let saved = done.iter().map(|(song, _)| song.clone()).collect::<Vec<_>>();
     match (op.as_str(), save_file.as_deref(), sync_path) {
