@@ -449,6 +449,7 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> Vec<Song> {
             duration: track["duration"]["totalMilliseconds"]
                 .as_f64()
                 .or(track["duration_ms"].as_f64())
+                .or(track["trackDuration"]["totalMilliseconds"].as_f64())
                 .unwrap_or_default()
                 / 1000.0,
             year: date.get(..4).and_then(|year| year.parse().ok()).unwrap_or_default(),
@@ -668,10 +669,18 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
 
 #[cfg(test)]
 mod tests {
-    use super::hotp;
+    use super::{build, hotp};
 
     #[test]
     fn hotp_matches_rfc_4226_vector() {
         assert_eq!(hotp(b"12345678901234567890", 1), "287082");
+    }
+
+    #[test]
+    fn playlist_track_duration_is_milliseconds() {
+        let tracks =
+            vec![serde_json::json!({"uri": "spotify:track:test", "trackDuration": {"totalMilliseconds": 12_345}})];
+        let song = build(tracks, None, &serde_json::json!({})).into_iter().next().expect("expected one track");
+        assert!((song.duration - 12.345).abs() < 1e-9);
     }
 }
