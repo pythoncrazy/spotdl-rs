@@ -1,4 +1,6 @@
 use crate::{http, Song, HOME, R};
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -20,6 +22,14 @@ static STATE: Mutex<Option<Value>> = Mutex::new(None);
 
 static ALBUMS: LazyLock<Mutex<HashMap<String, Value>>> = LazyLock::new(Default::default);
 
+fn hotp(key: &[u8], counter: u64) -> String {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC accepts keys of any size");
+    mac.update(&counter.to_be_bytes());
+    let d = mac.finalize().into_bytes();
+    let o = (d[19] & 15) as usize;
+    format!("{:06}", (u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) & 0x7fff_ffff) % 1_000_000)
+}
+
 fn totp(secret: &[u8]) -> R<String> {
     let key: Vec<u8> = secret
         .iter()
@@ -27,14 +37,7 @@ fn totp(secret: &[u8]) -> R<String> {
         .map(|(i, b)| b ^ ((i % 33 + 9) as u8))
         .flat_map(|b| b.to_string().into_bytes())
         .collect();
-    let pad = |x: u8| (0..64).map(|i| key.get(i).unwrap_or(&0) ^ x).collect::<Vec<u8>>();
-    let inner = Sha1::new()
-        .chain_update(pad(0x36))
-        .chain_update((UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() / 30).to_be_bytes())
-        .finalize();
-    let d = Sha1::new().chain_update(pad(0x5c)).chain_update(inner).finalize();
-    let o = (d[19] & 15) as usize;
-    Ok(format!("{:06}", (u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) & 0x7fff_ffff) % 1_000_000))
+    Ok(hotp(&key, UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() / 30))
 }
 
 fn hashes(ops: &[&str], cfg: &Value) -> R<Value> {
@@ -250,21 +253,6 @@ pub fn enrich(song: &mut Song, cfg: &Value) {
     }
 }
 
-fn base64(value: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::new();
-    for chunk in value.chunks(3) {
-        let a = chunk[0] as usize;
-        let b = chunk.get(1).copied().unwrap_or_default() as usize;
-        let c = chunk.get(2).copied().unwrap_or_default() as usize;
-        encoded.push(TABLE[a >> 2] as char);
-        encoded.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
-        encoded.push(if chunk.len() > 1 { TABLE[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
-        encoded.push(if chunk.len() > 2 { TABLE[c & 63] as char } else { '=' });
-    }
-    encoded
-}
-
 static TOKEN: Mutex<Option<(String, u64)>> = Mutex::new(None);
 
 fn token_request(cfg: &Value, fields: &[(&str, &str)]) -> R<Value> {
@@ -273,7 +261,7 @@ fn token_request(cfg: &Value, fields: &[(&str, &str)]) -> R<Value> {
         cfg["client_id"].as_str().unwrap_or_default(),
         cfg["client_secret"].as_str().unwrap_or_default()
     );
-    let auth = format!("Basic {}", base64(id.as_bytes()));
+    let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(id.as_bytes()));
     let form = fields.iter().map(|(key, value)| format!("{key}={}", crate::url_encode(value))).collect::<Vec<_>>();
     let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/x-www-form-urlencoded")];
     let reply = http("POST", "https://accounts.spotify.com/api/token", &headers, Some(form.join("&").as_bytes()), cfg)?;
@@ -680,4 +668,14 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
         _ => return playlist(&uri, id, api, cfg),
     };
     Ok(build(tracks, None, cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hotp;
+
+    #[test]
+    fn hotp_matches_rfc_4226_vector() {
+        assert_eq!(hotp(b"12345678901234567890", 1), "287082");
+    }
 }

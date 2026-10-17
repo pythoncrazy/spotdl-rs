@@ -8,11 +8,12 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
-    process::Command,
     sync::{LazyLock, OnceLock},
     time::Duration,
 };
+use zip::ZipArchive;
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -281,13 +282,10 @@ fn install(tool: &str, cfg: &Value) -> R<()> {
     } else {
         let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
         let url = format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim());
-        let archive = HOME.join("deno.zip");
-        fs::write(&archive, http("GET", &url, &[], None, cfg)?)?;
-        let mut unpack = Command::new(if cfg!(windows) { "tar" } else { "unzip" });
-        unpack.arg(if cfg!(windows) { "-xOf" } else { "-p" }).arg(&archive).arg(&member);
-        let output = unpack.output()?;
-        let _ = fs::remove_file(&archive);
-        output.stdout
+        let mut archive = ZipArchive::new(Cursor::new(http("GET", &url, &[], None, cfg)?))?;
+        let mut binary = Vec::new();
+        archive.by_name(&member)?.read_to_end(&mut binary)?;
+        binary
     };
     if binary.is_empty() {
         return Err(format!("Could not install {tool}").into());
