@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::{mpsc::Sender, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -346,6 +346,22 @@ fn yt_dlp(cfg: &Value) -> Command {
     command
 }
 
+fn download<'a>(command: &'a mut Command, selector: &str, template: &Path, cfg: &Value) -> &'a mut Command {
+    command
+        .args(["-f", selector])
+        .args("--no-playlist --no-warnings --force-overwrites -q --print after_move:filepath -o".split_whitespace())
+        .arg(template);
+    if cfg["sponsor_block"] == true {
+        command.args(["--sponsorblock-remove", "all"]);
+    }
+    command
+}
+
+fn downloaded(output: &Output) -> Option<PathBuf> {
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (output.status.success() && path.is_file()).then_some(path)
+}
+
 fn skip_ad_wait(info: &mut Value) {
     match info {
         Value::Object(object) => {
@@ -390,43 +406,23 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
         return Err(error.into());
     }
     let mut y = yt_dlp(cfg);
-    y.args(["--load-info-json"])
-        .arg(&info_file)
-        .args(["-f", selector, "--no-warnings", "--force-overwrites", "-q", "--print", "after_move:filepath", "-o"])
-        .arg(&template);
-    if cfg["sponsor_block"] == true {
-        y.args(["--sponsorblock-remove", "all"]);
-    }
-    let result = y.output();
+    y.args(["--load-info-json"]).arg(&info_file);
+    let result = download(&mut y, selector, &template, cfg).output();
     let _ = fs::remove_file(&info_file);
-    let got = match result {
-        Ok(result) if result.status.success() => {
-            let got = PathBuf::from(String::from_utf8_lossy(&result.stdout).trim());
-            got.is_file().then_some(got)
-        }
-        _ => None,
-    };
-    let got = match got {
+    let got = match result.ok().and_then(|output| downloaded(&output)) {
         Some(got) => got,
         None => {
             remove_partial_download(out, id);
             let mut y = yt_dlp(cfg);
-            y.args(["-f", selector])
-                .args(
-                    "--no-playlist --no-warnings --force-overwrites -q --print after_move:filepath -o"
-                        .split_whitespace(),
-                )
-                .arg(&template);
-            if cfg["sponsor_block"] == true {
-                y.args(["--sponsorblock-remove", "all"]);
+            let res = search::yt(download(&mut y, selector, &template, cfg).arg(url), cfg, &search::DOWNLOAD_GATE)?;
+            match downloaded(&res) {
+                Some(got) => got,
+                None => {
+                    let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
+                    let _ = fs::remove_file(got);
+                    return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&res.stderr).trim()).into());
+                }
             }
-            let res = search::yt(y.arg(url), cfg, &search::DOWNLOAD_GATE)?;
-            let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
-            if !res.status.success() || !got.is_file() {
-                let _ = fs::remove_file(&got);
-                return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&res.stderr).trim()).into());
-            }
-            got
         }
     };
     let ext = got.extension().unwrap_or_default().to_string_lossy().to_string();
