@@ -145,57 +145,63 @@ fn ytm_retryable(error: &str) -> bool {
             .any(|sign| error.to_ascii_lowercase().contains(sign))
 }
 
+fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
+    let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
+    let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
+    let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
+    items
+        .filter_map(|i| {
+            let r = &i["musicResponsiveListItemRenderer"];
+            let columns = &r["flexColumns"];
+            let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
+            let kind = |t: &str| -> Vec<String> {
+                let typed = meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
+                typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
+            };
+            let time =
+                meta.last()?["text"].as_str()?.split(':').try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
+            let artists = kind("ARTIST");
+            let artists = match artists.first() {
+                Some(_) => artists,
+                None => vec![meta.first()?["text"].as_str()?.into()],
+            };
+            Some(Hit {
+                song: hit_song(
+                    format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
+                    columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"].as_str()?.into(),
+                    artists,
+                    kind("ALBUM").first().cloned().unwrap_or_default(),
+                    time.ok()?,
+                ),
+                verified: songs,
+                isrc,
+            })
+        })
+        .collect()
+}
+
 fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
     let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-    with_backoff(
+    let v = with_backoff(
         cfg,
         || {
             let reply = http("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
                 .map_err(|error| error.to_string())?;
-            let v: Value = serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
-            let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
-            let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
-            let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
-            Ok(items
-                .filter_map(|i| {
-                    let r = &i["musicResponsiveListItemRenderer"];
-                    let columns = &r["flexColumns"];
-                    let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
-                    let kind = |t: &str| -> Vec<String> {
-                        let typed =
-                            meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
-                        typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
-                    };
-                    let time = meta.last()?["text"]
-                        .as_str()?
-                        .split(':')
-                        .try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
-                    let artists = kind("ARTIST");
-                    let artists = match artists.first() {
-                        Some(_) => artists,
-                        None => vec![meta.first()?["text"].as_str()?.into()],
-                    };
-                    Some(Hit {
-                        song: hit_song(
-                            format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
-                            columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"]
-                                .as_str()?
-                                .into(),
-                            artists,
-                            kind("ALBUM").first().cloned().unwrap_or_default(),
-                            time.ok()?,
-                        ),
-                        verified: songs,
-                        isrc,
-                    })
-                })
-                .collect())
+            serde_json::from_slice(&reply).map_err(|error| error.to_string())
         },
         ytm_retryable,
-    )
+    )?;
+    Ok(ytm_hits(&v, songs, isrc))
+}
+
+fn hits_or_note(first_error: &mut Option<String>, result: R<Vec<Hit>>) -> Vec<Hit> {
+    result.unwrap_or_else(|error| {
+        first_error.get_or_insert(error.to_string());
+        Vec::new()
+    })
 }
 
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
@@ -272,14 +278,7 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
     let mut found: Vec<(f64, String)> = Vec::new();
     let mut first_error = None;
     if let Some(isrc) = song.isrc.as_ref().filter(|_| providers.contains(&"youtube-music")) {
-        let hits = match ytm(isrc, true, true, cfg) {
-            Ok(hits) => hits,
-            Err(error) => {
-                first_error.get_or_insert(error.to_string());
-                Vec::new()
-            }
-        };
-        let hits = hits.into_iter();
+        let hits = hits_or_note(&mut first_error, ytm(isrc, true, true, cfg)).into_iter();
         let hits = hits.filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0);
         let best = hits.max_by(|a, b| rank(a).total_cmp(&rank(b)));
         found.extend(best.map(|hit| (f64::INFINITY, hit.song.url)));
@@ -290,21 +289,10 @@ pub fn find(song: &Song, cfg: &Value) -> R<Vec<String>> {
             "youtube" => ytdlp(&format!("ytsearch10:{query}"), cfg),
             _ => ytdlp(&format!("scsearch10:{query}"), cfg),
         };
-        let mut hits = match hits {
-            Ok(hits) => hits,
-            Err(error) => {
-                first_error.get_or_insert(error.to_string());
-                Vec::new()
-            }
-        };
+        let mut hits = hits_or_note(&mut first_error, hits);
         let best = hits.iter().map(rank).max_by(f64::total_cmp);
         if *provider == "youtube-music" && !verified && best.is_none_or(|best| best < 80.0) {
-            match ytm(&query, false, false, cfg) {
-                Ok(extra) => hits.extend(extra),
-                Err(error) => {
-                    first_error.get_or_insert(error.to_string());
-                }
-            }
+            hits.extend(hits_or_note(&mut first_error, ytm(&query, false, false, cfg)));
         }
         let hits = hits.into_iter().filter(|hit| !verified || hit.verified);
         found.extend(hits.map(|hit| (rank(&hit), hit.song.url)).filter(|candidate| candidate.0 > 0.0));
