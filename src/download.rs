@@ -350,69 +350,16 @@ fn downloaded(output: &Output) -> Option<PathBuf> {
     (output.status.success() && path.is_file()).then_some(path)
 }
 
-fn skip_ad_wait(info: &mut Value) {
-    match info {
-        Value::Object(object) => {
-            object.remove("available_at");
-            object.values_mut().for_each(skip_ad_wait);
-        }
-        Value::Array(values) => values.iter_mut().for_each(skip_ad_wait),
-        _ => {}
-    }
-}
-
-fn remove_partial_download(out: &Path, id: &str) {
-    let Some(stem) = out.file_stem() else { return };
-    let prefix = format!("{}.{id}.", stem.to_string_lossy());
-    let directory = out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-}
-
 fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let format = cfg["format"].as_str().unwrap_or("mp3");
     let bitrate = cfg["bitrate"].as_str().unwrap_or("auto");
     let selectors = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
     let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio/best", |entry| entry.1);
     let template = out.with_extension(format!("{id}.%(ext)s"));
-    let extracted = search::yt(
-        search::yt_dlp(cfg).args(["-f", selector, "--no-playlist", "--no-warnings", "-q", "-j"]).arg(url),
-        cfg,
-        &search::DOWNLOAD_GATE,
-    )?;
-    if !extracted.status.success() {
-        return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&extracted.stderr).trim()).into());
-    }
-    let mut info: Value = serde_json::from_slice(&extracted.stdout)?;
-    skip_ad_wait(&mut info);
-    let info_file = out.with_extension(format!("{id}.info.json"));
-    if let Err(error) = fs::write(&info_file, serde_json::to_vec(&info)?) {
-        let _ = fs::remove_file(&info_file);
-        return Err(error.into());
-    }
-    let mut y = search::yt_dlp(cfg);
-    y.args(["--load-info-json"]).arg(&info_file);
-    let result = download(&mut y, selector, &template, cfg).output();
-    let _ = fs::remove_file(&info_file);
-    let got = match result.ok().and_then(|output| downloaded(&output)) {
-        Some(got) => got,
-        None => {
-            remove_partial_download(out, id);
-            let mut y = search::yt_dlp(cfg);
-            let res = search::yt(download(&mut y, selector, &template, cfg).arg(url), cfg, &search::DOWNLOAD_GATE)?;
-            match downloaded(&res) {
-                Some(got) => got,
-                None => {
-                    let got = PathBuf::from(String::from_utf8_lossy(&res.stdout).trim());
-                    let _ = fs::remove_file(got);
-                    return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&res.stderr).trim()).into());
-                }
-            }
-        }
-    };
+    let mut command = search::yt_dlp(cfg);
+    let result = search::yt(download(&mut command, selector, &template, cfg).arg(url), cfg, &search::DOWNLOAD_GATE)?;
+    let got =
+        downloaded(&result).ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&result.stderr).trim()))?;
     let ext = got.extension().unwrap_or_default().to_string_lossy().to_string();
     let keep = ["auto", "disable"].contains(&bitrate);
     let temp = out.with_extension(format!("{id}.converted.{format}"));
@@ -742,34 +689,6 @@ mod tests {
             wait_turn(&NEXT, Duration::from_millis(50));
         }
         assert!(start.elapsed() >= Duration::from_millis(100));
-    }
-
-    #[test]
-    fn skip_ad_wait_removes_nested_available_at_fields() {
-        let mut info = json!({
-            "id": "track",
-            "available_at": 42,
-            "title": "title",
-            "formats": [{"format_id": "251", "available_at": 12}],
-            "requested_formats": [{
-                "format_id": "251",
-                "available_at": 13,
-                "fragments": [{"url": "audio", "available_at": 14}]
-            }]
-        });
-        skip_ad_wait(&mut info);
-        assert_eq!(
-            info,
-            json!({
-                "id": "track",
-                "title": "title",
-                "formats": [{"format_id": "251"}],
-                "requested_formats": [{
-                    "format_id": "251",
-                    "fragments": [{"url": "audio"}]
-                }]
-            })
-        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {

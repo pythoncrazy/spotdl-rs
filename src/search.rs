@@ -2,8 +2,13 @@ use crate::{Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
     process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -138,6 +143,32 @@ fn js_runtime_args(cmd: &mut Command) {
     }
 }
 
+// Logged-out YouTube adds a pre-roll ad; this overrides yt-dlp's wait until `available_at`.
+const YT_DLP_PLUGIN_SOURCE: &str = r#"import time
+from yt_dlp.extractor.youtube import YoutubeIE
+
+
+class NoAdWaitYoutubeIE(YoutubeIE, plugin_name='spotdl'):
+    def _get_available_at_timestamp(self, *args, **kwargs):
+        return int(time.time())
+"#;
+
+static YT_DLP_PLUGIN_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn yt_dlp_plugin_dir() -> Option<&'static Path> {
+    YT_DLP_PLUGIN_DIR
+        .get_or_init(|| {
+            let dir = crate::HOME.join("yt-dlp-plugins");
+            let file = dir.join("spotdl/yt_dlp_plugins/extractor/spotdl_no_ad_wait.py");
+            fs::create_dir_all(file.parent()?).ok()?;
+            if fs::read_to_string(&file).ok().as_deref() != Some(YT_DLP_PLUGIN_SOURCE) {
+                fs::write(file, YT_DLP_PLUGIN_SOURCE).ok()?;
+            }
+            Some(dir)
+        })
+        .as_deref()
+}
+
 pub(crate) fn yt_dlp(cfg: &Value) -> Command {
     let mut command = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
     for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
@@ -146,6 +177,9 @@ pub(crate) fn yt_dlp(cfg: &Value) -> Command {
         }
     }
     command.args(cfg["yt_dlp_args"].as_str().unwrap_or_default().split_whitespace());
+    if let Some(dir) = yt_dlp_plugin_dir() {
+        command.arg("--plugin-dirs").arg(dir);
+    }
     js_runtime_args(&mut command);
     command
 }
@@ -413,6 +447,7 @@ mod tests {
             "proxy": "http://proxy.example:8080",
             "yt_dlp_args": "--no-warnings --verbose"
         });
+        let plugin_dir = yt_dlp_plugin_dir().map(|path| path.to_string_lossy().into_owned());
         let args = yt_dlp(&cfg).get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
         assert!(args.starts_with(&[
             "--cookies".into(),
@@ -421,6 +456,9 @@ mod tests {
             "http://proxy.example:8080".into(),
         ]));
         assert!(args.windows(2).any(|pair| pair[0] == "--no-warnings" && pair[1] == "--verbose"));
+        if let Some(plugin_dir) = plugin_dir {
+            assert!(args.windows(2).any(|pair| pair[0] == "--plugin-dirs" && pair[1] == plugin_dir));
+        }
     }
 
     fn song(name: &str) -> Song {
