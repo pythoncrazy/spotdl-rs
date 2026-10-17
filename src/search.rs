@@ -59,7 +59,7 @@ fn with_backoff<T>(
     mut attempt: impl FnMut() -> Result<T, String>,
     retry: impl Fn(&str) -> bool,
 ) -> R<T> {
-    let attempts = cfg["max_retries"].as_u64().unwrap_or(3) + 1;
+    let attempts = cfg["max_retries"].as_u64().unwrap_or(3).saturating_add(1);
     for number in 1..=attempts {
         let until = gate.until.load(Relaxed);
         let wait = until.saturating_sub(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
@@ -72,22 +72,33 @@ fn with_backoff<T>(
                 gate.strikes.store(0, Relaxed);
                 return Ok(value);
             }
-            Err(error) if !retry(&error) || number == attempts => return Err(error.into()),
-            Err(_) if number == 1 => std::thread::sleep(short_retry_delay()),
-            Err(_) => {
-                let strike = gate.strikes.fetch_add(1, Relaxed).min(2) as usize;
-                gate.until
-                    .fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
+            Err(error) if !retry(&error) => return Err(error.into()),
+            Err(error) if number == attempts => {
+                if number > 1 {
+                    strike(gate);
+                }
+                return Err(error.into());
             }
+            Err(_) if number == 1 => std::thread::sleep(short_retry_delay()),
+            Err(_) => strike(gate),
         }
     }
     Err(format!("YouTube blocked {}", gate.name).into())
+}
+
+fn strike(gate: &Gate) {
+    let strike = gate.strikes.fetch_add(1, Relaxed).min(2) as usize;
+    gate.until.fetch_max(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs() + [30, 60, 120][strike], Relaxed);
 }
 
 fn youtube_blocked(error: &str) -> bool {
     ["Sign in to confirm", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
         .iter()
         .any(|sign| error.contains(sign))
+}
+
+fn youtube_retryable(error: &str, gate: &Gate) -> bool {
+    youtube_blocked(error) || gate.name == "downloads" && error.contains("Requested format is not available")
 }
 
 pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
@@ -97,13 +108,13 @@ pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
         || {
             let output = cmd.output().map_err(|error| error.to_string())?;
             let error = String::from_utf8_lossy(&output.stderr);
-            if youtube_blocked(&error) {
+            if youtube_retryable(&error, gate) {
                 Err(error.trim().to_string())
             } else {
                 Ok(output)
             }
         },
-        youtube_blocked,
+        |error| youtube_retryable(error, gate),
     )
 }
 
@@ -166,11 +177,14 @@ fn ytm_retryable(error: &str) -> bool {
             .any(|sign| error.to_ascii_lowercase().contains(sign))
 }
 
-fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
+fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> R<Vec<Hit>> {
+    if v.get("contents").is_none() {
+        return Err("unexpected YouTube Music response".into());
+    }
     let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
     let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
     let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
-    items
+    Ok(items
         .filter_map(|i| {
             let r = &i["musicResponsiveListItemRenderer"];
             let columns = &r["flexColumns"];
@@ -198,7 +212,7 @@ fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
                 isrc,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
@@ -215,7 +229,7 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
         },
         ytm_retryable,
     )?;
-    Ok(ytm_hits(&v, songs, isrc))
+    ytm_hits(&v, songs, isrc)
 }
 
 fn hits_or_note(first_error: &mut Option<String>, result: R<Vec<Hit>>) -> Vec<Hit> {
@@ -461,5 +475,31 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(gate.until.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn final_retryable_failure_sets_the_gate() {
+        let gate = Gate::new("test");
+        let cfg = serde_json::json!({"max_retries": 1});
+        let result = with_backoff(&gate, &cfg, || Err::<(), _>("HTTP 403".into()), |_| true);
+        assert!(result.is_err());
+        assert_eq!(gate.strikes.load(Relaxed), 1);
+        assert!(gate.until.load(Relaxed) > 0);
+    }
+
+    #[test]
+    fn unavailable_download_format_is_retryable_only_for_downloads() {
+        let error = "ERROR: Requested format is not available";
+        assert!(youtube_retryable(error, &DOWNLOAD_GATE));
+        assert!(!youtube_retryable(error, &SEARCH_GATE));
+    }
+
+    #[test]
+    fn missing_ytm_contents_is_an_error_but_empty_results_are_not() {
+        assert!(matches!(
+            ytm_hits(&serde_json::json!({}), true, false),
+            Err(error) if error.to_string() == "unexpected YouTube Music response"
+        ));
+        assert!(ytm_hits(&serde_json::json!({"contents": {}}), true, false).unwrap().is_empty());
     }
 }

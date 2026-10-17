@@ -96,7 +96,7 @@ fn init_agent(cfg: &Value) -> &'static ureq::Agent {
 
 pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
     let agent = init_agent(cfg);
-    let attempts = cfg["max_retries"].as_u64().unwrap_or(3).max(1);
+    let attempts = cfg["max_retries"].as_u64().unwrap_or(3).saturating_add(1);
     let mut attempt = 1;
     loop {
         let mut request = ureq::http::Request::builder().method(method).uri(url);
@@ -126,6 +126,20 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
         }
         return Ok(reply.body_mut().with_config().limit(1 << 28).read_to_vec()?);
     }
+}
+
+pub fn http_uri(url: &str, cfg: &Value) -> R<String> {
+    let agent = init_agent(cfg);
+    let request = ureq::http::Request::builder().method("GET").uri(url).body(Vec::new())?;
+    let request = match cfg["timeout"].as_u64() {
+        Some(timeout) => agent.configure_request(request).timeout_global(Some(Duration::from_secs(timeout))).build(),
+        None => request,
+    };
+    let response = agent.run(request)?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} for {url}", response.status()).into());
+    }
+    Ok(ureq::ResponseExt::get_uri(&response).to_string())
 }
 
 pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b: Option<&[u8]>, cfg: &Value) -> R<T> {
@@ -443,7 +457,7 @@ fn write_m3u(done: &[(Song, R<PathBuf>)], op: &str, cfg: &Value) -> R<()> {
     let first = done.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song, cfg));
     let mut files = std::collections::BTreeMap::<String, String>::new();
     let keep = |result: &R<PathBuf>| {
-        op != "download" || cfg["add_unavailable"] == true || result.as_ref().is_ok_and(|path| path.is_file())
+        op == "save" || cfg["add_unavailable"] == true || result.as_ref().is_ok_and(|path| path.is_file())
     };
     for (song, result) in done.iter().filter(|(_, result)| keep(result)) {
         let path = result.as_ref().map_or_else(|_| download::path(song, cfg), Clone::clone);
@@ -534,11 +548,12 @@ fn run() -> R<()> {
         None => original.clone(),
     };
     let (songs, errors) = resolve(&queries, &op, &cfg);
-    if let Some(file) = sync.as_ref().filter(|_| cfg["sync_without_deleting"] != true) {
+    let resolution_succeeded = errors.is_empty();
+    if let Some(file) = sync.as_ref().filter(|_| resolution_succeeded && cfg["sync_without_deleting"] != true) {
         download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs, &cfg);
     }
     let sync_path = sync.as_ref().map(|_| original[0].clone()).or(save_file.clone()).filter(|_| op == "sync");
-    if let Some(path) = sync_path.as_ref().filter(|_| sync.is_none()) {
+    if let Some(path) = sync_path.as_ref().filter(|_| resolution_succeeded && sync.is_none()) {
         fs::write(path, sync_file(&queries, &songs)?)?;
     }
     let threads = if op == "save" { meta_threads } else { cfg["threads"].as_u64().unwrap_or(16).max(1) as usize };
@@ -572,7 +587,7 @@ fn run() -> R<()> {
     };
     let saved = done.iter().map(|(song, _)| song.clone()).collect::<Vec<_>>();
     match (op.as_str(), save_file.as_deref(), sync_path) {
-        ("sync", _, Some(path)) => fs::write(path, sync_file(&queries, &saved)?)?,
+        ("sync", _, Some(path)) if resolution_succeeded => fs::write(path, sync_file(&queries, &saved)?)?,
         ("save", Some("-"), _) => println!("{}", serde_json::to_string_pretty(&saved)?),
         ("save" | "download", Some(path), _) => fs::write(path, serde_json::to_string_pretty(&saved)?)?,
         ("save", None, _) => return Err("save file is not specified".into()),

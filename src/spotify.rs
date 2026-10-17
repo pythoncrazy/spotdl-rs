@@ -386,29 +386,33 @@ fn cover(value: &Value) -> Option<&str> {
 
 type List<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
 
-fn album_meta(uri: &str, cfg: &Value) -> Option<Value> {
+fn album_meta(uri: &str, cfg: &Value) -> R<Value> {
     let keep = ["name", "artists", "date", "discs", "tracksV2", "label", "coverArt", "copyright", "type"];
-    let cached = ALBUMS.lock().ok()?.get(uri).cloned();
+    let cached = ALBUMS.lock().map_err(|error| error.to_string())?.get(uri).cloned();
     let album = match cached {
         Some(album) => album,
         None => {
             let variables = json!({"uri": uri, "locale": "", "offset": 0, "limit": 1});
-            let mut album = query("getAlbum", variables, cfg).ok()?["data"]["albumUnion"].take();
-            album.as_object_mut()?.retain(|key, _| keep.contains(&key.as_str()));
-            ALBUMS.lock().ok()?.insert(uri.into(), album.clone());
+            let mut response = query("getAlbum", variables, cfg)?;
+            let mut album = response["data"]["albumUnion"].take();
+            album
+                .as_object_mut()
+                .ok_or("Spotify album metadata is missing")?
+                .retain(|key, _| keep.contains(&key.as_str()));
+            ALBUMS.lock().map_err(|error| error.to_string())?.insert(uri.into(), album.clone());
             album
         }
     };
-    Some(album)
+    Ok(album)
 }
 
-fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> Vec<Song> {
+fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> R<Vec<Song>> {
     let uris: HashSet<&str> = tracks
         .iter()
         .filter_map(|track| track["albumOfTrack"]["uri"].as_str().or(track["album"]["uri"].as_str()))
         .collect();
     let albums: HashMap<&str, Value> =
-        uris.into_par_iter().filter_map(|uri| Some((uri, album_meta(uri, cfg)?))).collect();
+        uris.into_par_iter().map(|uri| album_meta(uri, cfg).map(|album| (uri, album))).collect::<R<_>>()?;
     let length = tracks.len();
     let empty = Value::Null;
     let playable = tracks
@@ -478,7 +482,7 @@ fn build(tracks: Vec<Value>, list: Option<List>, cfg: &Value) -> Vec<Song> {
             ..Song::default()
         }
     };
-    playable.map(song).collect()
+    Ok(playable.map(song).collect())
 }
 
 fn album(uri: &str, cfg: &Value) -> R<Vec<Value>> {
@@ -505,18 +509,20 @@ fn artist(uri: &str, cfg: &Value) -> R<Vec<Song>> {
         |value: &Value| value["uri"].as_str().or(value["releases"]["items"][0]["uri"].as_str()).map(String::from);
     let mut seen = HashSet::new();
     let albums: Vec<String> = releases.iter().filter_map(release).filter(|uri| seen.insert(uri.clone())).collect();
-    let tracks = |uri: &String| match api {
-        true => {
-            let id = uri.rsplit(':').next().unwrap_or_default();
-            let mut tracks = official(&format!("albums/{id}/tracks?limit=50"), cfg).unwrap_or_default();
-            tracks.iter_mut().for_each(|track| track["albumOfTrack"]["uri"] = json!(uri));
-            tracks
+    let tracks = |uri: &String| -> R<Vec<Value>> {
+        match api {
+            true => {
+                let id = uri.rsplit(':').next().unwrap_or_default();
+                let mut tracks = official(&format!("albums/{id}/tracks?limit=50"), cfg)?;
+                tracks.iter_mut().for_each(|track| track["albumOfTrack"]["uri"] = json!(uri));
+                Ok(tracks)
+            }
+            false => album(uri, cfg),
         }
-        false => album(uri, cfg).unwrap_or_default(),
     };
-    let tracks: Vec<Value> = albums.par_iter().flat_map_iter(tracks).collect();
+    let tracks: Vec<Value> = albums.par_iter().map(tracks).collect::<R<Vec<_>>>()?.into_iter().flatten().collect();
     let mut seen = HashSet::new();
-    let songs = build(tracks, None, cfg).into_iter();
+    let songs = build(tracks, None, cfg)?.into_iter();
     Ok(songs.filter(|song| seen.insert((song.name.to_lowercase(), song.artists.clone()))).collect())
 }
 
@@ -586,26 +592,27 @@ fn playlist(uri: &str, id: &str, api: bool, cfg: &Value) -> R<Vec<Song>> {
     let url = format!("https://open.spotify.com/playlist/{id}");
     let author = meta["ownerV2"]["data"]["name"].as_str().or(meta["owner"]["display_name"].as_str());
     let list = (meta["name"].as_str().unwrap_or_default(), url.as_str(), author, cover(&meta));
-    Ok(build(tracks, Some(list), cfg))
+    build(tracks, Some(list), cfg)
 }
 
 fn library(text: &str, cfg: &Value) -> R<Option<Vec<Song>>> {
     let take = |path: &str, key: &str| -> R<Vec<Value>> {
         Ok(official(path, cfg)?.into_iter().map(|mut value| value[key].take()).collect())
     };
-    let lists = |values: &[Value]| -> Vec<Song> {
-        values
+    let lists = |values: &[Value]| -> R<Vec<Song>> {
+        let lists: Vec<Vec<Song>> = values
             .par_iter()
             .filter_map(|value| value["uri"].as_str())
-            .flat_map_iter(|uri| resolve(uri, cfg).unwrap_or_default())
-            .collect()
+            .map(|uri| resolve(uri, cfg))
+            .collect::<R<_>>()?;
+        Ok(lists.into_iter().flatten().collect())
     };
     if let Some((_, path)) = text.split_once("open.spotify.com/user/") {
         let user = path.split(['/', '?']).next().unwrap_or_default();
-        return Ok(Some(lists(&official(&format!("users/{user}/playlists?limit=50"), cfg)?)));
+        return Ok(Some(lists(&official(&format!("users/{user}/playlists?limit=50"), cfg)?)?));
     }
     let songs = match text {
-        "saved" => build(take("me/tracks?limit=50", "track")?, None, cfg),
+        "saved" => build(take("me/tracks?limit=50", "track")?, None, cfg)?,
         "all-user-playlists" | "all-saved-playlists" => {
             let user = official("me", cfg)?.into_iter().next().and_then(|user| user["id"].as_str().map(String::from));
             let user = user.ok_or("Spotify did not return the current user")?;
@@ -613,10 +620,10 @@ fn library(text: &str, cfg: &Value) -> R<Option<Vec<Song>>> {
             let playlists = official("me/playlists?limit=50", cfg)?.into_iter();
             let playlists: Vec<Value> =
                 playlists.filter(|playlist| owned(playlist) == (text == "all-user-playlists")).collect();
-            lists(&playlists)
+            lists(&playlists)?
         }
-        "all-user-saved-albums" => lists(&take("me/albums?limit=50", "album")?),
-        "all-user-followed-artists" => lists(&official("me/following?type=artist&limit=50", cfg)?),
+        "all-user-saved-albums" => lists(&take("me/albums?limit=50", "album")?)?,
+        "all-user-followed-artists" => lists(&official("me/following?type=artist&limit=50", cfg)?)?,
         _ => return Ok(None),
     };
     Ok(Some(songs))
@@ -637,11 +644,7 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
     if text.contains("soundcloud.com/") {
         return crate::search::source(text, cfg, false);
     }
-    let text = if text.contains("spotify.link") {
-        ureq::ResponseExt::get_uri(&ureq::get(text).call()?).to_string()
-    } else {
-        text.to_string()
-    };
+    let text = if text.contains("spotify.link") { crate::http_uri(text, cfg)? } else { text.to_string() };
     if let Some(songs) = library(&text, cfg)? {
         return Ok(songs);
     }
@@ -664,7 +667,7 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
         ("artist", _) => return artist(&uri, cfg),
         _ => return playlist(&uri, id, api, cfg),
     };
-    Ok(build(tracks, None, cfg))
+    build(tracks, None, cfg)
 }
 
 #[cfg(test)]
@@ -680,7 +683,7 @@ mod tests {
     fn playlist_track_duration_is_milliseconds() {
         let tracks =
             vec![serde_json::json!({"uri": "spotify:track:test", "trackDuration": {"totalMilliseconds": 12_345}})];
-        let song = build(tracks, None, &serde_json::json!({})).into_iter().next().expect("expected one track");
+        let song = build(tracks, None, &serde_json::json!({})).unwrap().into_iter().next().expect("expected one track");
         assert!((song.duration - 12.345).abs() < 1e-9);
     }
 }
