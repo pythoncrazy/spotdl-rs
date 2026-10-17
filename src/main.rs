@@ -526,8 +526,55 @@ fn run() -> R<()> {
     }
     let threads = if op == "save" { meta_threads } else { cfg["threads"].as_u64().unwrap_or(16).max(1) as usize };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
-    let process = |song: Song| download::process(song, &op, &cfg);
-    let done: Vec<(Song, R<PathBuf>)> = pool.install(|| songs.into_par_iter().with_max_len(1).map(process).collect());
+    let lyrics_stage = matches!(op.as_str(), "download" | "sync")
+        && cfg["lyrics_providers"].as_array().is_some_and(|providers| !providers.is_empty());
+    let done: Vec<(Song, R<PathBuf>)> = if lyrics_stage {
+        let lyrics_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let (sender, receiver) = std::sync::mpsc::channel::<download::LyricsJob>();
+        let lyrics_cfg = &cfg;
+        std::thread::scope(|scope| -> R<_> {
+            let lyrics = scope.spawn(move || {
+                lyrics_pool.install(|| {
+                    receiver
+                        .into_iter()
+                        .par_bridge()
+                        .map(|(index, song, path)| (index, download::add_lyrics(&song, &path, lyrics_cfg)))
+                        .collect::<Vec<_>>()
+                })
+            });
+            let done = pool.install(|| {
+                songs
+                    .into_par_iter()
+                    .enumerate()
+                    .with_max_len(1)
+                    .map(|(index, song)| download::process(song, &op, &cfg, index, Some(&sender)))
+                    .collect::<Vec<_>>()
+            });
+            drop(sender);
+            let mut done = done;
+            for (index, result) in lyrics.join().map_err(|_| "lyrics stage panicked")? {
+                match result {
+                    Ok(Some(text)) => done[index].0.lyrics = Some(text),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let (song, result) = &mut done[index];
+                        crate::log(&cfg, "ERROR", &format!("{} - {}: {error}", song.artists.join(", "), song.name));
+                        *result = Err(error);
+                    }
+                }
+            }
+            Ok(done)
+        })?
+    } else {
+        pool.install(|| {
+            songs
+                .into_par_iter()
+                .enumerate()
+                .with_max_len(1)
+                .map(|(index, song)| download::process(song, &op, &cfg, index, None))
+                .collect()
+        })
+    };
     let saved = done.iter().map(|(song, _)| song.clone()).collect::<Vec<_>>();
     match (op.as_str(), save_file.as_deref(), sync_path) {
         ("sync", _, Some(path)) => fs::write(path, sync_file(&queries, &saved)?)?,

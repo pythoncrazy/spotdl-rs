@@ -10,9 +10,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{mpsc::Sender, Mutex, OnceLock},
     time::{Duration, Instant},
 };
+
+pub type LyricsJob = (usize, Song, PathBuf);
 
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
     let clean = |value: &str| {
@@ -181,6 +183,17 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
         Some(text.trim().to_string()).filter(|text| !text.is_empty())
     };
     cfg["lyrics_providers"].as_array().into_iter().flatten().filter_map(Value::as_str).find_map(provider)
+}
+
+pub fn add_lyrics(song: &Song, file: &Path, cfg: &Value) -> R<Option<String>> {
+    let Some(text) = lyrics(song, cfg) else {
+        return Ok(None);
+    };
+    let mut song = song.clone();
+    song.lyrics = Some(text.clone());
+    tag(file, &song, cfg)?;
+    write_lrc(file, &song, cfg)?;
+    Ok(Some(text))
 }
 
 fn tag(file: &Path, s: &Song, cfg: &Value) -> R<()> {
@@ -366,7 +379,7 @@ fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
     Ok(())
 }
 
-fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
+fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&Sender<LyricsJob>>) -> R<PathBuf> {
     let should_enrich = op != "save" && op != "url";
     let enriched_for_output = should_enrich
         && cfg["output"].as_str().is_some_and(|output| {
@@ -424,51 +437,54 @@ fn finish(s: &mut Song, op: &str, cfg: &Value) -> R<PathBuf> {
         crate::spotify::enrich(s, cfg);
     }
     let will_download = op != "url" && (!exists || overwrite == "force");
-    std::thread::scope(|scope| -> R<PathBuf> {
-        let pending = (will_download && s.lyrics.is_none()).then(|| {
-            let song = s.clone();
-            scope.spawn(move || lyrics(&song, cfg))
-        });
-        let candidates = match &s.download_url {
-            Some(url) => vec![url.clone()],
-            None if exists && overwrite == "metadata" && op != "url" => Vec::new(),
-            None => search::find(s, cfg)?,
-        };
-        if op == "url" {
-            s.download_url = candidates.first().cloned();
-            return Ok(target);
+    let candidates = match &s.download_url {
+        Some(url) => vec![url.clone()],
+        None if exists && overwrite == "metadata" && op != "url" => Vec::new(),
+        None => search::find(s, cfg)?,
+    };
+    if op == "url" {
+        s.download_url = candidates.first().cloned();
+        return Ok(target);
+    }
+    if will_download {
+        fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+        let id =
+            if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
+        let mut error = String::from("no match");
+        let mut fetched =
+            candidates.iter().filter(|url| fetch(url, &out, &id, cfg).map_err(|e| error = e.to_string()).is_ok());
+        s.download_url = Some(fetched.next().ok_or(error)?.clone());
+        if target != out && target.is_file() {
+            fs::remove_file(&target)?;
         }
-        if will_download {
-            fs::create_dir_all(out.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-            let id =
-                if s.song_id.is_empty() { format!("{:x}", Sha1::digest(s.url.as_bytes())) } else { s.song_id.clone() };
-            let mut error = String::from("no match");
-            let mut fetched =
-                candidates.iter().filter(|url| fetch(url, &out, &id, cfg).map_err(|e| error = e.to_string()).is_ok());
-            s.download_url = Some(fetched.next().ok_or(error)?.clone());
-            if target != out && target.is_file() {
-                fs::remove_file(&target)?;
-            }
-            target = out.clone();
+        target = out.clone();
+    }
+    if lyrics_tx.is_none() && s.lyrics.is_none() {
+        s.lyrics = lyrics(s, cfg);
+    }
+    tag(&target, s, cfg)?;
+    write_lrc(&target, s, cfg)?;
+    if cfg["create_skip_file"] == true {
+        fs::write(format!("{}.skip", target.display()), "")?;
+    }
+    append(archive, &s.url)?;
+    if s.lyrics.is_none() {
+        if let Some(sender) = lyrics_tx {
+            sender.send((index, s.clone(), target.clone()))?;
         }
-        if let Some(task) = pending {
-            s.lyrics = task.join().ok().flatten();
-        } else if s.lyrics.is_none() {
-            s.lyrics = lyrics(s, cfg);
-        }
-        tag(&target, s, cfg)?;
-        write_lrc(&target, s, cfg)?;
-        if cfg["create_skip_file"] == true {
-            fs::write(format!("{}.skip", target.display()), "")?;
-        }
-        append(archive, &s.url)?;
-        Ok(target)
-    })
+    }
+    Ok(target)
 }
 
-pub fn process(mut s: Song, op: &str, cfg: &Value) -> (Song, R<PathBuf>) {
+pub fn process(
+    mut s: Song,
+    op: &str,
+    cfg: &Value,
+    index: usize,
+    lyrics_tx: Option<&Sender<LyricsJob>>,
+) -> (Song, R<PathBuf>) {
     let label = format!("{} - {}", s.artists.join(", "), s.name);
-    let result = finish(&mut s, op, cfg);
+    let result = finish(&mut s, op, cfg, index, lyrics_tx);
     match &result {
         Ok(_) if op == "url" => println!("{}", s.download_url.as_deref().unwrap_or_default()),
         Ok(path) if cfg["simple_tui"] == true => println!("{label}: {}", path.display()),
@@ -548,7 +564,7 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
             vec![song]
         };
         for song in songs {
-            process(song, "download", &cfg).1?;
+            process(song, "download", &cfg, 0, None).1?;
         }
     }
     Ok(())
