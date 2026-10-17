@@ -413,12 +413,18 @@ static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 fn write_lrc(file: &Path, lyrics: Option<&str>, cfg: &Value) -> R<()> {
     let sidecar = file.with_extension("lrc");
     let replace = matches!(cfg["overwrite"].as_str(), Some("force" | "metadata"));
-    if let Some(lyrics) =
-        lyrics.filter(|text| cfg["generate_lrc"] == true && (replace || !sidecar.exists()) && text.starts_with('['))
-    {
-        fs::write(sidecar, lyrics)?;
-    }
+    lyrics
+        .filter(|text| cfg["generate_lrc"] == true && (replace || !sidecar.exists()) && is_synced(text))
+        .map(|text| fs::write(sidecar, text))
+        .transpose()?;
     Ok(())
+}
+
+fn is_synced(text: &str) -> bool {
+    text.lines().any(|line| {
+        let minutes = line.bytes().skip(1).take_while(u8::is_ascii_digit).count();
+        line.starts_with('[') && minutes > 0 && line.as_bytes().get(minutes + 1) == Some(&b':')
+    })
 }
 
 fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&Sender<LyricsJob>>) -> R<PathBuf> {
@@ -716,14 +722,16 @@ mod tests {
 
     #[test]
     fn overwrite_refreshes_existing_lrc_sidecars() {
+        assert!(is_synced("[00:01.00] a\n[00:02.00] b"));
+        assert!(!is_synced("[Intro: X]\nline"));
+        assert!(is_synced("[ar:Artist]\n[00:01.00] a"));
         let dir = temp_dir("lrc-overwrite");
         let audio = dir.join("track.mp3");
-        let sidecar = audio.with_extension("lrc");
         for overwrite in ["force", "metadata"] {
-            fs::write(&sidecar, "[00:00.00] Old lyrics").unwrap();
+            fs::write(audio.with_extension("lrc"), "[00:00.00] Old lyrics").unwrap();
             let cfg = json!({"generate_lrc": true, "overwrite": overwrite});
             write_lrc(&audio, Some("[00:01.00] New lyrics"), &cfg).unwrap();
-            assert_eq!(fs::read_to_string(&sidecar).unwrap(), "[00:01.00] New lyrics");
+            assert_eq!(fs::read_to_string(audio.with_extension("lrc")).unwrap(), "[00:01.00] New lyrics");
         }
         fs::remove_dir_all(dir).unwrap();
     }
