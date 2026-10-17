@@ -556,6 +556,13 @@ mod tests {
 
     #[test]
     fn spotify_url_round_trips_for_supported_audio_formats() {
+        let Ok(version) = Command::new("ffmpeg").arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
         let dir = std::env::temp_dir().join(format!(
             "spotdl-url-tags-{}-{}",
             std::process::id(),

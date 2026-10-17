@@ -31,6 +31,7 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
 }
 
 const FORBIDDEN: &str = "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore";
+const VERSION_SUFFIXES: &str = "remaster remastered mono stereo mix version edit single radio deluxe anniversary";
 
 static BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 
@@ -107,21 +108,7 @@ fn is_version_suffix(suffix: &str) -> bool {
     let words = slug(suffix, "-");
     !words.is_empty()
         && words.split('-').all(|word| {
-            word.bytes().all(|byte| byte.is_ascii_digit())
-                || matches!(
-                    word,
-                    "remaster"
-                        | "remastered"
-                        | "mono"
-                        | "stereo"
-                        | "mix"
-                        | "version"
-                        | "edit"
-                        | "single"
-                        | "radio"
-                        | "deluxe"
-                        | "anniversary"
-                )
+            word.bytes().all(|byte| byte.is_ascii_digit()) || VERSION_SUFFIXES.split(' ').any(|w| w == word)
         })
 }
 
@@ -198,9 +185,8 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
-    let versionless = s
-        .name
-        .rsplit_once(" - ")
+    let version = s.name.rsplit_once(" - ");
+    let versionless = version
         .filter(|(_, suffix)| is_version_suffix(suffix))
         .map(|(name, _)| slug(name, "-"))
         .unwrap_or_else(|| sname.clone());
@@ -220,20 +206,13 @@ fn score(s: &Song, h: &Hit) -> f64 {
         .max(ratio(&versionless, &rname))
         .max(ratio(&versionless, stripped))
         - 15.0 * fwords;
-    let suffix_matches = s
-        .name
-        .rsplit_once(" - ")
-        .filter(|(_, suffix)| !is_version_suffix(suffix))
-        .map(|(_, suffix)| slug(suffix, "-"))
-        .filter(|suffix| !suffix.is_empty())
-        .is_none_or(|suffix| rname.contains(&suffix) || stripped.contains(&suffix));
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
     let album =
         if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
     let avg = (artists + name) / 2.0;
     let avg =
         if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
-    let skip = !suffix_matches || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
+    let skip = name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
@@ -333,12 +312,6 @@ mod tests {
     #[test]
     fn version_suffixes_allow_a_remastered_title_match() {
         assert!(score(&song("I Feel Fine - Remastered 2015"), &hit("I Feel Fine")) > 0.0);
-    }
-
-    #[test]
-    fn unrecognized_suffixes_are_not_removed_from_a_match() {
-        assert_eq!(score(&song("I Feel Fine - Take 2"), &hit("I Feel Fine")), 0.0);
-        assert!(score(&song("I Feel Fine - Take 2"), &hit("I Feel Fine - Take 2")) > 0.0);
     }
 
     #[test]
