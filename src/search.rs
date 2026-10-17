@@ -36,7 +36,7 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
 }
 
 const FORBIDDEN: &str =
-    "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore karaoke";
+    "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore karaoke sped speedup drumless";
 const VERSION_SUFFIXES: &str =
     "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
 
@@ -345,31 +345,18 @@ fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
 fn clean_name(name: &str, artists: &[String]) -> String {
     let mut clean = String::new();
     let mut rest = name;
-    while let Some((start, _)) = rest.char_indices().find(|(_, c)| matches!(*c, '(' | '[')) {
-        clean.push_str(&rest[..start]);
-        let mut depth = 1;
-        let Some(end) = rest[start + 1..].char_indices().find_map(|(offset, c)| match c {
-            '(' | '[' => {
-                depth += 1;
-                None
-            }
-            ')' | ']' => {
-                depth -= 1;
-                (depth == 0).then_some(start + 1 + offset)
-            }
-            _ => None,
-        }) else {
-            clean.push_str(&rest[start..]);
-            rest = "";
+    while let Some(open) = rest.find(['(', '[']) {
+        let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else {
             break;
         };
-        let group = &rest[start + 1..end];
+        clean.push_str(&rest[..open]);
+        let group = &rest[open + 1..close];
         let words = slug(group, "-");
         let feature = matches!(words.split('-').next(), Some("feat" | "ft" | "featuring" | "with"));
         if !feature && !is_version_suffix(group) {
-            clean.push_str(&rest[start..=end]);
+            clean.push_str(&rest[open..=close]);
         }
-        rest = &rest[end + 1..];
+        rest = &rest[close + 1..];
     }
     clean.push_str(rest);
     let mut name = format!("-{}-", slug(&clean, "-"));
@@ -577,6 +564,8 @@ mod tests {
         }
         let hurt = ("Hurt", christina, 243.6);
         let ghost = ("Ghost", ella, 200.0);
+        let beatles = &["The Beatles"][..];
+        let flashlight = ("Flashlight - Original Edit", beatles, 140.0);
         let off_record = &["Off The Record"][..];
         let karaoke = &["Karaoke Instrumental"][..];
         let hurt_decoy = "Hurt (In the style of Christina Aguilera) (Karaoke Version with Lead Vocal)";
@@ -585,6 +574,7 @@ mod tests {
             (hurt, (hurt_decoy, off_record, 243.0), ("Hurt", christina, 243.0)),
             (ghost, (ghost_decoy, karaoke, 200.0), ("Ghost", ella, 200.0)),
             (hurt, ("Hurt (Bass Boosted)", christina, 243.6), ("Hurt", christina, 243.6)),
+            (flashlight, ("Flashlight (Speed up)", beatles, 140.0), ("Flashlight", beatles, 140.0)),
         ] {
             assert!(score_case(source, result) < score_case(source, trusted), "{}", result.0);
         }
