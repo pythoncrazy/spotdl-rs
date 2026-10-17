@@ -113,19 +113,25 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
 
 const LRCLIB_INTERVAL: Duration = Duration::from_millis(750);
 static LRCLIB_NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+const GENIUS_INTERVAL: Duration = Duration::from_millis(1000);
+static GENIUS_NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn wait_turn(next: &Mutex<Option<Instant>>, interval: Duration) {
+    let now = Instant::now();
+    let slot = {
+        let mut next = next.lock().unwrap_or_else(|error| error.into_inner());
+        let slot = next.map_or(now, |next| now.max(next));
+        *next = Some(slot + interval);
+        slot
+    };
+    std::thread::sleep(slot.saturating_duration_since(Instant::now()));
+}
 
 fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<u8>> {
     let mut request_cfg = cfg.clone();
     request_cfg["max_retries"] = json!(0);
     for attempt in 0..5 {
-        let now = Instant::now();
-        let slot = {
-            let mut next = LRCLIB_NEXT.lock().unwrap_or_else(|error| error.into_inner());
-            let slot = next.map_or(now, |next| now.max(next));
-            *next = Some(slot + LRCLIB_INTERVAL);
-            slot
-        };
-        std::thread::sleep(slot.saturating_duration_since(Instant::now()));
+        wait_turn(&LRCLIB_NEXT, LRCLIB_INTERVAL);
         let response = crate::http("GET", url, &[], None, &request_cfg);
         match response {
             Ok(bytes) => return Some(bytes),
@@ -174,6 +180,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                 );
                 let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
                 let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
+                wait_turn(&GENIUS_NEXT, GENIUS_INTERVAL);
                 let reply: Value = crate::http_json("GET", &url, headers, None, &lyrics_cfg).ok()?;
                 let artist = search::slug(&song.artist, "");
                 let hits = reply["response"]["sections"][0]["hits"].as_array()?;
@@ -185,6 +192,7 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
                         && (primary == artist || primary.contains(&artist) || artist.contains(&primary))
                 })?["result"]["url"]
                     .as_str()?;
+                wait_turn(&GENIUS_NEXT, GENIUS_INTERVAL);
                 html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
             }
             "azlyrics" => {
@@ -671,6 +679,16 @@ pub fn meta(files: &[String], cfg: &Value) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_turn_spaces_requests() {
+        static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+        let start = Instant::now();
+        for _ in 0..3 {
+            wait_turn(&NEXT, Duration::from_millis(50));
+        }
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("spotdl-{name}-{}", std::process::id()));
