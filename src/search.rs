@@ -207,6 +207,13 @@ fn words<'a>(values: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
     words
 }
 
+fn altered(word: &str) -> bool {
+    REJECTED_VERSIONS.split_whitespace().any(|version| version == word)
+        || word
+            .strip_suffix("hz")
+            .is_some_and(|frequency| !frequency.is_empty() && frequency.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 pub fn ratio(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let row = a.iter().fold(vec![0usize; b.len() + 1], |row, x| {
@@ -396,8 +403,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let allowed_words = words(
         std::iter::once(s.name.as_str()).chain(s.artists.iter().map(String::as_str)).chain([s.album_name.as_str()]),
     );
-    let rejected =
-        REJECTED_VERSIONS.split_whitespace().any(|word| result_words.contains(word) && !allowed_words.contains(word));
+    let rejected = result_words.iter().any(|word| altered(word) && !allowed_words.contains(word));
     let penalized = PENALIZED_VERSIONS
         .split_whitespace()
         .filter(|word| result_words.contains(*word) && !allowed_words.contains(*word))
@@ -426,8 +432,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
         .max(ratio(&sname, &stripped))
         .max(ratio(&versionless, &rname))
         .max(ratio(&versionless, &stripped))
-        .max(ratio(&bare, &stripped))
-        - 15.0 * penalized;
+        .max(ratio(&bare, &stripped));
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
     let album =
         if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
@@ -436,7 +441,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
         if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
     let skip = rejected || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
-    avg.min(100.0) * f64::from(u8::from(!skip))
+    (avg.min(100.0) - 15.0 * penalized).max(1.0) * f64::from(u8::from(!skip))
 }
 
 pub fn find(song: &Song, cfg: &Value, prior_error: Option<String>) -> R<Vec<String>> {
