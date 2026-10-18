@@ -36,7 +36,7 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
 }
 
 const REJECTED_VERSIONS: &str =
-    "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally";
+    "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally reversed reverse amv";
 const PENALIZED_VERSIONS: &str = "remaster remastered lyrics lyric visualizer video edit";
 const VERSION_SUFFIXES: &str =
     "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
