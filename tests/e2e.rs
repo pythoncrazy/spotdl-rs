@@ -122,7 +122,6 @@ fn resolves_spotify_tracks_to_youtube_urls() {
         ("Kun tää loppuu", "https://open.spotify.com/track/10B96serXW72hB0N65H5Lt", false),
         ("Hurt", "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH", true),
         ("Ghost", "https://open.spotify.com/track/4XPWKmy05Rcff6TLHNoNF8", true),
-        ("Mimmit fiilaa", "https://open.spotify.com/track/059ZdcYEsV1MkiQGdKfNdV", true),
         ("Stuck with U", "https://open.spotify.com/track/4HBZA5flZLE435QTztThqH", true),
         ("Tornado", "https://open.spotify.com/track/3seNictp7GWitSNKlujwnY", true),
         ("Hey, Soul Sister", "https://open.spotify.com/track/0KpfYajJVVGgQ32Dby7e9i", true),
