@@ -235,9 +235,6 @@ fn ytm_retryable(error: &str) -> bool {
 }
 
 fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> R<Vec<Hit>> {
-    if v.get("contents").is_none() {
-        return Err("unexpected YouTube Music response".into());
-    }
     let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
     let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
     let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
@@ -277,15 +274,21 @@ fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
     let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-    let v = with_backoff(
-        &SEARCH_GATE,
-        cfg,
-        || {
-            crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
-                .map_err(|error| error.to_string())
-        },
-        ytm_retryable,
-    )?;
+    let v = crate::spotify::cached(&format!("ytm{body}"), cfg["no_cache"] != true, false, || {
+        let v: Value = with_backoff(
+            &SEARCH_GATE,
+            cfg,
+            || {
+                crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
+                    .map_err(|error| error.to_string())
+            },
+            ytm_retryable,
+        )?;
+        if v.get("contents").is_none() {
+            return Err("unexpected YouTube Music response".into());
+        }
+        Ok(v)
+    })?;
     ytm_hits(&v, songs, isrc)
 }
 

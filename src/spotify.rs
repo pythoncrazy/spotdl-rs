@@ -100,7 +100,7 @@ fn state(cfg: &Value, rejected: Option<&str>) -> R<Arc<Value>> {
     Ok(v)
 }
 
-fn cached(key: &str, cache: bool, forever: bool, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
+pub(crate) fn cached(key: &str, cache: bool, forever: bool, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
     let key = format!("{:x}", Sha1::digest(key.as_bytes()));
     let path = HOME.join("cache").join(&key[..16]);
     if cache {
