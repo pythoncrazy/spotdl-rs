@@ -50,7 +50,7 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
         ("track-id", s.song_id.clone()),
         ("track-number", format!("{:02}", s.track_number)),
         ("duration", (s.duration as u64).to_string()),
-        ("output-ext", cfg["format"].as_str().unwrap_or("mp3").into()),
+        ("output-ext", cfg["format"].as_str().unwrap_or("opus").into()),
     ];
     let json = serde_json::to_value(s).unwrap_or_default();
     let text = |v: &Value| {
@@ -91,7 +91,7 @@ pub fn path(s: &Song, cfg: &Value) -> PathBuf {
     };
     let parts = tpl.trim_start_matches('/').trim_end_matches(".{output-ext}").split('/').map(part);
     let mut out = Path::new(if tpl.starts_with('/') { "/" } else { "" }).join(parts.collect::<PathBuf>());
-    out.as_mut_os_string().push(format!(".{}", cfg["format"].as_str().unwrap_or("mp3")));
+    out.as_mut_os_string().push(format!(".{}", cfg["format"].as_str().unwrap_or("opus")));
     out
 }
 
@@ -404,10 +404,10 @@ fn queued_download(
 }
 
 fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
-    let format = cfg["format"].as_str().unwrap_or("mp3");
+    let format = cfg["format"].as_str().unwrap_or("opus");
     let bitrate = cfg["bitrate"].as_str().unwrap_or("auto");
-    let selectors = [("m4a", "bestaudio[ext=m4a]/bestaudio/best"), ("opus", "bestaudio[ext=webm]/bestaudio/best")];
-    let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio/best", |entry| entry.1);
+    let selectors = [("m4a", "bestaudio[ext=m4a]/bestaudio"), ("opus", "bestaudio[ext=webm]/bestaudio")];
+    let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio", |entry| entry.1);
     let template = out.with_extension(format!("{id}.%(ext)s"));
     let (got, text) = search::yt(cfg, &search::DOWNLOAD_GATE, || {
         YT_DLP.with_borrow_mut(|worker| queued_download(worker, url, selector, &template, cfg))

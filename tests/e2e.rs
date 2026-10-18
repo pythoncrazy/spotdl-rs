@@ -200,6 +200,14 @@ fn downloads_revolver_tracks_and_updates_metadata() {
         assert_eq!(tag.album().as_deref(), expected["album_name"].as_str());
         assert_eq!(tag.track(), expected["track_number"].as_u64().map(|number| number as u32));
         assert!(!tag.pictures().is_empty());
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=sample_rate", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .unwrap();
+        assert_success(&probe);
+        let sample_rate = String::from_utf8_lossy(&probe.stdout).trim().parse::<u32>().unwrap();
+        assert!(sample_rate >= 44_100, "{file:?} has {sample_rate} Hz audio");
         assert!((audio.properties().duration().as_secs_f64() - expected["duration"].as_f64().unwrap()).abs() < 5.0);
         let source = tag.get_string(&ItemKey::Unknown("WWWAUDIOFILE".into())).unwrap_or_default();
         assert_eq!(source, spotify);
