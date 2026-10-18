@@ -105,7 +105,9 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
             _ => skip,
         };
         out.push_str(if skip == 0 && tag.starts_with("br") { "\n" } else { "" });
-        out.push_str(if skip == 0 { text } else { "" });
+        if skip == 0 {
+            out.extend(text.chars().filter(|character| !matches!(*character, '\n' | '\r')));
+        }
         (skip, out)
     });
     Some(text.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
@@ -127,17 +129,24 @@ fn wait_turn(next: &Mutex<Option<Instant>>, interval: Duration) {
     std::thread::sleep(slot.saturating_duration_since(Instant::now()));
 }
 
-fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<Value>> {
+fn paced_get(
+    url: &str,
+    headers: &[(&str, &str)],
+    next: &Mutex<Option<Instant>>,
+    interval: Duration,
+    cfg: &Value,
+) -> Option<Vec<u8>> {
     let mut request_cfg = cfg.clone();
     request_cfg["max_retries"] = json!(0);
+    let host = url.split_once("://").map_or(url, |(_, host)| host.split('/').next().unwrap_or(host));
     for attempt in 0..5 {
-        wait_turn(&LRCLIB_NEXT, LRCLIB_INTERVAL);
-        match crate::http_json::<Vec<Value>>("GET", url, &[], None, &request_cfg) {
-            Ok(tracks) => return Some(tracks),
+        wait_turn(next, interval);
+        match crate::http("GET", url, headers, None, &request_cfg) {
+            Ok(bytes) => return Some(bytes),
             Err(error) => {
                 let status = error.to_string().split_whitespace().nth(1).and_then(|status| status.parse::<u16>().ok());
                 let status = status.filter(|status| *status == 429 || (500..600).contains(status))?;
-                crate::log(cfg, "DEBUG", &format!("LRCLIB HTTP {status} on attempt {}/5", attempt + 1));
+                crate::log(cfg, "DEBUG", &format!("{host} HTTP {status} on attempt {}/5", attempt + 1));
                 if attempt == 4 {
                     return None;
                 }
@@ -148,7 +157,7 @@ fn lrclib_request(url: &str, cfg: &Value) -> Option<Vec<Value>> {
     None
 }
 
-pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
+fn provider_lyrics(name: &str, song: &Song, cfg: &Value) -> Option<String> {
     let mut lyrics_cfg = cfg.clone();
     lyrics_cfg["max_retries"] = json!(1);
     lyrics_cfg["timeout"] = json!(10);
@@ -157,69 +166,72 @@ pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
         String::from_utf8(bytes).ok()
     };
     let encode = crate::url_encode;
-    let provider = |name: &str| {
-        let text = match name {
-            "synced" => {
-                let url = format!(
-                    "https://lrclib.net/api/search?artist_name={}&track_name={}",
-                    encode(&song.artist),
-                    encode(search::versionless(&song.name))
-                );
-                let tracks = lrclib_request(&url, &lyrics_cfg)?;
-                let hit = tracks
-                    .iter()
-                    .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
-                hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
-            }
-            "genius" => {
-                let url = format!(
-                    "https://genius.com/api/search/song?q={}",
-                    encode(&format!("{} {}", song.artist, search::versionless(&song.name)))
-                );
-                let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
-                let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
-                wait_turn(&GENIUS_NEXT, GENIUS_INTERVAL);
-                let reply: Value = crate::http_json("GET", &url, headers, None, &lyrics_cfg).ok()?;
-                let artist = search::slug(&song.artist, "");
-                let hits = reply["response"]["sections"][0]["hits"].as_array()?;
-                let url = hits.iter().find(|hit| {
-                    let primary =
-                        search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
-                    !artist.is_empty()
-                        && !primary.is_empty()
-                        && (primary == artist || primary.contains(&artist) || artist.contains(&primary))
-                })?["result"]["url"]
-                    .as_str()?;
-                wait_turn(&GENIUS_NEXT, GENIUS_INTERVAL);
-                html(&page(url, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
-            }
-            "azlyrics" => {
-                let artist = search::slug(&song.artist, "");
-                let title = search::slug(search::versionless(&song.name), "");
-                html(
-                    &page(&format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html"), &[])?,
-                    "<!-- Usage of azlyrics.com",
-                    "</div>",
-                )?
-            }
-            _ => {
-                let url = format!(
-                    "https://www.musixmatch.com/lyrics/{}/{}",
-                    search::slug(&song.artist, "-"),
-                    search::slug(search::versionless(&song.name), "-")
-                );
-                let body = page(&url, &[])?.split_once("\"body\":")?.1.to_string();
-                serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
-            }
-        };
-        Some(text.trim().to_string()).filter(|text| !text.is_empty())
+    let text = match name {
+        "synced" => {
+            let url = format!(
+                "https://lrclib.net/api/search?artist_name={}&track_name={}",
+                encode(&song.artist),
+                encode(search::versionless(&song.name))
+            );
+            let bytes = paced_get(&url, &[], &LRCLIB_NEXT, LRCLIB_INTERVAL, &lyrics_cfg)?;
+            let tracks: Vec<Value> = serde_json::from_slice(&bytes).ok()?;
+            let hit = tracks
+                .iter()
+                .find(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)?;
+            hit["syncedLyrics"].as_str().or(hit["plainLyrics"].as_str())?.to_string()
+        }
+        "genius" => {
+            let url = format!(
+                "https://genius.com/api/search/song?q={}",
+                encode(&format!("{} {}", song.artist, search::versionless(&song.name)))
+            );
+            let auth = format!("Bearer {}", cfg["genius_token"].as_str().unwrap_or_default());
+            let headers: &[(&str, &str)] = if auth.len() > 7 { &[("Authorization", &auth)] } else { &[] };
+            let bytes = paced_get(&url, headers, &GENIUS_NEXT, GENIUS_INTERVAL, &lyrics_cfg)?;
+            let reply: Value = serde_json::from_slice(&bytes).ok()?;
+            let artist = search::slug(&song.artist, "");
+            let hits = reply["response"]["sections"][0]["hits"].as_array()?;
+            let url = hits.iter().find(|hit| {
+                let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
+                !artist.is_empty()
+                    && !primary.is_empty()
+                    && (primary == artist || primary.contains(&artist) || artist.contains(&primary))
+            })?["result"]["url"]
+                .as_str()?;
+            let page = String::from_utf8(paced_get(url, &[], &GENIUS_NEXT, GENIUS_INTERVAL, &lyrics_cfg)?).ok()?;
+            html(&page, "data-lyrics-container=\"true\"", "LyricsFooter")?
+        }
+        "azlyrics" => {
+            let artist = search::slug(&song.artist, "");
+            let title = search::slug(search::versionless(&song.name), "");
+            html(
+                &page(&format!("https://www.azlyrics.com/lyrics/{artist}/{title}.html"), &[])?,
+                "<!-- Usage of azlyrics.com",
+                "</div>",
+            )?
+        }
+        _ => {
+            let url = format!(
+                "https://www.musixmatch.com/lyrics/{}/{}",
+                search::slug(&song.artist, "-"),
+                search::slug(search::versionless(&song.name), "-")
+            );
+            let body = page(&url, &[])?.split_once("\"body\":")?.1.to_string();
+            serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
+        }
     };
-    crate::string_values(&cfg["lyrics_providers"]).find_map(provider)
+    Some(text.trim().to_string()).filter(|text| !text.is_empty())
+}
+
+pub fn lyrics(song: &Song, cfg: &Value) -> Option<String> {
+    crate::string_values(&cfg["lyrics_providers"]).find_map(|name| provider_lyrics(name, song, cfg))
 }
 
 pub fn add_lyrics(song: &Song, file: &Path, cfg: &Value) -> Option<String> {
     let text = lyrics(song, cfg)?;
-    if let Err(error) = set_lyrics(file, &text).and_then(|_| write_lrc(file, Some(&text), cfg)) {
+    let mut song_with_lyrics = song.clone();
+    song_with_lyrics.lyrics = Some(text.clone());
+    if let Err(error) = set_lyrics(file, &text).and_then(|_| write_lrc(file, &song_with_lyrics, cfg)) {
         crate::log(cfg, "ERROR", &format!("{} - {}: {error}", song.artists.join(", "), song.name));
         return None;
     }
@@ -417,13 +429,21 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
 static SCAN: std::sync::OnceLock<std::collections::HashMap<String, PathBuf>> = std::sync::OnceLock::new();
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 
-fn write_lrc(file: &Path, lyrics: Option<&str>, cfg: &Value) -> R<()> {
+fn write_lrc(file: &Path, song: &Song, cfg: &Value) -> R<()> {
     let sidecar = file.with_extension("lrc");
     let replace = matches!(cfg["overwrite"].as_str(), Some("force" | "metadata"));
-    lyrics
-        .filter(|text| cfg["generate_lrc"] == true && (replace || !sidecar.exists()) && is_synced(text))
-        .map(|text| fs::write(sidecar, text))
-        .transpose()?;
+    if cfg["generate_lrc"] != true || (!replace && sidecar.exists()) {
+        return Ok(());
+    }
+    let lyrics = song
+        .lyrics
+        .as_deref()
+        .filter(|text| is_synced(text))
+        .map(str::to_owned)
+        .or_else(|| provider_lyrics("synced", song, cfg).filter(|text| is_synced(text)));
+    if let Some(lyrics) = lyrics {
+        fs::write(sidecar, lyrics)?;
+    }
     Ok(())
 }
 
@@ -537,7 +557,7 @@ fn finish(s: &mut Song, op: &str, cfg: &Value, index: usize, lyrics_tx: Option<&
     if lyrics_tx.is_none() && s.lyrics.is_none() {
         s.lyrics = lyrics(s, cfg);
     }
-    tag(&target, s, cfg).and_then(|_| write_lrc(&target, s.lyrics.as_deref(), cfg))?;
+    tag(&target, s, cfg).and_then(|_| write_lrc(&target, s, cfg))?;
     if cfg["create_skip_file"] == true {
         fs::write(skip_path(&target), "")?;
     }
@@ -623,11 +643,14 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
     let redownload = cfg["redownload"] == true;
     let needs_lrc = cfg["generate_lrc"] == true && !file.with_extension("lrc").exists();
     if complete && !force && !redownload {
-        if needs_lrc {
-            let song = Song { lyrics: value(&ItemKey::Lyrics), ..Song::default() };
-            write_lrc(file, song.lyrics.as_deref(), cfg)?;
+        if !needs_lrc {
+            return Ok(());
         }
-        return Ok(());
+        let song = Song { lyrics: value(&ItemKey::Lyrics), ..Song::default() };
+        if song.lyrics.as_deref().is_some_and(is_synced) {
+            write_lrc(file, &song, cfg)?;
+            return Ok(());
+        }
     }
     let url = audio_url(primary, format).filter(|url| url.contains("spotify"));
     let query = url.unwrap_or_else(|| {
@@ -639,7 +662,7 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
     if !complete || force {
         tag(file, &song, cfg)?;
     }
-    write_lrc(file, song.lyrics.as_deref(), cfg)?;
+    write_lrc(file, &song, cfg)?;
     if redownload {
         let mut cfg = cfg.clone();
         cfg["overwrite"] = json!("force");

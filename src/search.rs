@@ -104,7 +104,7 @@ fn strike(gate: &Gate) {
 }
 
 fn transient(error: &str) -> bool {
-    error.contains("Requested format is not available")
+    error.contains("Requested format is not available") || error.contains("Failed to extract any player response")
 }
 
 fn youtube_retryable(error: &str) -> bool {
