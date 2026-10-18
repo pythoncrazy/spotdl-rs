@@ -9,7 +9,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, PipeReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc::Sender, Mutex, OnceLock},
@@ -18,8 +18,10 @@ use std::{
 
 pub type LyricsJob = (usize, Song, PathBuf);
 
+type Worker = (Child, BufReader<PipeReader>);
+
 thread_local! {
-    static YT_DLP: RefCell<Option<(Child, BufReader<std::io::PipeReader>)>> = const { RefCell::new(None) };
+    static YT_DLP: RefCell<Option<Worker>> = const { RefCell::new(None) };
 }
 
 const ENRICHED: [&str; 7] = ["genre", "isrc", "publisher", "upc", "bpm", "gain", "original-date"];
@@ -361,88 +363,44 @@ fn download<'a>(command: &'a mut Command, selector: &str, template: &Path, cfg: 
     command
 }
 
-fn spawn_ytdlp(
-    selector: &str,
-    template: &Path,
-    cfg: &Value,
-) -> std::io::Result<(Child, BufReader<std::io::PipeReader>)> {
+fn spawn_ytdlp(selector: &str, template: &Path, cfg: &Value) -> std::io::Result<Worker> {
     let (reader, writer) = std::io::pipe()?;
-    let stderr = writer.try_clone()?;
-    let mut command = search::yt_dlp(cfg);
-    download(&mut command, selector, template, cfg)
+    let child = download(&mut search::yt_dlp(cfg), selector, template, cfg)
         .args(["--lazy-playlist", "-i", "spotdl-queue:"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(writer))
-        .stderr(Stdio::from(stderr));
-    let child = command.spawn()?;
-    drop(command);
+        .stderr(writer.try_clone()?)
+        .stdout(writer)
+        .spawn()?;
     Ok((child, BufReader::new(reader)))
 }
 
-fn stop_ytdlp(worker: &mut Option<(Child, BufReader<std::io::PipeReader>)>) {
-    if let Some((mut child, _)) = worker.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
 fn queued_download(
-    worker: &mut Option<(Child, BufReader<std::io::PipeReader>)>,
+    slot: &mut Option<Worker>,
     url: &str,
     selector: &str,
     template: &Path,
     cfg: &Value,
 ) -> std::io::Result<(Option<PathBuf>, String)> {
-    if worker.is_none() {
-        *worker = Some(spawn_ytdlp(selector, template, cfg)?);
-    }
-    let send = worker
-        .as_mut()
-        .and_then(|(child, _)| child.stdin.as_mut())
-        .ok_or_else(|| std::io::Error::other("yt-dlp stdin is unavailable"))
-        .and_then(|stdin| {
-            writeln!(stdin, "{url}\t{}", template.display())?;
-            stdin.flush()
-        });
-    if let Err(error) = send {
-        stop_ytdlp(worker);
-        return Err(error);
-    }
+    let (child, reader) = match slot {
+        Some(worker) => worker,
+        None => slot.insert(spawn_ytdlp(selector, template, cfg)?),
+    };
+    let sent = child.stdin.as_mut().is_some_and(|stdin| writeln!(stdin, "{url}\t{}", template.display()).is_ok());
     let mut lines = Vec::new();
-    loop {
-        let mut line = String::new();
-        let read = worker
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("yt-dlp worker is unavailable"))?
-            .1
-            .read_line(&mut line);
-        match read {
-            Ok(0) => {
-                let text = lines.join("\n");
-                stop_ytdlp(worker);
-                return Err(std::io::Error::other(text));
+    if sent {
+        for line in reader.lines().map_while(Result::ok) {
+            if line == "SPOTDL-DONE" {
+                let path = lines.iter().rev().map(PathBuf::from).find(|path| path.is_file());
+                return Ok((path, lines.join("\n")));
             }
-            Ok(_) => {
-                let line = line.trim_end_matches(['\r', '\n']);
-                if line == "SPOTDL-DONE" {
-                    break;
-                }
-                lines.push(line.to_string());
-            }
-            Err(error) => {
-                let text = lines.join("\n");
-                let text = if text.is_empty() { error.to_string() } else { text };
-                let kind = error.kind();
-                stop_ytdlp(worker);
-                return Err(std::io::Error::new(kind, text));
-            }
+            lines.push(line);
         }
     }
-    let path = lines.iter().rev().find_map(|line| {
-        let path = PathBuf::from(line);
-        path.is_file().then_some(path)
-    });
-    Ok((path, lines.join("\n")))
+    if let Some((mut child, _)) = slot.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Err(std::io::Error::other(lines.join("\n")))
 }
 
 fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
@@ -452,12 +410,8 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let selector = selectors.iter().find(|entry| entry.0 == format).map_or("bestaudio/best", |entry| entry.1);
     let template = out.with_extension(format!("{id}.%(ext)s"));
     let (got, text) = search::yt(cfg, &search::DOWNLOAD_GATE, || {
-        YT_DLP.with(|worker| {
-            let mut worker = worker.borrow_mut();
-            queued_download(&mut worker, url, selector, &template, cfg)
-        })
-    })
-    .map_err(|error| format!("yt-dlp: {error}"))?;
+        YT_DLP.with_borrow_mut(|worker| queued_download(worker, url, selector, &template, cfg))
+    })?;
     let got = got.ok_or_else(|| format!("yt-dlp: {}", text.trim()))?;
     let ext = got.extension().unwrap_or_default().to_string_lossy().to_string();
     let keep = ["auto", "disable"].contains(&bitrate);
