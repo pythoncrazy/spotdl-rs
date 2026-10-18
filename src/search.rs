@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
         OnceLock,
@@ -114,17 +114,16 @@ fn youtube_retryable(error: &str) -> bool {
             .any(|pattern| error.contains(pattern))
 }
 
-pub(crate) fn yt(cmd: &mut Command, cfg: &Value, gate: &Gate) -> R<Output> {
+pub(crate) fn yt<T>(cfg: &Value, gate: &Gate, mut run: impl FnMut() -> std::io::Result<(T, String)>) -> R<(T, String)> {
     with_backoff(
         gate,
         cfg,
         || {
-            let output = cmd.output().map_err(|error| error.to_string())?;
-            let error = String::from_utf8_lossy(&output.stderr);
-            if youtube_retryable(&error) {
-                Err(error.trim().to_string())
+            let (value, text) = run().map_err(|error| error.to_string())?;
+            if youtube_retryable(&text) {
+                Err(text.trim().to_string())
             } else {
-                Ok(output)
+                Ok((value, text))
             }
         },
         youtube_retryable,
@@ -150,14 +149,36 @@ fn js_runtime_args(cmd: &mut Command) {
     }
 }
 
-// Logged-out YouTube adds a pre-roll ad; this overrides yt-dlp's wait until `available_at`.
-const YT_DLP_PLUGIN_SOURCE: &str = r#"import time
+// Logged-out YouTube needs the no-ad wait override, preprocessed-player cache, and queue extractor.
+const YT_DLP_PLUGIN_SOURCE: &str = r#"import sys
+import time
+from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.extractor.youtube import YoutubeIE
+
+try:
+    from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
+    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
+except ImportError:
+    pass
 
 
 class NoAdWaitYoutubeIE(YoutubeIE, plugin_name='spotdl'):
     def _get_available_at_timestamp(self, *args, **kwargs):
         return int(time.time())
+
+
+class SpotdlQueueIE(InfoExtractor):
+    _VALID_URL = r'spotdl-queue:'
+
+    def _entries(self):
+        for line in sys.stdin:
+            url, _, template = line.rstrip('\n').partition('\t')
+            self._downloader.params['outtmpl'] = {'default': template}
+            yield self.url_result(url)
+            print('SPOTDL-DONE', flush=True)
+
+    def _real_extract(self, url):
+        return self.playlist_result(self._entries())
 "#;
 
 static YT_DLP_PLUGIN_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -342,8 +363,12 @@ pub(crate) fn first_hit(song: &Song, cfg: &Value) -> R<String> {
 
 fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
     let mut cmd = yt_dlp(cfg);
-    cmd.args(["--flat-playlist", "-J", "--no-warnings"]);
-    let out = yt(cmd.arg(search), cfg, &SEARCH_GATE)?;
+    cmd.args(["--flat-playlist", "-J", "--no-warnings"]).arg(search);
+    let (out, _) = yt(cfg, &SEARCH_GATE, || {
+        let output = cmd.output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        Ok((output, stderr))
+    })?;
     if !out.status.success() {
         return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
     }
