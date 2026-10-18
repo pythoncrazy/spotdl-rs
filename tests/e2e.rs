@@ -122,11 +122,26 @@ fn resolves_spotify_tracks_to_youtube_urls() {
         ("Kun tää loppuu", "https://open.spotify.com/track/10B96serXW72hB0N65H5Lt", false),
         ("Hurt", "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH", true),
         ("Ghost", "https://open.spotify.com/track/4XPWKmy05Rcff6TLHNoNF8", true),
+        ("Mimmit fiilaa", "https://open.spotify.com/track/059ZdcYEsV1MkiQGdKfNdV", true),
+        ("Stuck with U", "https://open.spotify.com/track/4HBZA5flZLE435QTztThqH", true),
+        ("Tornado", "https://open.spotify.com/track/3seNictp7GWitSNKlujwnY", true),
+        ("Hey, Soul Sister", "https://open.spotify.com/track/0KpfYajJVVGgQ32Dby7e9i", true),
+        ("It Wasn't Me", "https://open.spotify.com/track/1lzr43nnXAijIGYnCT8M8H", true),
     ] {
         let watch = watch_url(&spotdl(&dir, &["url", spotify]));
         if check_title {
             let title = oembed_title(&watch);
-            assert!(!title.to_lowercase().contains("karaoke"), "{name} resolved to {title}");
+            let normalized = title.to_lowercase();
+            assert!(
+                !["karaoke", "bass boost", "bassboost", "tribute", "nightcore", "slowed", "sped up"]
+                    .iter()
+                    .any(|version| normalized.contains(version)),
+                "{name} resolved to {title}"
+            );
+            assert!(
+                !normalized.split(|c: char| !c.is_alphanumeric()).any(|word| word == "8d"),
+                "{name} resolved to {title}"
+            );
         }
     }
 }

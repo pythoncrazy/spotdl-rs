@@ -35,8 +35,9 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
     }
 }
 
-const FORBIDDEN: &str =
-    "bassboosted remix remastered remaster reverb bassboost live acoustic 8daudio concert acapella slowed instrumental cover nightcore karaoke sped speedup drumless";
+const REJECTED_VERSIONS: &str =
+    "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally";
+const PENALIZED_VERSIONS: &str = "remaster remastered lyrics lyric visualizer video edit";
 const VERSION_SUFFIXES: &str =
     "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
 
@@ -193,6 +194,17 @@ pub(crate) fn yt_dlp(cfg: &Value) -> Command {
 pub fn slug(s: &str, sep: &str) -> String {
     let s = deunicode::deunicode(s).to_lowercase();
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(sep)
+}
+
+fn words<'a>(values: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut words = HashSet::new();
+    for value in values {
+        let slugged = slug(value, "-");
+        let tokens = slugged.split('-').filter(|word| !word.is_empty()).collect::<Vec<_>>();
+        words.extend(tokens.iter().map(|word| (*word).to_string()));
+        words.extend(tokens.windows(2).map(|pair| format!("{}{}", pair[0], pair[1])));
+    }
+    words
 }
 
 pub fn ratio(a: &str, b: &str) -> f64 {
@@ -376,6 +388,20 @@ fn clean_name(name: &str, artists: &[String]) -> String {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
+    let result_words = words(
+        std::iter::once(hit.name.as_str())
+            .chain(hit.artists.iter().map(String::as_str))
+            .chain([hit.album_name.as_str()]),
+    );
+    let allowed_words = words(
+        std::iter::once(s.name.as_str()).chain(s.artists.iter().map(String::as_str)).chain([s.album_name.as_str()]),
+    );
+    let rejected =
+        REJECTED_VERSIONS.split_whitespace().any(|word| result_words.contains(word) && !allowed_words.contains(word));
+    let penalized = PENALIZED_VERSIONS
+        .split_whitespace()
+        .filter(|word| result_words.contains(*word) && !allowed_words.contains(*word))
+        .count() as f64;
     let versionless_name = versionless(&s.name);
     let versionless = slug(versionless_name, "-");
     let combined_artists = slug(&hit.artists.join(" "), "-");
@@ -394,8 +420,6 @@ fn score(s: &Song, h: &Hit) -> f64 {
         .map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-")))
         .fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
-    let (rname_flat, sname_flat) = (rname.replace('-', ""), sname.replace('-', ""));
-    let fwords = FORBIDDEN.split(' ').filter(|w| rname_flat.contains(w) && !sname_flat.contains(w)).count() as f64;
     let stripped = clean_name(&hit.name, &s.artists);
     let bare = clean_name(versionless_name, &s.artists);
     let name = ratio(&sname, &rname)
@@ -403,14 +427,14 @@ fn score(s: &Song, h: &Hit) -> f64 {
         .max(ratio(&versionless, &rname))
         .max(ratio(&versionless, &stripped))
         .max(ratio(&bare, &stripped))
-        - 15.0 * fwords;
+        - 15.0 * penalized;
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
     let album =
         if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
     let avg = (artists + name) / 2.0;
     let avg =
         if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
-    let skip = name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
+    let skip = rejected || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     avg.min(100.0) * f64::from(u8::from(!skip))
 }
