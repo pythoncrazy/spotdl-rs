@@ -294,4 +294,64 @@ fn reports_cli_option_and_config_errors() {
         "{}",
         output_text(&config)
     );
+
+    let format = spotdl(&dir, &["--format"]);
+    assert!(!format.status.success());
+    assert!(
+        String::from_utf8_lossy(&format.stderr).to_lowercase().contains("missing value for --format"),
+        "{}",
+        output_text(&format)
+    );
+
+    let fixture = dir.join("local.spotdl");
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&json!({"songs": [{
+            "name": "．．／．．／etc",
+            "artist": "Artist",
+            "artists": ["Artist"],
+            "album_name": "Album",
+            "url": "https://open.spotify.com/track/0123456789012345678901",
+            "song_id": "0123456789012345678901",
+            "duration": 180
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let fixture = fixture.display().to_string();
+    let output_dir = dir.join("safe");
+    let output_template = format!("{}/{{title}}.{{output-ext}}", output_dir.display());
+    let traversal = spotdl(
+        &dir,
+        &[
+            "save",
+            &fixture,
+            "--save-file",
+            "-",
+            "--lyrics-providers=",
+            "--restrict",
+            "ascii",
+            "--output",
+            &output_template,
+            "--m3u",
+        ],
+    );
+    assert_success(&traversal);
+    let text = output_text(&traversal);
+    let expected = output_dir.join("....etc.opus").display().to_string();
+    assert!(text.contains(&expected), "{}", text);
+    let playlist = fs::read_to_string(dir.join("Album.m3u8")).unwrap();
+    assert!(playlist.contains("safe/....etc.opus"), "{playlist}");
+    assert!(!playlist.contains("../"), "{playlist}");
+
+    let empty_output = spotdl(&dir, &["save", &fixture, "--save-file", "-", "--lyrics-providers=", "--output", ""]);
+    assert_success(&empty_output);
+    let text = output_text(&empty_output);
+    let reported_path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("INFO: Artist - ．．／．．／etc: "))
+        .map(PathBuf::from)
+        .expect("missing reported save path");
+    assert!(!reported_path.is_absolute(), "{}", text);
+    assert_eq!(reported_path, PathBuf::from("Artist - ．．／．．／etc.opus"));
 }

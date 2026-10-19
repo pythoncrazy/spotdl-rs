@@ -221,6 +221,9 @@ fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
             ),
             (Some(Value::Number(_)), Some(v)) => (1, json!(v.parse::<usize>()?)),
             (Some(_), Some(v)) => (1, json!(v)),
+            (Some(Value::String(_) | Value::Number(_)), None) => {
+                return Err(format!("missing value for --{raw_key}").into());
+            }
             (Some(_), _) => (0, json!("")),
             (None, _)
                 if !["help", "check_for_updates", "download_ffmpeg", "download_deno", "download_yt_dlp"]

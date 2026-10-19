@@ -30,9 +30,13 @@ pub fn uses_enriched_fields(template: &str) -> bool {
     ENRICHED.iter().any(|name| template.contains(&format!("{{{name}}}")))
 }
 
+fn strip_invalid_path_chars(value: &str) -> String {
+    value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect()
+}
+
 pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
     let clean = |value: &str| {
-        let kept: String = value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect();
+        let kept = strip_invalid_path_chars(value);
         kept.trim().trim_end_matches('.').to_string()
     };
     let extra = [
@@ -67,7 +71,13 @@ pub fn fill(tpl: &str, s: &Song, cfg: &Value) -> String {
 
 pub fn path(s: &Song, cfg: &Value) -> PathBuf {
     let output = cfg["output"].as_str().unwrap_or_default();
-    let tpl = if output.contains('{') { output.to_string() } else { format!("{output}/{{artists}} - {{title}}") };
+    let tpl = if output.is_empty() {
+        "{artists} - {title}".to_string()
+    } else if output.contains('{') {
+        output.to_string()
+    } else {
+        format!("{output}/{{artists}} - {{title}}")
+    };
     let max = cfg["max_filename_length"].as_u64().filter(|max| *max > 0).unwrap_or(u64::MAX) as usize;
     let part = |part: &str| {
         let value = fill(part, s, cfg);
@@ -76,6 +86,7 @@ pub fn path(s: &Song, cfg: &Value) -> PathBuf {
             Some("ascii") => deunicode::deunicode(&value),
             _ => value,
         };
+        let value = strip_invalid_path_chars(&value);
         if value == "." || value == ".." {
             "_".to_string()
         } else {
@@ -417,7 +428,10 @@ fn fetch(url: &str, out: &Path, id: &str, cfg: &Value) -> R<()> {
     let keep = ["auto", "disable"].contains(&bitrate);
     let temp = out.with_extension(format!("{id}.converted.{format}"));
     let converted = if ext == format && keep {
-        fs::rename(&got, &temp).map_err(Into::into)
+        fs::rename(&got, &temp).map_err(|error| {
+            let _ = fs::remove_file(&got);
+            error.into()
+        })
     } else {
         let codecs =
             [("mp3", "libmp3lame"), ("flac", "flac"), ("ogg", "libvorbis"), ("opus", "libopus"), ("m4a", "aac")];
@@ -680,8 +694,9 @@ fn meta_file(file: &Path, cfg: &Value) -> R<()> {
     let complete = primary.title().is_some_and(|title| !title.is_empty())
         && primary.artist().is_some_and(|artist| !artist.is_empty())
         && filled(&ItemKey::TrackArtists)
-        && filled(&ItemKey::Lyrics)
-        && !primary.pictures().is_empty();
+        && (cfg["lyrics_providers"].as_array().is_some_and(|providers| providers.is_empty())
+            || filled(&ItemKey::Lyrics))
+        && (cfg["skip_album_art"] == true || !primary.pictures().is_empty());
     let force = cfg["force_update_metadata"] == true;
     let redownload = cfg["redownload"] == true;
     let needs_lrc = cfg["generate_lrc"] == true && !file.with_extension("lrc").exists();

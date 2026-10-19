@@ -217,9 +217,12 @@ pub fn slug(s: &str, sep: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(sep)
 }
 
-fn words<'a>(values: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+fn words(song: &Song) -> HashSet<String> {
     let mut words = HashSet::new();
-    for value in values {
+    for value in std::iter::once(song.name.as_str())
+        .chain(song.artists.iter().map(String::as_str))
+        .chain([song.album_name.as_str()])
+    {
         let slugged = slug(value, "-");
         let tokens = slugged.split('-').filter(|word| !word.is_empty()).collect::<Vec<_>>();
         words.extend(tokens.iter().map(|word| (*word).to_string()));
@@ -420,14 +423,8 @@ fn clean_name(name: &str, artists: &[String]) -> String {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
-    let result_words = words(
-        std::iter::once(hit.name.as_str())
-            .chain(hit.artists.iter().map(String::as_str))
-            .chain([hit.album_name.as_str()]),
-    );
-    let allowed_words = words(
-        std::iter::once(s.name.as_str()).chain(s.artists.iter().map(String::as_str)).chain([s.album_name.as_str()]),
-    );
+    let result_words = words(hit);
+    let allowed_words = words(s);
     let rejected = result_words.iter().any(|word| altered(word) && !allowed_words.contains(word));
     let penalized = PENALIZED_VERSIONS
         .split_whitespace()
