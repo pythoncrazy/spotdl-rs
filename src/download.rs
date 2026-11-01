@@ -43,6 +43,14 @@ pub fn fill(template: &str, s: &Song) -> String {
         ("original-date", original_date.clone()),
         ("track-id", s.song_id.clone()),
         ("track-number", format!("{:02}", s.track_number)),
+        // "07", or "2-07" when the album has more than one disc, so the discs' track numbers do not collide.
+        (
+            "disc-track-number",
+            match s.disc_count {
+                0 | 1 => format!("{:02}", s.track_number),
+                _ => format!("{}-{:02}", s.disc_number, s.track_number),
+            },
+        ),
         ("duration", (s.duration as u64).to_string()),
         ("output-ext", text("format").unwrap_or("opus").into()),
     ];

@@ -14,6 +14,8 @@ spotdl meta ~/Music
 
 Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an action. A query is a Spotify URL or URI, a `.spotdl` file, a YouTube, YouTube Music or SoundCloud URL, or search text (`album:`, `playlist:` and `artist:` pick the result type). Use `youtube-url|spotify-url` to pin the video for a song; a pinned video wins over the search, also when the song appears in another query. An artist link gets every release on the artist page. Each song is downloaded once, from the first album that has it; reissues and singles add only new songs.
 
+In `--output`, `{disc-track-number}` is the track number (`07`), with the disc in front on albums that have more than one disc (`2-07`).
+
 Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`. Use `--key=value` when a value starts with `--`, for example `--yt-dlp-args="--js-runtimes node"`.
 
 Use `--max-retries 3` to set the number of retries after a failed request. Use `--use-cache-file` to keep track data between runs. Use `--no-cache` to turn off local caches.

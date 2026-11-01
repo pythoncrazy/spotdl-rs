@@ -153,6 +153,21 @@ fn rejects_bad_options_and_unsafe_paths() {
     assert!(list.contains("\nsafe/....etc.opus\n"), "{list}");
     let text = ok(spotdl(&dir, &["save", "local.spotdl", "--save-file", "-", "--output", ""]));
     assert!(text.contains("A - ．．／．．／etc: A - ．．／．．／etc.opus"), "{text}");
+
+    // Multi-disc albums number tracks "2-07", so two discs' track 7 do not share a path.
+    let song = |disc: u32, count: u32| {
+        json!({"name": format!("S{disc}{count}"), "artist": "A", "artists": ["A"],
+        "album_name": "Album", "track_number": 7, "disc_number": disc, "disc_count": count,
+        "url": format!("https://open.spotify.com/track/01234567890123456789{disc}{count}")})
+    };
+    fs::write(dir.join("discs.spotdl"), json!([song(1, 2), song(2, 2), song(1, 1)]).to_string()).unwrap();
+    let text = ok(spotdl(
+        &dir,
+        &["save", "discs.spotdl", "--save-file", "-", "--output", "{title} {disc-track-number}.{output-ext}"],
+    ));
+    for line in ["S12 1-07.opus", "S22 2-07.opus", "S11 07.opus"] {
+        assert!(text.contains(line), "{line} not in {text}");
+    }
 }
 
 #[test]
