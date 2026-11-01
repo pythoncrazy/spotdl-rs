@@ -67,7 +67,8 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
             Err(error) => error,
         };
         let has = |signs: &[&str]| signs.iter().any(|sign| error.contains(sign));
-        let blocked = has(&["not a bot", "HTTP Error 403", "HTTP Error 429", "Too Many Requests"]);
+        let blocked =
+            has(&["not a bot", "HTTP Error 403", "HTTP 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]);
         let transient = has(&["Requested format is not available", "Failed to extract any player response"]);
         if attempt >= number("max_retries") || !(blocked || transient) {
             return Err(error.into());
@@ -265,7 +266,9 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let reply = cached(&format!("ytm{body}"), 7, || {
         let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-        let reply: Value = http_json(url, &[("Content-Type", "application/json")], Some(&body))?;
+        let reply: Value = youtube(|| {
+            http_json(url, &[("Content-Type", "application/json")], Some(&body)).map_err(|error| error.to_string())
+        })?;
         reply.get("contents").is_some().then_some(reply).ok_or_else(|| "unexpected YouTube Music response".into())
     })?;
     Ok(ytm_hits(&reply, songs, isrc))
