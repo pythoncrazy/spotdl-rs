@@ -1,11 +1,9 @@
-use crate::{cached, download, http_json, list, log, now, number, on, spotify, text, Song, HOME, R};
+use crate::{cached, download, http_json, list, log, now, number, on, spotify, text, Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    fs,
-    path::PathBuf,
     process::Command,
-    sync::{atomic::AtomicU64, atomic::Ordering::Relaxed, OnceLock},
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
 
@@ -13,22 +11,6 @@ const REJECTED: &str = "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed s
 const PENALIZED: &str = "remaster remastered lyrics lyric visualizer video edit";
 const SUFFIXES: &str =
     "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
-
-// Logged-out YouTube makes clients wait out a pre-roll ad; the cached preprocessed player saves a JS solve per run.
-const PLUGIN: &str = r#"import time
-from yt_dlp.extractor.youtube import YoutubeIE
-
-try:
-    from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
-    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
-except ImportError:
-    pass
-
-
-class NoAdWaitYoutubeIE(YoutubeIE, plugin_name='spotdl'):
-    def _get_available_at_timestamp(self, *args, **kwargs):
-        return int(time.time())
-"#;
 
 /// Until when (Unix seconds) every thread holds off YouTube after it blocked us.
 static PAUSE: AtomicU64 = AtomicU64::new(0);
@@ -100,23 +82,11 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
 }
 
 pub fn yt_dlp() -> Command {
-    static PLUGINS: OnceLock<Option<PathBuf>> = OnceLock::new();
-    let plugins = PLUGINS.get_or_init(|| {
-        let file = HOME.join("yt-dlp-plugins/spotdl/yt_dlp_plugins/extractor/spotdl_no_ad_wait.py");
-        fs::create_dir_all(file.parent()?).ok()?;
-        if fs::read_to_string(&file).ok().as_deref() != Some(PLUGIN) {
-            fs::write(&file, PLUGIN).ok()?;
-        }
-        Some(HOME.join("yt-dlp-plugins"))
-    });
     let mut command = Command::new(text("yt_dlp").unwrap_or("yt-dlp"));
     // Deno is on by default; these are used when it is missing.
     command.args(["--js-runtimes", "node", "--js-runtimes", "bun"]);
     for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
         command.args(text(key).map(|value| [flag, value]).into_iter().flatten());
-    }
-    if let Some(dir) = plugins {
-        command.arg("--plugin-dirs").arg(dir);
     }
     command.args(text("yt_dlp_args").unwrap_or_default().split_whitespace());
     command

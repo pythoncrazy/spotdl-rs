@@ -156,7 +156,8 @@ fn downloads_tags_and_repairs_metadata() {
     let albums = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.is_dir());
     let files: Vec<PathBuf> =
         albums.flat_map(|album| fs::read_dir(album).unwrap().map(|entry| entry.unwrap().path())).collect();
-    let audio: Vec<&PathBuf> = files.iter().filter(|file| file.extension().unwrap() == "opus").collect();
+    let audio: Vec<&PathBuf> =
+        files.iter().filter(|file| file.extension().is_some_and(|extension| extension == "opus")).collect();
     assert_eq!(audio.len(), 2, "{files:?}");
     for file in &audio {
         let tagged = lofty::read_from_path(file).unwrap();

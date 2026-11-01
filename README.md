@@ -2,7 +2,7 @@
 
 Use this program to get audio for Spotify songs, albums, playlists, and artists. It finds each song on YouTube Music, prefers the label's official audio and the same clean or explicit edit, and tags the file with Spotify and Deezer metadata and lyrics.
 
-The program needs `yt-dlp` and FFmpeg in `PATH` (or set `--yt-dlp` and `--ffmpeg`). For reliable YouTube downloads, also have Deno, Node.js, or Bun in `PATH`. A small yt-dlp plugin in `~/.spotdl/yt-dlp-plugins` skips the pre-roll ad wait that logged-out YouTube imposes.
+The program needs `yt-dlp` and FFmpeg in `PATH` (or set `--yt-dlp` and `--ffmpeg`). For reliable YouTube downloads, also have Deno, Node.js, or Bun in `PATH`.
 
 ```sh
 spotdl <Spotify URL>
