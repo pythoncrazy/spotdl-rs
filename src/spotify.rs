@@ -1,4 +1,4 @@
-use crate::{cached, http, http_json, number, on, search, url_encode, Song, HOME, R};
+use crate::{cached, http, http_json, number, on, search, url_encode, Pace, Song, HOME, R};
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -19,7 +19,9 @@ const QUERIES: [&str; 5] = ["getTrack", "getAlbum", "fetchPlaylist", "queryArtis
 
 static SESSION: Mutex<Option<Arc<Value>>> = Mutex::new(None);
 static ALBUMS: LazyLock<Mutex<HashMap<String, Arc<Value>>>> = LazyLock::new(Default::default);
-static DEEZER: LazyLock<Mutex<HashMap<String, Arc<OnceLock<Value>>>>> = LazyLock::new(Default::default);
+static DEEZER_ALBUMS: LazyLock<Mutex<HashMap<String, Arc<OnceLock<Value>>>>> = LazyLock::new(Default::default);
+/// Deezer allows 50 requests in 5 seconds.
+static DEEZER: Pace = Pace::new(110);
 
 /// The web player's TOTP: HOTP-SHA1 of the 30-second step, keyed by the digits of the XOR-ed secret.
 fn totp(secret: &[u8]) -> String {
@@ -224,13 +226,23 @@ fn track(uri: &str) -> R<Value> {
 
 fn artist(uri: &str) -> R<Vec<Song>> {
     let releases = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50)?.1;
+    let mut releases: Vec<&Value> = releases.iter().map(|release| &release["releases"]["items"][0]).collect();
+    // Each song is kept once, from its first release in this order: albums, EPs, singles, then compilations;
+    // originals before reissues, and standard before deluxe editions. Remasters and outtake sets so do not take
+    // songs away from the original albums.
+    let kind =
+        |release: &Value| ["ALBUM", "EP", "SINGLE", "COMPILATION"].iter().position(|kind| release["type"] == *kind);
+    let date = |release: &Value| release["date"]["isoString"].as_str().unwrap_or_default().to_string();
+    releases
+        .sort_by_key(|release| (kind(release).unwrap_or(4), date(release), release["tracks"]["totalCount"].as_u64()));
     let mut seen = HashSet::new();
-    let albums = releases.iter().filter_map(|release| release["releases"]["items"][0]["uri"].as_str());
-    let albums: Vec<&str> = albums.filter(|uri| seen.insert(*uri)).collect();
+    let albums: Vec<&str> =
+        releases.iter().filter_map(|release| release["uri"].as_str()).filter(|uri| seen.insert(*uri)).collect();
     let tracks = albums.into_par_iter().map(album).collect::<R<Vec<_>>>()?;
-    let mut seen = HashSet::new();
     let songs = build(tracks.into_iter().flatten().collect(), Song::default())?;
-    Ok(songs.into_iter().filter(|song| seen.insert((song.name.to_lowercase(), song.artists.clone()))).collect())
+    let mut seen = HashSet::new();
+    let key = |song: &Song| (search::versionless(&song.name).to_lowercase(), song.artists.clone());
+    Ok(songs.into_iter().filter(|song| seen.insert(key(song))).collect())
 }
 
 fn playlist(uri: &str) -> R<Vec<Song>> {
@@ -320,61 +332,97 @@ pub fn resolve(text: &str) -> R<Vec<Song>> {
 }
 
 fn deezer(url: &str) -> R<Value> {
-    for wait in [0, 2, 5] {
-        std::thread::sleep(Duration::from_secs(wait));
+    for attempt in 0..6 {
+        DEEZER.wait();
         let reply: Value = http_json(url, &[], None)?;
         if reply["error"]["code"] != 4 {
             return Ok(reply);
         }
+        std::thread::sleep(Duration::from_secs(1 << attempt));
     }
     Err("Deezer rate limit".into())
 }
 
-/// Deezer's copy of the song's album, found by title: genres, UPC, label, release date and track ISRCs.
+/// The title before a " (Deluxe Edition)", " [Remastered]" or " - Single" note.
+fn base_title(title: &str) -> &str {
+    [" (", " [", " - "].iter().filter_map(|note| title.find(note)).min().map_or(title, |end| &title[..end])
+}
+
+fn genres(album: &Value) -> Vec<Value> {
+    album["genres"]["data"].as_array().into_iter().flatten().map(|genre| genre["name"].clone()).collect()
+}
+
+/// Deezer's copy of the song's album: genres, UPC, label, release date and track ISRCs. Deezer's search misses
+/// some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)"), so the album is
+/// also looked for in the artist's discography. When no album matches, the genres come from the album that has
+/// the song, or else from the artist's most common genre.
 fn deezer_album(song: &Song) -> R<Value> {
-    cached(&format!("deezer2:{}", song.album_id), 7, || {
-        let query = url_encode(&format!("{} {}", song.album_artist, song.album_name));
-        let hits = deezer(&format!("https://api.deezer.com/search/album?q={query}"))?;
-        let close = |a: &str, b: &Value| {
+    cached(&format!("deezer4:{}", song.album_id), 7, || {
+        let same = |a: &str, b: &Value| {
             search::ratio(&search::slug(a, "-"), &search::slug(b.as_str().unwrap_or_default(), "-")) > 80.0
         };
-        let mut hits = hits["data"].as_array().into_iter().flatten();
-        let Some(hit) = hits
-            .find(|hit| close(&song.album_name, &hit["title"]) && close(&song.album_artist, &hit["artist"]["name"]))
-        else {
-            return Ok(Value::Null);
+        let list = |url: &str| -> R<Vec<Value>> {
+            Ok(serde_json::from_value(deezer(url)?["data"].take()).unwrap_or_default())
         };
-        let id = hit["id"].as_u64().ok_or("Deezer album ID missing")?;
-        let details = deezer(&format!("https://api.deezer.com/album/{id}"))?;
-        let tracks = deezer(&format!("https://api.deezer.com/album/{id}/tracks?limit=500"))?;
-        let tracks: serde_json::Map<String, Value> = tracks["data"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(|(i, track)| {
-                let position = format!(
-                    "{}:{}",
-                    track["disk_number"].as_u64().unwrap_or(1),
-                    track["track_position"].as_u64().unwrap_or(i as u64 + 1)
-                );
-                (
-                    position,
-                    json!({"isrc": track["isrc"], "duration": track["duration"], "explicit": track["explicit_lyrics"]}),
-                )
-            })
-            .collect();
-        let genres: Vec<&Value> =
-            details["genres"]["data"].as_array().into_iter().flatten().map(|genre| &genre["name"]).collect();
-        Ok(
-            json!({"genres": genres, "upc": details["upc"], "label": details["label"], "release_date": details["release_date"], "tracks": tracks}),
-        )
+        let find =
+            |kind: &str, query: &str| list(&format!("https://api.deezer.com/search/{kind}?q={}", url_encode(query)));
+        let title = |hit: &Value| base_title(hit["title"].as_str().unwrap_or_default()).to_string();
+        let pick = |albums: &[Value]| {
+            let full = albums.iter().find(|hit| same(&song.album_name, &hit["title"]));
+            full.or_else(|| albums.iter().find(|hit| same(base_title(&song.album_name), &json!(title(hit)))))
+                .and_then(|album| album["id"].as_u64())
+        };
+        let hits = find("album", &format!("{} {}", song.album_artist, base_title(&song.album_name)))?;
+        let hits: Vec<Value> =
+            hits.into_iter().filter(|hit| same(&song.album_artist, &hit["artist"]["name"])).collect();
+        let mut discography = None;
+        let mut id = pick(&hits);
+        if id.is_none() {
+            let artists = find("artist", &song.album_artist)?;
+            if let Some(artist) = artists.iter().find(|hit| same(&song.album_artist, &hit["name"])) {
+                let albums = list(&format!("https://api.deezer.com/artist/{}/albums?limit=500", artist["id"]))?;
+                id = pick(&albums);
+                discography = Some(albums);
+            }
+        }
+        if let Some(id) = id {
+            let details = deezer(&format!("https://api.deezer.com/album/{id}"))?;
+            let tracks = deezer(&format!("https://api.deezer.com/album/{id}/tracks?limit=500"))?;
+            let tracks = tracks["data"].as_array().into_iter().flatten().enumerate().map(|(i, track)| {
+                let (disc, position) = (track["disk_number"].as_u64().unwrap_or(1), track["track_position"].as_u64());
+                let data =
+                    json!({"isrc": track["isrc"], "duration": track["duration"], "explicit": track["explicit_lyrics"]});
+                (format!("{disc}:{}", position.unwrap_or(i as u64 + 1)), data)
+            });
+            let tracks: serde_json::Map<String, Value> = tracks.collect();
+            let (upc, label, date) = (&details["upc"], &details["label"], &details["release_date"]);
+            return Ok(
+                json!({"genres": genres(&details), "upc": upc, "label": label, "release_date": date, "tracks": tracks}),
+            );
+        }
+        let query = format!("artist:\"{}\" track:\"{}\"", song.artist, search::versionless(&song.name));
+        let tracks = find("track", &query)?;
+        let same_song = |track: &&Value| {
+            let length = (track["duration"].as_f64().unwrap_or_default() - song.duration).abs();
+            same(&song.artist, &track["artist"]["name"]) && length <= 3.0
+        };
+        if let Some(id) = tracks.iter().find(same_song).and_then(|track| track["album"]["id"].as_u64()) {
+            return Ok(json!({"genres": genres(&deezer(&format!("https://api.deezer.com/album/{id}"))?)}));
+        }
+        let mut counts = HashMap::new();
+        for genre in discography.iter().flatten().filter_map(|album| album["genre_id"].as_i64()).filter(|id| *id > 0) {
+            *counts.entry(genre).or_insert(0) += 1;
+        }
+        Ok(match counts.into_iter().max_by_key(|(id, count)| (*count, -id)) {
+            Some((id, _)) => json!({"genres": [deezer(&format!("https://api.deezer.com/genre/{id}"))?["name"]]}),
+            None => Value::Null,
+        })
     })
 }
 
 /// Adds Deezer's genres, label, UPC, original date, ISRC, BPM and gain.
 pub fn enrich(song: &mut Song) {
-    let cell = DEEZER
+    let cell = DEEZER_ALBUMS
         .lock()
         .ok()
         .filter(|_| !song.album_id.is_empty())

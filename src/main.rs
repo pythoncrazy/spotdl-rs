@@ -10,8 +10,8 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{LazyLock, OnceLock},
-    time::{Duration, UNIX_EPOCH},
+    sync::{LazyLock, Mutex, OnceLock, PoisonError},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -107,6 +107,25 @@ pub fn number(key: &str) -> u64 {
 
 pub fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
+}
+
+/// Spaces the requests to one site `ms` apart, across all threads.
+pub struct Pace(Mutex<Option<Instant>>, u64);
+
+impl Pace {
+    pub const fn new(ms: u64) -> Self {
+        Self(Mutex::new(None), ms)
+    }
+
+    pub fn wait(&self) {
+        let slot = {
+            let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let slot = next.map_or(Instant::now(), |next| next.max(Instant::now()));
+            *next = Some(slot + Duration::from_millis(self.1));
+            slot
+        };
+        std::thread::sleep(slot.saturating_duration_since(Instant::now()));
+    }
 }
 
 pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {

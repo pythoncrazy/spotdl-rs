@@ -79,6 +79,20 @@ fn save_keeps_pins_and_lists_every_song() {
 }
 
 #[test]
+fn artist_keeps_original_albums_whole() {
+    let dir = dir("artist");
+    let file = dir.join("kendrick.spotdl");
+    let kendrick = "https://open.spotify.com/artist/2YZyLoL8N0Wb9xBt1NhZWg";
+    ok(spotdl(&dir, &["save", kendrick, "--save-file", file.to_str().unwrap()]));
+    let songs = json_file(&file);
+    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
+    // The standard albums keep all their songs; reissues add only the songs that the originals do not have.
+    assert_eq!(album("DAMN."), 14);
+    assert_eq!(album("DAMN. COLLECTORS EDITION."), 0);
+    assert_eq!(album("good kid, m.A.A.d city"), 13);
+}
+
+#[test]
 fn url_finds_official_audio() {
     let dir = dir("url");
     for track in [
@@ -169,6 +183,7 @@ fn downloads_tags_and_repairs_metadata() {
         }
         assert!(tag.title().is_some() && tag.album().is_some_and(|album| album.contains("Revolver")));
         assert!(!tag.pictures().is_empty() && skip(file).exists());
+        assert!(tag.genre().is_some_and(|genre| !genre.is_empty()), "{file:?} has no genre");
         assert!(tagged.properties().duration().as_secs() > 100);
     }
     assert_eq!(fs::read_to_string(&archive).unwrap().lines().count(), 2);

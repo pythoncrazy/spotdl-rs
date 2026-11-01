@@ -1,4 +1,4 @@
-use crate::{http, list, log, on, search, spotify, text, url_encode, Song, R};
+use crate::{http, list, log, on, search, spotify, text, url_encode, Pace, Song, R};
 use lofty::{
     config::WriteOptions,
     picture::{MimeType, Picture, PictureType},
@@ -12,8 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{LazyLock, Mutex, OnceLock, PoisonError},
-    time::{Duration, Instant},
+    sync::OnceLock,
 };
 
 /// Template fields that only exist after Deezer enrichment.
@@ -22,8 +21,8 @@ const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
 
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
-static LRCLIB: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
-static GENIUS: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
+static LRCLIB: Pace = Pace::new(750);
+static GENIUS: Pace = Pace::new(1000);
 
 fn path_safe(value: &str) -> String {
     value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect()
@@ -121,17 +120,6 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Waits for this site's next free slot, so all threads together send one request per `ms`.
-fn pace(next: &Mutex<Instant>, ms: u64) {
-    let slot = {
-        let mut next = next.lock().unwrap_or_else(PoisonError::into_inner);
-        let slot = (*next).max(Instant::now());
-        *next = slot + Duration::from_millis(ms);
-        slot
-    };
-    std::thread::sleep(slot.saturating_duration_since(Instant::now()));
-}
-
 /// The text between `start` and `end`, without tags, `<br>` as newlines, and excluded `<div>`s dropped.
 fn html(page: &str, start: &str, end: &str) -> Option<String> {
     let region = page.split_once(start)?.1.split(end).next()?;
@@ -161,7 +149,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
     let (artist, title) = (&song.artist, search::versionless(&song.name));
     let lyrics = match name {
         "synced" => {
-            pace(&LRCLIB, 750);
+            LRCLIB.wait();
             let url = format!(
                 "https://lrclib.net/api/search?artist_name={}&track_name={}",
                 url_encode(artist),
@@ -175,7 +163,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
         "genius" => {
             let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
             let headers: Vec<(&str, &str)> = auth.iter().map(|auth| ("Authorization", auth.as_str())).collect();
-            pace(&GENIUS, 1000);
+            GENIUS.wait();
             let url = format!("https://genius.com/api/search/song?q={}", url_encode(&format!("{artist} {title}")));
             let reply: Value = serde_json::from_str(&get(&url, &headers)?).ok()?;
             let artist = search::slug(artist, "");
@@ -185,7 +173,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
             };
             let page =
                 reply["response"]["sections"][0]["hits"].as_array()?.iter().find(same)?["result"]["url"].as_str()?;
-            pace(&GENIUS, 1000);
+            GENIUS.wait();
             html(&get(page, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
         }
         "azlyrics" => {
