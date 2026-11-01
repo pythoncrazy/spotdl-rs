@@ -1,61 +1,63 @@
-use crate::{Song, R};
+use crate::{cached, download, http_json, list, log, now, number, on, spotify, text, Song, HOME, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
-    sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
-        OnceLock,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{atomic::AtomicU64, atomic::Ordering::Relaxed, OnceLock},
+    time::Duration,
 };
 
-/// YouTube Music's own classification of a video (`musicVideoType`).
+const REJECTED: &str = "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally reversed reverse amv";
+const PENALIZED: &str = "remaster remastered lyrics lyric visualizer video edit";
+const SUFFIXES: &str =
+    "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
+
+// Logged-out YouTube makes clients wait out a pre-roll ad; the cached preprocessed player saves a JS solve per run.
+const PLUGIN: &str = r#"import time
+from yt_dlp.extractor.youtube import YoutubeIE
+
+try:
+    from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
+    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
+except ImportError:
+    pass
+
+
+class NoAdWaitYoutubeIE(YoutubeIE, plugin_name='spotdl'):
+    def _get_available_at_timestamp(self, *args, **kwargs):
+        return int(time.time())
+"#;
+
+/// Until when (Unix seconds) every thread holds off YouTube after it blocked us.
+static PAUSE: AtomicU64 = AtomicU64::new(0);
+
+/// YouTube Music's classification of a video (`musicVideoType`).
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Kind {
-    /// Label-provided audio ("Art Track"): the exact studio recording, no intro or outro.
+    /// Label-provided audio: the exact studio recording.
     Atv,
-    /// Official music video: right recording, but may carry skits, intros or a different edit.
+    /// Official music video: the right recording, but maybe with skits, intros or another edit.
     Omv,
-    /// User upload, or a result whose type YouTube Music didn't report (yt-dlp searches).
+    /// User upload, or a result with no type (yt-dlp searches).
     #[default]
     Other,
 }
 
-impl Kind {
-    fn parse(value: &str) -> Self {
-        match value {
-            "MUSIC_VIDEO_TYPE_ATV" => Self::Atv,
-            "MUSIC_VIDEO_TYPE_OMV" => Self::Omv,
-            _ => Self::Other,
-        }
-    }
-
-    /// Ranking offset: official audio first, then official videos, then everything else.
-    fn bonus(self) -> f64 {
-        match self {
-            Self::Atv => 0.0,
-            Self::Omv => -5.0,
-            Self::Other => -12.0,
-        }
-    }
-}
-
 #[derive(Default)]
-pub struct Hit {
+struct Hit {
     song: Song,
     verified: bool,
     isrc: bool,
     kind: Kind,
-    /// YouTube Music's explicit badge; only meaningful for verified (song) results.
+    /// YouTube Music's explicit badge; only meaningful for song results.
     explicit: bool,
 }
 
-fn hit_song(url: String, name: String, artists: Vec<String>, album: String, duration: f64) -> Song {
-    let artist = artists.first().cloned().unwrap_or_default();
+fn hit(url: String, name: String, artists: Vec<String>, album: String, duration: f64) -> Song {
     let song_id = url.rsplit(['=', '/']).next().unwrap_or_default().to_string();
+    let artist = artists.first().cloned().unwrap_or_default();
     Song {
         name,
         artist,
@@ -69,180 +71,54 @@ fn hit_song(url: String, name: String, artists: Vec<String>, album: String, dura
     }
 }
 
-const REJECTED_VERSIONS: &str =
-    "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally reversed reverse amv";
-const PENALIZED_VERSIONS: &str = "remaster remastered lyrics lyric visualizer video edit";
-const VERSION_SUFFIXES: &str =
-    "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
-
-pub(crate) struct Gate {
-    name: &'static str,
-    until: AtomicU64,
-    strikes: AtomicU64,
-}
-
-impl Gate {
-    const fn new(name: &'static str) -> Self {
-        Self { name, until: AtomicU64::new(0), strikes: AtomicU64::new(0) }
-    }
-}
-
-pub(crate) static SEARCH_GATE: Gate = Gate::new("searches");
-pub(crate) static DOWNLOAD_GATE: Gate = Gate::new("downloads");
-
-fn short_retry_delay() -> Duration {
-    let jitter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 3;
-    Duration::from_secs(3 + u64::from(jitter))
-}
-
-fn with_backoff<T>(
-    gate: &Gate,
-    cfg: &Value,
-    mut attempt: impl FnMut() -> Result<T, String>,
-    retry: impl Fn(&str) -> bool,
-) -> R<T> {
-    let attempts = cfg["max_retries"].as_u64().unwrap_or(3).saturating_add(1);
-    for number in 1..=attempts {
-        let until = gate.until.load(Relaxed);
-        let wait = until.saturating_sub(UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
+/// Runs a YouTube step, retrying transient errors; when YouTube blocks us, every thread pauses.
+pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
+    let mut attempt = 0;
+    loop {
+        let wait = PAUSE.load(Relaxed).saturating_sub(now());
         if wait > 0 {
-            eprintln!("YouTube blocked {}. Waiting {wait} s.", gate.name);
+            log("WARNING", &format!("YouTube is blocking requests; waiting {wait} s"));
+            std::thread::sleep(Duration::from_secs(wait));
         }
-        std::thread::sleep(Duration::from_secs(wait));
-        match attempt() {
-            Ok(value) => {
-                gate.strikes.store(0, Relaxed);
-                return Ok(value);
-            }
-            Err(error) if !retry(&error) => return Err(error.into()),
-            Err(error) if number == attempts => {
-                if number > 1 && !transient(&error) {
-                    strike(gate);
-                }
-                return Err(error.into());
-            }
-            Err(error) if transient(&error) || number == 1 => std::thread::sleep(short_retry_delay()),
-            Err(_) => strike(gate),
+        let error = match step() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let has = |signs: &[&str]| signs.iter().any(|sign| error.contains(sign));
+        let blocked = has(&["not a bot", "HTTP Error 403", "HTTP Error 429", "Too Many Requests"]);
+        let transient = has(&["Requested format is not available", "Failed to extract any player response"]);
+        if attempt >= number("max_retries") || !(blocked || transient) {
+            return Err(error.into());
         }
-    }
-    Err(format!("YouTube blocked {}", gate.name).into())
-}
-
-fn strike(gate: &Gate) {
-    let now = UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
-    let until = gate.until.load(Relaxed);
-    let wait = [30, 60, 120][gate.strikes.load(Relaxed).min(2) as usize];
-    if until <= now && gate.until.compare_exchange(until, now + wait, Relaxed, Relaxed).is_ok() {
-        gate.strikes.fetch_add(1, Relaxed);
+        if blocked && attempt > 0 {
+            PAUSE.fetch_max(now() + (30 << attempt.min(2)), Relaxed);
+        } else {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        attempt += 1;
     }
 }
 
-fn transient(error: &str) -> bool {
-    error.contains("Requested format is not available") || error.contains("Failed to extract any player response")
-}
-
-fn youtube_retryable(error: &str) -> bool {
-    transient(error)
-        || ["not a bot", "HTTP Error 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]
-            .iter()
-            .any(|pattern| error.contains(pattern))
-}
-
-pub(crate) fn yt<T>(cfg: &Value, gate: &Gate, mut run: impl FnMut() -> std::io::Result<(T, String)>) -> R<(T, String)> {
-    with_backoff(
-        gate,
-        cfg,
-        || {
-            let (value, text) = run().map_err(|error| error.to_string())?;
-            if youtube_retryable(&text) {
-                Err(text.trim().to_string())
-            } else {
-                Ok((value, text))
-            }
-        },
-        youtube_retryable,
-    )
-}
-
-fn js_runtime_args(cmd: &mut Command) {
-    let deno = crate::HOME.join(if cfg!(windows) { "deno.exe" } else { "deno" });
-    if deno.is_file() {
-        cmd.args(["--js-runtimes", &format!("deno:{}", deno.display())]);
-        return;
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    if let Some((name, path)) = ["deno", "node", "bun"].into_iter().find_map(|name| {
-        let executable = format!("{name}{suffix}");
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(&executable))
-            .find(|path| path.is_file())
-            .map(|path| (name, path))
-    }) {
-        cmd.args(["--js-runtimes", &format!("{name}:{}", path.display())]);
-    }
-}
-
-// Logged-out YouTube needs the no-ad wait override, preprocessed-player cache, and queue extractor.
-const YT_DLP_PLUGIN_SOURCE: &str = r#"import sys
-import time
-from yt_dlp.extractor.common import InfoExtractor
-from yt_dlp.extractor.youtube import YoutubeIE
-
-try:
-    from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
-    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
-except ImportError:
-    pass
-
-
-class NoAdWaitYoutubeIE(YoutubeIE, plugin_name='spotdl'):
-    def _get_available_at_timestamp(self, *args, **kwargs):
-        return int(time.time())
-
-
-class SpotdlQueueIE(InfoExtractor):
-    _VALID_URL = r'spotdl-queue:'
-
-    def _entries(self):
-        for line in sys.stdin:
-            url, _, template = line.rstrip('\n').partition('\t')
-            self._downloader.params['outtmpl'] = {'default': template}
-            yield self.url_result(url)
-            print('SPOTDL-DONE', flush=True)
-
-    def _real_extract(self, url):
-        return self.playlist_result(self._entries())
-"#;
-
-static YT_DLP_PLUGIN_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-fn yt_dlp_plugin_dir() -> Option<&'static Path> {
-    YT_DLP_PLUGIN_DIR
-        .get_or_init(|| {
-            let dir = crate::HOME.join("yt-dlp-plugins");
-            let file = dir.join("spotdl/yt_dlp_plugins/extractor/spotdl_no_ad_wait.py");
-            fs::create_dir_all(file.parent()?).ok()?;
-            if fs::read_to_string(&file).ok().as_deref() != Some(YT_DLP_PLUGIN_SOURCE) {
-                fs::write(file, YT_DLP_PLUGIN_SOURCE).ok()?;
-            }
-            Some(dir)
-        })
-        .as_deref()
-}
-
-pub(crate) fn yt_dlp(cfg: &Value) -> Command {
-    let mut command = Command::new(cfg["yt_dlp"].as_str().unwrap_or("yt-dlp"));
+pub fn yt_dlp() -> Command {
+    static PLUGINS: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let plugins = PLUGINS.get_or_init(|| {
+        let file = HOME.join("yt-dlp-plugins/spotdl/yt_dlp_plugins/extractor/spotdl_no_ad_wait.py");
+        fs::create_dir_all(file.parent()?).ok()?;
+        if fs::read_to_string(&file).ok().as_deref() != Some(PLUGIN) {
+            fs::write(&file, PLUGIN).ok()?;
+        }
+        Some(HOME.join("yt-dlp-plugins"))
+    });
+    let mut command = Command::new(text("yt_dlp").unwrap_or("yt-dlp"));
+    // Deno is on by default; these are used when it is missing.
+    command.args(["--js-runtimes", "node", "--js-runtimes", "bun"]);
     for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
-        if let Some(value) = cfg[key].as_str() {
-            command.args([flag, value]);
-        }
+        command.args(text(key).map(|value| [flag, value]).into_iter().flatten());
     }
-    command.args(cfg["yt_dlp_args"].as_str().unwrap_or_default().split_whitespace());
-    if let Some(dir) = yt_dlp_plugin_dir() {
+    if let Some(dir) = plugins {
         command.arg("--plugin-dirs").arg(dir);
     }
-    js_runtime_args(&mut command);
+    command.args(text("yt_dlp_args").unwrap_or_default().split_whitespace());
     command
 }
 
@@ -251,27 +127,7 @@ pub fn slug(s: &str, sep: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(sep)
 }
 
-fn words(song: &Song) -> HashSet<String> {
-    let mut words = HashSet::new();
-    for value in std::iter::once(song.name.as_str())
-        .chain(song.artists.iter().map(String::as_str))
-        .chain([song.album_name.as_str()])
-    {
-        let slugged = slug(value, "-");
-        let tokens = slugged.split('-').filter(|word| !word.is_empty()).collect::<Vec<_>>();
-        words.extend(tokens.iter().map(|word| (*word).to_string()));
-        words.extend(tokens.windows(2).map(|pair| format!("{}{}", pair[0], pair[1])));
-    }
-    words
-}
-
-fn altered(word: &str) -> bool {
-    REJECTED_VERSIONS.split_whitespace().any(|version| version == word)
-        || word
-            .strip_suffix("hz")
-            .is_some_and(|frequency| !frequency.is_empty() && frequency.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
+/// Similarity in percent: twice the longest common subsequence over the total length.
 pub fn ratio(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let row = a.iter().fold(vec![0usize; b.len() + 1], |row, x| {
@@ -288,200 +144,67 @@ pub fn ratio(a: &str, b: &str) -> f64 {
     }
 }
 
+/// Words and joined word pairs of the title, artists and album.
+fn words(song: &Song) -> HashSet<String> {
+    let mut words = HashSet::new();
+    for value in [&song.name, &song.album_name].into_iter().chain(&song.artists) {
+        let slugged = slug(value, "-");
+        let tokens: Vec<&str> = slugged.split('-').filter(|word| !word.is_empty()).collect();
+        words.extend(tokens.iter().map(|word| word.to_string()));
+        words.extend(tokens.windows(2).map(|pair| pair.concat()));
+    }
+    words
+}
+
+fn altered(word: &str) -> bool {
+    let hertz = word.strip_suffix("hz").is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
+    hertz || REJECTED.split(' ').any(|version| version == word)
+}
+
 fn is_version_suffix(suffix: &str) -> bool {
     let words = slug(suffix, "-");
     !words.is_empty()
-        && words.split('-').all(|word| {
-            word.bytes().all(|byte| byte.is_ascii_digit()) || VERSION_SUFFIXES.split(' ').any(|w| w == word)
-        })
+        && words.split('-').all(|w| w.bytes().all(|b| b.is_ascii_digit()) || SUFFIXES.split(' ').any(|s| s == w))
 }
 
-pub(crate) fn versionless(name: &str) -> &str {
-    name.rsplit_once(" - ").filter(|(_, suffix)| is_version_suffix(suffix)).map_or(name, |(title, _)| title)
+/// A credit or soundtrack note rather than another recording: "feat. X", "with X", "From "Top Gun"".
+fn is_note(text: &str) -> bool {
+    matches!(slug(text, "-").split('-').next(), Some("feat" | "ft" | "featuring" | "with" | "from"))
 }
 
-fn ytm_retryable(error: &str) -> bool {
-    let status = error
-        .strip_prefix("HTTP ")
-        .and_then(|error| error.split_whitespace().next())
-        .and_then(|status| status.parse::<u16>().ok());
-    status.is_some_and(|status| status == 403 || status == 429 || status >= 500)
-        || ["timeout", "timed out", "connection", "connect", "network", "transport"]
-            .iter()
-            .any(|sign| error.to_ascii_lowercase().contains(sign))
+/// The title without a " - Remastered 2011" or " - From "Black Panther"" suffix.
+pub fn versionless(name: &str) -> &str {
+    let suffix = |(_, suffix): &(&str, &str)| is_version_suffix(suffix) || is_note(suffix);
+    name.rsplit_once(" - ").filter(suffix).map_or(name, |(title, _)| title)
 }
 
-fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> R<Vec<Hit>> {
-    let tab = &v["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
-    let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
-    let items = shelves.flat_map(|s| s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
-    Ok(items
-        .filter_map(|i| {
-            let r = &i["musicResponsiveListItemRenderer"];
-            let columns = &r["flexColumns"];
-            let meta = columns[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array()?;
-            let kind = |t: &str| -> Vec<String> {
-                let typed = meta.iter().filter(|x| x["navigationEndpoint"]["browseEndpoint"].to_string().contains(t));
-                typed.filter_map(|x| x["text"].as_str().map(String::from)).collect()
-            };
-            let time =
-                meta.last()?["text"].as_str()?.split(':').try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
-            let artists = kind("ARTIST");
-            let artists = match artists.first() {
-                Some(_) => artists,
-                None => vec![meta.first()?["text"].as_str()?.into()],
-            };
-            let config = "/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType";
-            let video_type = [
-                format!("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint{config}"),
-                format!("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint{config}"),
-            ]
-            .iter()
-            .find_map(|path| r.pointer(path).and_then(Value::as_str))
-            .map_or(Kind::Other, Kind::parse);
-            let badges = r["badges"].as_array().into_iter().flatten();
-            let explicit = badges
-                .filter_map(|badge| badge["musicInlineBadgeRenderer"]["icon"]["iconType"].as_str())
-                .any(|icon| icon == "MUSIC_EXPLICIT_BADGE");
-            Some(Hit {
-                kind: video_type,
-                explicit,
-                song: hit_song(
-                    format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
-                    columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"].as_str()?.into(),
-                    artists,
-                    kind("ALBUM").first().cloned().unwrap_or_default(),
-                    time.ok()?,
-                ),
-                verified: songs,
-                isrc,
-            })
-        })
-        .collect())
-}
-
-fn ytm(query: &str, songs: bool, isrc: bool, cfg: &Value) -> R<Vec<Hit>> {
-    let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
-    let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
-    let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
-    let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-    let v = crate::spotify::cached(&format!("ytm{body}"), cfg["no_cache"] != true, false, || {
-        let v: Value = with_backoff(
-            &SEARCH_GATE,
-            cfg,
-            || {
-                crate::http_json("POST", url, &[("Content-Type", "application/json")], Some(body.as_bytes()), cfg)
-                    .map_err(|error| error.to_string())
-            },
-            ytm_retryable,
-        )?;
-        if v.get("contents").is_none() {
-            return Err("unexpected YouTube Music response".into());
-        }
-        Ok(v)
-    })?;
-    ytm_hits(&v, songs, isrc)
-}
-
-fn hits_or_note(first_error: &mut Option<String>, result: R<Vec<Hit>>) -> Vec<Hit> {
-    result.unwrap_or_else(|error| {
-        first_error.get_or_insert(error.to_string());
-        Vec::new()
-    })
-}
-
-pub fn isrc_hit(song: &Song, cfg: &Value) -> R<Option<String>> {
-    let youtube_music = crate::string_values(&cfg["audio_providers"]).any(|provider| provider == "youtube-music");
-    let Some(isrc) = song.isrc.as_ref().filter(|_| youtube_music) else {
-        return Ok(None);
-    };
-    let filter = cfg["filter_results"] != false;
-    let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
-    // This hit skips the text search, so it must also be the same edit: a clean ISRC for an explicit song
-    // (or the reverse) falls through to the text search, which ranks both edits.
-    Ok(ytm(isrc, true, true, cfg)?
-        .into_iter()
-        .filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && hit.explicit == song.explicit)
-        .filter(|hit| rank(hit) > 0.0)
-        .max_by(|a, b| rank(a).total_cmp(&rank(b)))
-        .map(|hit| hit.song.url))
-}
-
-pub(crate) fn first_hit(song: &Song, cfg: &Value) -> R<String> {
-    let isrc = isrc_hit(song, cfg);
-    if let Ok(Some(url)) = isrc.as_ref() {
-        return Ok(url.clone());
-    }
-    find(song, cfg, isrc.err().map(|error| error.to_string()))?.into_iter().next().ok_or("no match".into())
-}
-
-fn ytdlp(search: &str, cfg: &Value) -> R<Vec<Hit>> {
-    let mut cmd = yt_dlp(cfg);
-    cmd.args(["--flat-playlist", "-J", "--no-warnings"]).arg(search);
-    let (out, _) = yt(cfg, &SEARCH_GATE, || {
-        let output = cmd.output()?;
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        Ok((output, stderr))
-    })?;
-    if !out.status.success() {
-        return Err(format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
-    }
-    let mut v: Value = serde_json::from_slice(&out.stdout)?;
-    let entries = match v["entries"].take() {
-        Value::Array(entries) => entries,
-        _ => vec![v],
-    };
-    let hit = |entry: &Value| {
-        let artist = ["artist", "uploader", "channel"].iter().find_map(|key| entry[key].as_str());
-        Some(Hit {
-            song: hit_song(
-                entry["webpage_url"].as_str().or(entry["url"].as_str())?.into(),
-                entry["track"].as_str().or(entry["title"].as_str())?.into(),
-                vec![artist.unwrap_or_default().into()],
-                entry["album"].as_str().unwrap_or_default().into(),
-                entry["duration"].as_f64().unwrap_or_default(),
-            ),
-            ..Hit::default()
-        })
-    };
-    Ok(entries.iter().filter_map(hit).collect())
-}
-
+/// The slugged title without featured artists, soundtrack notes and version groups.
 fn clean_name(name: &str, artists: &[String]) -> String {
-    let mut clean = String::new();
-    let mut rest = name;
+    let (mut clean, mut rest) = (String::new(), name);
     while let Some(open) = rest.find(['(', '[']) {
-        let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else {
-            break;
-        };
+        let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else { break };
         clean.push_str(&rest[..open]);
         let group = &rest[open + 1..close];
-        let words = slug(group, "-");
-        // "(From SUITS: Season 6)" / "(From "Top Gun")" name the soundtrack, not a different recording.
-        let feature = matches!(words.split('-').next(), Some("feat" | "ft" | "featuring" | "with" | "from"));
-        if !feature && !is_version_suffix(group) {
+        if !is_note(group) && !is_version_suffix(group) {
             clean.push_str(&rest[open..=close]);
         }
         rest = &rest[close + 1..];
     }
     clean.push_str(rest);
-    let mut name = format!("-{}-", slug(&clean, "-"));
-    for artist in artists {
-        name = name.replace(&format!("-{}-", slug(artist, "-")), "-");
-    }
+    let name = artists
+        .iter()
+        .fold(format!("-{}-", slug(&clean, "-")), |name, a| name.replace(&format!("-{}-", slug(a, "-")), "-"));
     name.trim_matches('-').into()
 }
 
+/// How well a result matches the song, 0 for a reject; official audio and the right edit rank first.
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
-    let result_words = words(hit);
-    let allowed_words = words(s);
+    let (result_words, allowed_words) = (words(hit), words(s));
     let rejected = result_words.iter().any(|word| altered(word) && !allowed_words.contains(word));
-    let penalized = PENALIZED_VERSIONS
-        .split_whitespace()
-        .filter(|word| result_words.contains(*word) && !allowed_words.contains(*word))
-        .count() as f64;
+    let penalized =
+        PENALIZED.split(' ').filter(|w| result_words.contains(*w) && !allowed_words.contains(*w)).count() as f64;
     let versionless_name = versionless(&s.name);
     let versionless = slug(versionless_name, "-");
     let combined_artists = slug(&hit.artists.join(" "), "-");
@@ -498,96 +221,181 @@ fn score(s: &Song, h: &Hit) -> f64 {
     };
     let count = s.artists.len().max(1) as f64;
     let artists = 100.0 * s.artists.iter().filter(|a| found(a)).count() as f64 / count;
-    let main = hit
-        .artists
-        .iter()
-        .chain([&hit.name, &combined_artists])
-        .map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-")))
-        .fold(0.0, f64::max);
+    let main =
+        hit.artists.iter().chain([&hit.name, &combined_artists]).map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-")));
+    let main = main.fold(0.0, f64::max);
     let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
-    let stripped = clean_name(&hit.name, &s.artists);
-    let bare = clean_name(versionless_name, &s.artists);
-    let name = ratio(&sname, &rname)
-        .max(ratio(&sname, &stripped))
-        .max(ratio(&versionless, &rname))
-        .max(ratio(&versionless, &stripped))
-        .max(ratio(&bare, &stripped));
+    let (stripped, bare) = (clean_name(&hit.name, &s.artists), clean_name(versionless_name, &s.artists));
+    let pairs =
+        [(&sname, &rname), (&sname, &stripped), (&versionless, &rname), (&versionless, &stripped), (&bare, &stripped)];
+    let name = pairs.iter().map(|(a, b)| ratio(a, b)).fold(0.0, f64::max);
     let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
-    let album =
-        if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
+    let album = !hit.album_name.is_empty() && ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) > 80.0;
     let avg = (artists + name) / 2.0;
     let skip = rejected || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
-    // A different album is not evidence of a different recording: the same studio track is published on
-    // singles, deluxe editions and compilations, and the duration already tells versions apart. Penalizing
-    // it (as Python spotDL does) made album-less user uploads beat the label's own audio, so a matching
-    // album only breaks ties.
-    let album = if album > 80.0 { 3.0 } else { 0.0 };
-    // Clean and explicit edits are separate tracks with identical titles; YouTube Music badges them.
+    // The same recording is on singles, deluxe editions and compilations, so a matching album only breaks ties;
+    // penalizing other albums (as Python spotDL does) made album-less uploads beat the label's own audio.
+    let album = if album { 3.0 } else { 0.0 };
+    // Clean and explicit edits are separate tracks with the same title; YouTube Music badges them.
     let edit = if h.verified && h.explicit != s.explicit { -10.0 } else { 0.0 };
-    // A perfect name and artist match skips the time average above, so without this two equally named
-    // official tracks (an original master and a remaster) would tie and the first search result would win.
+    // Without this, a perfect name and artist match would tie an original master with its remaster.
     let closeness = -(0.5 * (s.duration - hit.duration).abs()).min(5.0);
-    let adjusted = avg.min(100.0) - 15.0 * penalized + album + edit + closeness + h.kind.bonus();
+    let kind = match h.kind {
+        Kind::Atv => 0.0,
+        Kind::Omv => -5.0,
+        Kind::Other => -12.0,
+    };
+    let adjusted = avg.min(100.0) - 15.0 * penalized + album + edit + closeness + kind;
     adjusted.max(1.0) * f64::from(u8::from(!skip))
 }
 
-pub fn find(song: &Song, cfg: &Value, prior_error: Option<String>) -> R<Vec<String>> {
-    let query = crate::download::fill(cfg["search_query"].as_str().unwrap_or("{artists} - {title}"), song, cfg);
-    let filter = cfg["filter_results"] != false;
-    let verified = cfg["only_verified_results"] == true;
-    let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
-    let mut found: Vec<(f64, String)> = Vec::new();
-    let mut first_error = prior_error;
-    for provider in crate::string_values(&cfg["audio_providers"]) {
-        let hits = match provider {
-            "youtube-music" => ytm(&query, true, false, cfg),
-            "youtube" => ytdlp(&format!("ytsearch10:{query}"), cfg),
-            _ => ytdlp(&format!("scsearch10:{query}"), cfg),
+fn ytm_hits(reply: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
+    let tab = &reply["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"];
+    let shelves = tab["sectionListRenderer"]["contents"].as_array().into_iter().flatten();
+    let items = shelves.flat_map(|shelf| shelf["musicShelfRenderer"]["contents"].as_array().into_iter().flatten());
+    let parse = |item: &Value| {
+        let r = &item["musicResponsiveListItemRenderer"];
+        let column = |i: usize| &r["flexColumns"][i]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+        let meta = column(1).as_array()?;
+        let linked = |kind: &str| -> Vec<String> {
+            let runs = meta.iter().filter(|run| run["navigationEndpoint"]["browseEndpoint"].to_string().contains(kind));
+            runs.filter_map(|run| run["text"].as_str().map(String::from)).collect()
         };
-        let mut hits = hits_or_note(&mut first_error, hits);
-        let best = hits.iter().map(rank).max_by(f64::total_cmp);
-        if provider == "youtube-music" && !verified && best.is_none_or(|best| best < 80.0) {
-            hits.extend(hits_or_note(&mut first_error, ytm(&query, false, false, cfg)));
+        let time =
+            meta.last()?["text"].as_str()?.split(':').try_fold(0.0, |a, p| p.parse::<f64>().map(|p| a * 60.0 + p));
+        let artists = Some(linked("ARTIST"))
+            .filter(|a| !a.is_empty())
+            .or_else(|| Some(vec![meta.first()?["text"].as_str()?.into()]))?;
+        let config = "/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType";
+        let paths = [
+            format!("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint{config}"),
+            format!("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint{config}"),
+        ];
+        let kind = match paths.iter().find_map(|path| r.pointer(path)?.as_str()) {
+            Some("MUSIC_VIDEO_TYPE_ATV") => Kind::Atv,
+            Some("MUSIC_VIDEO_TYPE_OMV") => Kind::Omv,
+            _ => Kind::Other,
+        };
+        let mut badges = r["badges"].as_array().into_iter().flatten();
+        let explicit =
+            badges.any(|badge| badge["musicInlineBadgeRenderer"]["icon"]["iconType"] == "MUSIC_EXPLICIT_BADGE");
+        let url = format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?);
+        let album = linked("ALBUM").into_iter().next().unwrap_or_default();
+        let song = hit(url, column(0)[0]["text"].as_str()?.into(), artists, album, time.ok()?);
+        Some(Hit { song, verified: songs, isrc, kind, explicit })
+    };
+    items.filter_map(parse).collect()
+}
+
+/// YouTube Music's song results (`songs`) or video results for a query.
+fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
+    let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
+    let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
+    let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
+    let reply = cached(&format!("ytm{body}"), 7, || {
+        let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
+        let reply: Value = http_json(url, &[("Content-Type", "application/json")], Some(&body))?;
+        reply.get("contents").is_some().then_some(reply).ok_or_else(|| "unexpected YouTube Music response".into())
+    })?;
+    Ok(ytm_hits(&reply, songs, isrc))
+}
+
+/// yt-dlp's flat listing of a search (`ytsearch10:...`), video or playlist.
+fn ytdlp(target: &str) -> R<Vec<Hit>> {
+    let stdout = youtube(|| {
+        let out =
+            yt_dlp().args(["--flat-playlist", "-J", "--no-warnings", target]).output().map_err(|e| e.to_string())?;
+        let error = || format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim());
+        out.status.success().then(|| out.stdout.clone()).ok_or_else(error)
+    })?;
+    let mut reply: Value = serde_json::from_slice(&stdout)?;
+    let entries = match reply["entries"].take() {
+        Value::Array(entries) => entries,
+        _ => vec![reply],
+    };
+    let parse = |entry: &Value| {
+        let artist = ["artist", "uploader", "channel"].iter().find_map(|key| entry[key].as_str()).unwrap_or_default();
+        let url = entry["webpage_url"].as_str().or(entry["url"].as_str())?.into();
+        let name = entry["track"].as_str().or(entry["title"].as_str())?.into();
+        let album = entry["album"].as_str().unwrap_or_default().into();
+        Some(Hit {
+            song: hit(url, name, vec![artist.into()], album, entry["duration"].as_f64().unwrap_or_default()),
+            ..Hit::default()
+        })
+    };
+    Ok(entries.iter().filter_map(parse).collect())
+}
+
+/// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
+pub fn find(song: &Song) -> R<Vec<String>> {
+    let query = download::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
+    let filter = crate::cfg()["filter_results"] != false;
+    let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
+    let verified = on("only_verified_results");
+    let (mut found, mut error) = (Vec::<(f64, String)>::new(), None::<String>);
+    let mut note = |result: R<Vec<Hit>>| {
+        result.unwrap_or_else(|e| {
+            error.get_or_insert(e.to_string());
+            Vec::new()
+        })
+    };
+    for provider in list("audio_providers") {
+        let mut hits = match provider {
+            "youtube-music" => note(ytm(&query, true, false)),
+            "youtube" => note(ytdlp(&format!("ytsearch10:{query}"))),
+            _ => note(ytdlp(&format!("scsearch10:{query}"))),
+        };
+        if provider == "youtube-music" {
+            // The ISRC search skips the text match, so it must also be the same length and edit.
+            let isrc = song.isrc.as_deref().map_or_else(|| Ok(Vec::new()), |isrc| ytm(isrc, true, true));
+            let same = |h: &Hit| (h.song.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
+            found.extend(
+                note(isrc).into_iter().filter(same).map(|h| (rank(&h) + 1000.0, h.song.url)).filter(|c| c.0 > 1000.0),
+            );
+            if !verified && hits.iter().map(rank).fold(0.0, f64::max) < 80.0 {
+                hits.extend(note(ytm(&query, false, false)));
+            }
         }
         let hits = hits.into_iter().filter(|hit| !verified || hit.verified);
         found.extend(hits.map(|hit| (rank(&hit), hit.song.url)).filter(|candidate| candidate.0 > 0.0));
     }
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut seen = HashSet::new();
-    let found: Vec<String> =
-        found.into_iter().map(|candidate| candidate.1).filter(|url| seen.insert(url.clone())).take(3).collect();
-    if found.is_empty() {
-        return Err(first_error
-            .map_or_else(|| format!("no match for {query}"), |error| format!("search failed for {query}: {error}"))
-            .into());
+    let found: Vec<String> = found.into_iter().map(|c| c.1).filter(|url| seen.insert(url.clone())).take(3).collect();
+    match (found.is_empty(), error) {
+        (false, _) => Ok(found),
+        (true, Some(error)) => Err(format!("search failed for {query}: {error}").into()),
+        (true, None) => Err(format!("no match for {query}").into()),
     }
-    Ok(found)
 }
 
-pub(crate) fn apply_ytm_data(song: &mut Song, source: Song, copy: bool) {
-    if copy {
-        song.name = source.name;
-        song.artist = source.artist;
-        song.artists = source.artists;
-        song.duration = source.duration;
-        song.album_name = source.album_name;
-    }
-    song.download_url = source.download_url;
-}
-
-pub fn source(url: &str, cfg: &Value, lookup: bool) -> R<Vec<Song>> {
-    let count =
-        if url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?")) { 1 } else { usize::MAX };
-    let music = url.contains("music.youtube.com");
-    let song = |hit: Hit| {
-        if !lookup || !music {
-            return Some(hit.song);
-        }
-        let query = format!("{} - {}", hit.song.artists.join(", "), hit.song.name);
-        let mut song = crate::spotify::resolve(&query, cfg).ok()?.into_iter().next()?;
-        apply_ytm_data(&mut song, hit.song, cfg["ytm_data"] == true);
-        Some(song)
+/// The Spotify song with a video's URL, and with its title, artists and length when `ytm_data` is on.
+pub fn with_video(song: Song, video: Song) -> Song {
+    let song = match on("ytm_data") {
+        true => Song {
+            name: video.name,
+            artist: video.artist,
+            artists: video.artists,
+            duration: video.duration,
+            album_name: video.album_name,
+            ..song
+        },
+        false => song,
     };
-    Ok(ytdlp(url, cfg)?.into_iter().take(count).filter_map(song).collect())
+    Song { download_url: video.download_url, ..song }
+}
+
+/// Songs for a YouTube or SoundCloud URL; YouTube Music songs get Spotify metadata when `lookup` is set.
+pub fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
+    let single = url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?"));
+    let lookup = lookup && url.contains("music.youtube.com");
+    let song = |hit: Hit| match lookup {
+        false => Some(hit.song),
+        true => {
+            let found = spotify::resolve(&format!("{} - {}", hit.song.artists.join(", "), hit.song.name)).ok()?;
+            Some(with_video(found.into_iter().next()?, hit.song))
+        }
+    };
+    Ok(ytdlp(url)?.into_iter().take(if single { 1 } else { usize::MAX }).filter_map(song).collect())
 }

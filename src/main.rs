@@ -3,37 +3,38 @@ mod search;
 mod spotify;
 
 use rayon::prelude::*;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap},
     fs,
-    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{LazyLock, OnceLock},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
-use zip::ZipArchive;
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 pub static HOME: LazyLock<PathBuf> = LazyLock::new(|| {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     PathBuf::from(home.unwrap_or_default()).join(".spotdl")
 });
 
-const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"auth_token":null,"client_id":"","client_secret":"","no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"cache_path":null,"use_cache_file":false,"max_retries":3,"headless":false,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"user_auth":false,"use_official_api":false,"load_config":true}"#;
-
+const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
 const ALIASES: [(&str, &str); 4] = [
     ("audio", "audio_providers"),
     ("lyrics", "lyrics_providers"),
     ("genius_access_token", "genius_token"),
     ("dont_filter_results", "filter_results"),
 ];
+const PROVIDERS: [(&str, &[&str]); 2] = [
+    ("audio_providers", &["youtube-music", "youtube", "soundcloud"]),
+    ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
+];
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+/// One track, in the `.spotdl` save-file format shared with Python spotDL.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Song {
     pub name: String,
@@ -60,67 +61,79 @@ pub struct Song {
     pub lyrics: Option<String>,
     pub popularity: Option<u64>,
     pub album_id: String,
+    pub artist_id: String,
+    pub album_type: String,
     pub list_name: Option<String>,
     pub list_url: Option<String>,
     pub list_position: Option<usize>,
     pub list_length: Option<usize>,
     #[serde(skip)]
+    pub extra: Extra,
+}
+
+/// Run-time data that the save-file format has no field for.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
     pub list_author: Option<String>,
-    #[serde(skip)]
     pub list_cover_url: Option<String>,
-    pub artist_id: String,
-    pub album_type: String,
-    #[serde(skip)]
     pub original_date: String,
-    #[serde(skip)]
     pub upc: String,
-    #[serde(skip)]
     pub bpm: f64,
-    #[serde(skip)]
     pub gain: f64,
 }
 
-fn init_agent(cfg: &Value) -> &'static ureq::Agent {
-    AGENT.get_or_init(|| {
-        let proxy = cfg["proxy"].as_str().and_then(|proxy| ureq::Proxy::new(proxy).ok());
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
-            .http_status_as_error(false)
-            .max_idle_connections(256)
-            .max_idle_connections_per_host(64)
-            .proxy(proxy)
-            .build();
-        ureq::Agent::new_with_config(config)
-    })
+static CONFIG: OnceLock<Value> = OnceLock::new();
+
+/// Settings: the defaults, then `config.json`, then the command line.
+pub fn cfg() -> &'static Value {
+    CONFIG.get().expect("settings are loaded before use")
 }
 
-pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>, cfg: &Value) -> R<Vec<u8>> {
-    let agent = init_agent(cfg);
-    let attempts = cfg["max_retries"].as_u64().unwrap_or(3).saturating_add(1);
-    let mut attempt = 1;
+pub fn on(key: &str) -> bool {
+    cfg()[key] == true
+}
+
+pub fn text(key: &str) -> Option<&'static str> {
+    cfg()[key].as_str()
+}
+
+pub fn list(key: &str) -> impl Iterator<Item = &'static str> {
+    cfg()[key].as_array().into_iter().flatten().filter_map(Value::as_str)
+}
+
+pub fn number(key: &str) -> u64 {
+    cfg()[key].as_u64().unwrap_or_default()
+}
+
+pub fn now() -> u64 {
+    UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
+}
+
+pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .max_idle_connections_per_host(64)
+        .proxy(text("proxy").and_then(|proxy| ureq::Proxy::new(proxy).ok()))
+        .build();
+    ureq::Agent::new_with_config(config)
+});
+
+/// GET (or POST, given a body), retrying connection errors, 429 and 5xx with exponential backoff.
+pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8>> {
+    let mut attempt = 0;
     loop {
-        let mut request = ureq::http::Request::builder().method(method).uri(url);
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-        let request = request.body(body.unwrap_or_default().to_vec())?;
-        let request = match cfg["timeout"].as_u64() {
-            Some(timeout) => {
-                agent.configure_request(request).timeout_global(Some(Duration::from_secs(timeout))).build()
-            }
-            None => request,
-        };
-        let response = agent.run(request);
-        let retry = match &response {
-            Ok(reply) => reply.status() == 429 || reply.status().is_server_error(),
-            Err(_) => true,
-        };
-        if retry && attempt < attempts {
-            std::thread::sleep(Duration::from_secs(1 << attempt));
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let request = ureq::http::Request::builder().method(method).uri(url);
+        let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
+        let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
+        let retry = reply.as_ref().map_or(true, |reply| reply.status() == 429 || reply.status().is_server_error());
+        if retry && attempt < number("max_retries") {
             attempt += 1;
+            std::thread::sleep(Duration::from_secs(1 << attempt));
             continue;
         }
-        let mut reply = response?;
+        let mut reply = reply?;
         if !reply.status().is_success() {
             return Err(format!("HTTP {} for {url}", reply.status()).into());
         }
@@ -128,255 +141,25 @@ pub fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8
     }
 }
 
-pub fn http_json<T: DeserializeOwned>(m: &str, url: &str, h: &[(&str, &str)], b: Option<&[u8]>, cfg: &Value) -> R<T> {
-    Ok(serde_json::from_slice(&http(m, url, h, b, cfg)?)?)
+pub fn http_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<T> {
+    Ok(serde_json::from_slice(&http(url, headers, body)?)?)
 }
 
-pub(crate) fn string_values(value: &Value) -> impl Iterator<Item = &str> {
-    value.as_array().into_iter().flatten().filter_map(Value::as_str)
-}
-
-fn exe(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.into()
-    }
-}
-
-fn yt_dlp_release() -> R<(&'static str, &'static str)> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok(("yt-dlp_linux.zip", "yt-dlp_linux")),
-        ("linux", "aarch64") => Ok(("yt-dlp_linux_aarch64.zip", "yt-dlp_linux_aarch64")),
-        ("macos", "x86_64" | "aarch64") => Ok(("yt-dlp_macos.zip", "yt-dlp_macos")),
-        ("windows", "x86_64") => Ok(("yt-dlp_win.zip", "yt-dlp.exe")),
-        _ => Err("yt-dlp onedir build is not available for this system".into()),
-    }
-}
-
-fn installed_yt_dlp(home: &Path) -> Option<PathBuf> {
-    let legacy = home.join(exe("yt-dlp"));
-    yt_dlp_release()
-        .ok()
-        .map(|(_, executable)| home.join("yt-dlp_dist").join(executable))
-        .filter(|path| path.is_file())
-        .or_else(|| legacy.is_file().then_some(legacy))
-}
-
-fn settings(args: &[String]) -> R<(String, Vec<String>, Value)> {
-    let config_flag = args.iter().position(|arg| arg == "--config" || arg.starts_with("--config="));
-    let config_path = match config_flag {
-        Some(index) => PathBuf::from(
-            args[index]
-                .strip_prefix("--config=")
-                .filter(|path| !path.is_empty())
-                .or_else(|| args.get(index + 1).filter(|arg| !arg.starts_with("--")).map(String::as_str))
-                .ok_or("--config requires a file path")?,
-        ),
-        None => HOME.join("config.json"),
-    };
-    if config_flag.is_some() && !config_path.is_file() {
-        return Err(format!("config file not found: {}", config_path.display()).into());
-    }
-    let mut raw: Value = serde_json::from_str(DEFAULTS)?;
-    if config_path.is_file() {
-        let config: Value = serde_json::from_slice(&fs::read(&config_path)?)?;
-        if config_flag.is_some() || config["load_config"].as_bool().unwrap_or(true) {
-            config.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null()).for_each(|(key, value)| {
-                raw[key] = value.clone();
-            });
+/// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all).
+pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
+    let path = HOME.join("cache").join(&format!("{:x}", Sha1::digest(key))[..16]);
+    let days = if on("no_cache") { 0 } else { days };
+    let age = fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|time| time.elapsed().ok());
+    if age.is_some_and(|age| age.as_secs() / 86_400 < days) {
+        if let Some(value) = fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+            return Ok(value);
         }
     }
-    if raw["cache_path"].is_null() {
-        raw["cache_path"] = json!(HOME.join(".spotipy").to_string_lossy());
+    let value = fetch()?;
+    if days > 0 {
+        let _ = fs::create_dir_all(HOME.join("cache")).and_then(|_| fs::write(&path, value.to_string()));
     }
-    let mut positional = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let Some(argument) = args[i].strip_prefix("--") else {
-            positional.push(args[i].clone());
-            i += 1;
-            continue;
-        };
-        let (raw_key, inline_value) =
-            argument.split_once('=').map_or((argument, None), |(key, value)| (key, Some(value)));
-        let raw_key = raw_key.replace('-', "_");
-        if raw_key == "config" {
-            i += usize::from(inline_value.is_none() && args.get(i + 1).is_some_and(|value| !value.starts_with("--")))
-                + 1;
-            continue;
-        }
-        let key = ALIASES.iter().find(|a| a.0 == raw_key.as_str()).map_or(raw_key.as_str(), |a| a.1);
-        let rest = inline_value.map_or_else(
-            || args[i + 1..].iter().map(String::as_str).take_while(|v| !v.starts_with("--")).collect(),
-            |value| vec![value],
-        );
-        let values =
-            rest.iter().flat_map(|v| v.split(',')).map(str::trim).filter(|v| !v.is_empty()).collect::<Vec<_>>();
-        let (take, value) = match (raw.get(key), rest.first().copied()) {
-            (Some(Value::Array(_)), _) => (rest.len(), json!(values)),
-            (Some(Value::Bool(_)), v) => (
-                usize::from(matches!(v, Some("true" | "false"))),
-                json!(raw_key != "dont_filter_results" && v != Some("false")),
-            ),
-            (Some(Value::Number(_)), Some(v)) => (1, json!(v.parse::<usize>()?)),
-            (Some(_), Some(v)) => (1, json!(v)),
-            (Some(Value::String(_) | Value::Number(_)), None) => {
-                return Err(format!("missing value for --{raw_key}").into());
-            }
-            (Some(_), _) => (0, json!("")),
-            (None, _)
-                if !["help", "check_for_updates", "download_ffmpeg", "download_deno", "download_yt_dlp"]
-                    .contains(&key) =>
-            {
-                return Err(format!("unknown option --{raw_key}").into());
-            }
-            (None, _) => (0, json!(true)),
-        };
-        raw[key] = value;
-        i += if inline_value.is_some() { 1 } else { take + 1 };
-    }
-    if raw["m3u"].is_boolean() {
-        let enabled = raw["m3u"] == true;
-        raw["m3u"] = if enabled { json!("true") } else { Value::Null };
-    }
-    let explicit_ffmpeg = args.iter().any(|arg| arg == "--ffmpeg");
-    let local_ffmpeg = HOME.join(exe("ffmpeg"));
-    if !explicit_ffmpeg && raw["ffmpeg"] == "ffmpeg" && local_ffmpeg.is_file() {
-        raw["ffmpeg"] = json!(local_ffmpeg.to_string_lossy());
-    }
-    let explicit_yt_dlp = args.iter().any(|arg| arg == "--yt-dlp" || arg.starts_with("--yt-dlp="));
-    if !explicit_yt_dlp && raw["yt_dlp"] == "yt-dlp" {
-        if let Some(path) = installed_yt_dlp(&HOME) {
-            raw["yt_dlp"] = json!(path.to_string_lossy());
-        }
-    }
-    let known = ["download", "save", "sync", "url", "meta"].contains(&positional.first().map_or("", String::as_str));
-    let op = if known { positional.remove(0) } else { "download".into() };
-    let providers = [
-        ("audio_providers", "audio", &["youtube-music", "youtube", "soundcloud"][..]),
-        ("lyrics_providers", "lyrics", &["genius", "azlyrics", "musixmatch", "synced"][..]),
-    ];
-    for (key, label, allowed) in providers {
-        if let Some(provider) = string_values(&raw[key]).find(|provider| !allowed.contains(provider)) {
-            return Err(format!("unknown {label} provider: {provider}").into());
-        }
-    }
-    Ok((op, positional, raw))
-}
-
-fn write_default_config() -> R<()> {
-    let mut defaults: Value = serde_json::from_str(DEFAULTS)?;
-    defaults["cache_path"] = json!(HOME.join(".spotipy").to_string_lossy());
-    fs::create_dir_all(&*HOME)?;
-    fs::write(HOME.join("config.json"), serde_json::to_vec_pretty(&defaults)?)?;
-    println!("Config file generated at {}", HOME.join("config.json").display());
-    Ok(())
-}
-
-fn install(tool: &str, cfg: &Value) -> R<()> {
-    let table: &[(&str, &str, Option<&str>)] = &[
-        ("windows-x86_64", "win32-x64", Some("x86_64-pc-windows-msvc")),
-        ("windows-x86", "win32-ia32", None),
-        ("windows-aarch64", "", Some("aarch64-pc-windows-msvc")),
-        ("linux-x86_64", "linux-x64", Some("x86_64-unknown-linux-gnu")),
-        ("linux-x86", "linux-ia32", None),
-        ("linux-arm", "linux-arm", None),
-        ("linux-aarch64", "linux-arm64", Some("aarch64-unknown-linux-gnu")),
-        ("macos-x86_64", "darwin-x64", Some("x86_64-apple-darwin")),
-        ("macos-aarch64", "darwin-arm64", Some("aarch64-apple-darwin")),
-    ];
-    let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let platform_entry = || table.iter().find(|entry| entry.0 == target);
-    fs::create_dir_all(&*HOME)?;
-    let file = match tool {
-        "ffmpeg" => {
-            let name = platform_entry()
-                .map(|entry| entry.1)
-                .filter(|name| !name.is_empty())
-                .ok_or(format!("{tool} binary is not available for this system"))?;
-            let file = HOME.join(exe("ffmpeg"));
-            let url = format!("https://github.com/eugeneware/ffmpeg-static/releases/download/b4.4/{name}");
-            fs::write(&file, http("GET", &url, &[], None, cfg)?)?;
-            file
-        }
-        "yt-dlp" => {
-            let (name, executable) = yt_dlp_release()?;
-            let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}");
-            let bytes = http("GET", &url, &[("User-Agent", "spotdl-rs")], None, cfg)?;
-            let distribution = HOME.join("yt-dlp_dist");
-            let _ = fs::remove_dir_all(&distribution);
-            ZipArchive::new(Cursor::new(bytes))?.extract(&distribution)?;
-            distribution.join(executable)
-        }
-        "deno" => {
-            let name = platform_entry()
-                .and_then(|entry| entry.2)
-                .ok_or(format!("{tool} binary is not available for this system"))?;
-            let latest = String::from_utf8(http("GET", "https://dl.deno.land/release-latest.txt", &[], None, cfg)?)?;
-            let url = format!("https://dl.deno.land/release/{}/deno-{name}.zip", latest.trim());
-            let mut archive = ZipArchive::new(Cursor::new(http("GET", &url, &[], None, cfg)?))?;
-            let executable = exe("deno");
-            let file = HOME.join(&executable);
-            let mut binary = Vec::new();
-            archive.by_name(&executable)?.read_to_end(&mut binary)?;
-            fs::write(&file, binary)?;
-            file
-        }
-        _ => return Err(format!("{tool} binary is not available for this system").into()),
-    };
-    if !file.is_file() || file.metadata()?.len() == 0 {
-        return Err(format!("Could not install {tool}").into());
-    }
-    #[cfg(unix)]
-    fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    println!("{tool} installed at {}", file.display());
-    Ok(())
-}
-
-fn check_for_updates(cfg: &Value) -> R<()> {
-    let url = "https://api.github.com/repos/pythoncrazy/spotdl-rs/releases/latest";
-    let release: Value = match http_json("GET", url, &[("User-Agent", "spotdl-rs")], None, cfg) {
-        Ok(release) => release,
-        Err(error) if error.to_string().starts_with("HTTP 404") => {
-            println!("No release found.");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let latest = release["tag_name"].as_str().ok_or("GitHub release has no tag_name")?;
-    let current = env!("CARGO_PKG_VERSION");
-    let parts = |version: &str| {
-        let numbers = version.trim_start_matches('v').split('.').map(|part| part.parse().unwrap_or(0));
-        numbers.collect::<Vec<u64>>()
-    };
-    if parts(latest) > parts(current) {
-        println!("New version available: {latest}. Current version: {current}.");
-    } else {
-        println!("No updates available. Current version: {current}.");
-    }
-    Ok(())
-}
-
-pub fn log(cfg: &Value, level: &str, message: &str) {
-    let severity = |name: &str| match name.to_ascii_uppercase().as_str() {
-        "DEBUG" => 10,
-        "WARNING" | "WARN" => 30,
-        "ERROR" | "CRITICAL" => 40,
-        _ => 20,
-    };
-    if severity(level) < severity(cfg["log_level"].as_str().unwrap_or("INFO")) {
-        return;
-    }
-    let time = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
-    let line = cfg["log_format"].as_str().map_or_else(
-        || format!("{level}: {message}"),
-        |format| {
-            let format = format.replace("%(asctime)s", &time.to_string()).replace("%(name)s", "spotdl");
-            format.replace("%(levelname)s", level).replace("%(message)s", message)
-        },
-    );
-    eprintln!("{line}");
+    Ok(value)
 }
 
 pub fn url_encode(value: &str) -> String {
@@ -385,131 +168,190 @@ pub fn url_encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, UNRESERVED).to_string()
 }
 
-fn number(mut songs: Vec<Song>, cfg: &Value) -> Vec<Song> {
-    let numbering = cfg["playlist_numbering"] == true;
-    let retain = cfg["playlist_retain_track_cover"] == true;
+pub fn log(level: &str, message: &str) {
+    let rank = |name: &str| match name.to_ascii_uppercase().as_str() {
+        "DEBUG" => 0,
+        "WARNING" | "WARN" => 2,
+        "ERROR" | "CRITICAL" => 3,
+        _ => 1,
+    };
+    if rank(level) < rank(text("log_level").unwrap_or("INFO")) {
+        return;
+    }
+    let line = text("log_format").map_or_else(
+        || format!("{level}: {message}"),
+        |format| {
+            let format = format.replace("%(asctime)s", &now().to_string()).replace("%(name)s", "spotdl");
+            format.replace("%(levelname)s", level).replace("%(message)s", message)
+        },
+    );
+    eprintln!("{line}");
+}
+
+/// Loads the settings into `cfg()` and returns the operation and its queries.
+fn settings(args: &[String]) -> R<(String, Vec<String>)> {
+    let mut cfg: Value = serde_json::from_str(DEFAULTS)?;
+    let (mut cli, mut queries, mut config) = (serde_json::Map::new(), Vec::new(), None);
+    let mut i = 0;
+    while i < args.len() {
+        i += 1;
+        let Some(option) = args[i - 1].strip_prefix("--") else {
+            queries.push(args[i - 1].clone());
+            continue;
+        };
+        let (raw, inline) = option.split_once('=').map_or((option, None), |(name, value)| (name, Some(value)));
+        let name = raw.replace('-', "_");
+        let key = ALIASES.iter().find(|alias| alias.0 == name).map_or(name.as_str(), |alias| alias.1);
+        let rest: Vec<&str> = match inline {
+            Some(value) => vec![value],
+            None => args[i..].iter().map(String::as_str).take_while(|arg| !arg.starts_with("--")).collect(),
+        };
+        let (taken, value) = match (cfg.get(key), rest.first().copied()) {
+            _ if key == "config" => {
+                config = Some(PathBuf::from(rest.first().ok_or("--config requires a file path")?));
+                i += usize::from(inline.is_none());
+                continue;
+            }
+            (Some(Value::Array(_)), _) => {
+                let items = rest.iter().flat_map(|value| value.split(',')).map(str::trim).filter(|v| !v.is_empty());
+                (rest.len(), json!(items.collect::<Vec<_>>()))
+            }
+            (Some(Value::Bool(_)), value) => {
+                let on = name != "dont_filter_results" && value != Some("false");
+                (usize::from(matches!(value, Some("true" | "false"))), json!(on))
+            }
+            (Some(Value::Number(_)), Some(value)) => (1, json!(value.parse::<u64>()?)),
+            (Some(Value::String(_) | Value::Number(_)), None) => {
+                return Err(format!("missing value for --{raw}").into());
+            }
+            (Some(_), value) => (usize::from(value.is_some()), json!(value.unwrap_or_default())),
+            (None, _) => return Err(format!("unknown option --{raw}").into()),
+        };
+        cli.insert(key.to_string(), value);
+        i += if inline.is_some() { 0 } else { taken };
+    }
+    let path = config.clone().unwrap_or_else(|| HOME.join("config.json"));
+    if config.is_some() && !path.is_file() {
+        return Err(format!("config file not found: {}", path.display()).into());
+    }
+    if path.is_file() {
+        let file: serde_json::Map<String, Value> = serde_json::from_slice(&fs::read(&path)?)?;
+        if config.is_some() || file.get("load_config") != Some(&json!(false)) {
+            file.into_iter().filter(|(_, value)| !value.is_null()).for_each(|(key, value)| cfg[key] = value);
+        }
+    }
+    cli.into_iter().for_each(|(key, value)| cfg[key] = value);
+    for (key, known) in PROVIDERS {
+        let names = cfg[key].as_array().into_iter().flatten();
+        if let Some(name) = names.filter_map(Value::as_str).find(|name| !known.contains(name)) {
+            return Err(format!("unknown {} provider: {name}", key.trim_end_matches("_providers")).into());
+        }
+    }
+    CONFIG.set(cfg).map_err(|_| "settings were already loaded")?;
+    let op =
+        ["download", "save", "sync", "url", "meta"].into_iter().find(|op| queries.first().is_some_and(|q| q == op));
+    Ok((op.map_or_else(|| "download".into(), |_| queries.remove(0)), queries))
+}
+
+/// Playlist numbering, and the album, album type and explicit filters.
+fn arrange(mut songs: Vec<Song>) -> Vec<Song> {
+    let (numbering, retain) = (on("playlist_numbering"), on("playlist_retain_track_cover"));
     for song in songs.iter_mut().filter(|song| (numbering || retain) && song.list_name.is_some()) {
         song.album_name = song.list_name.clone().unwrap_or_default();
-        song.track_number = song.list_position.unwrap_or(song.track_number as usize) as u32;
-        song.tracks_count = song.list_length.unwrap_or(song.tracks_count as usize) as u32;
-        song.disc_number = 1;
-        song.disc_count = 1;
+        song.track_number = song.list_position.map_or(song.track_number, |position| position as u32);
+        song.tracks_count = song.list_length.map_or(song.tracks_count, |length| length as u32);
+        (song.disc_number, song.disc_count) = (1, 1);
         if numbering && song.list_url.as_deref().is_some_and(|url| url.contains("/playlist/")) {
-            song.album_artist = song.list_author.clone().unwrap_or_else(|| song.album_artist.clone());
+            song.album_artist = song.extra.list_author.clone().unwrap_or_else(|| song.album_artist.clone());
             if !retain {
-                song.cover_url.clone_from(&song.list_cover_url);
+                song.cover_url.clone_from(&song.extra.list_cover_url);
             }
         }
     }
-    let ignored = string_values(&cfg["ignore_albums"]);
-    let ignored = ignored.map(str::to_lowercase).collect::<Vec<_>>();
+    let ignored: Vec<String> = list("ignore_albums").map(str::to_lowercase).collect();
     songs.retain(|song| {
         let album = song.album_name.to_lowercase();
-        let explicit = cfg["skip_explicit"] == true && song.explicit;
-        let kind = cfg["album_type"].as_str().is_some_and(|kind| kind != song.album_type);
-        !explicit && !kind && !ignored.iter().any(|name| album.contains(name))
+        let wrong_type = text("album_type").is_some_and(|kind| kind != song.album_type);
+        !(on("skip_explicit") && song.explicit) && !wrong_type && !ignored.iter().any(|name| album.contains(name))
     });
     songs
 }
 
-fn resolve(queries: &[String], op: &str, cfg: &Value) -> (Vec<Song>, Vec<String>) {
-    let fetch = |query: &String| match spotify::resolve(query, cfg) {
-        Ok(songs) => (number(songs, cfg), Vec::new()),
-        Err(error) => (Vec::new(), vec![format!("{query}: {error}")]),
-    };
-    let (mut songs, mut errors): (Vec<Song>, Vec<String>) =
-        queries.par_iter().map(fetch).reduce(Default::default, |mut all, part| {
-            all.0.extend(part.0);
-            all.1.extend(part.1);
-            all
-        });
-    if cfg["fetch_albums"] == true && matches!(op, "download" | "sync") {
-        let ids = songs.iter().map(|song| format!("spotify:album:{}", song.album_id));
-        let ids = ids.filter(|id| id.len() > 14).collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
-        let (albums, failed) = resolve(&ids, "fetch", cfg);
-        songs.extend(albums);
+fn resolve(queries: &[String], albums: bool) -> (Vec<Song>, Vec<String>) {
+    let results: Vec<_> = queries.par_iter().map(|query| (query, spotify::resolve(query))).collect();
+    let (mut songs, mut errors) = (Vec::new(), Vec::new());
+    for (query, result) in results {
+        match result {
+            Ok(found) => songs.extend(arrange(found)),
+            Err(error) => errors.push(format!("{query}: {error}")),
+        }
+    }
+    if albums {
+        let mut ids: Vec<String> = songs.iter().map(|song| format!("spotify:album:{}", song.album_id)).collect();
+        ids.retain(|id| id.len() > 14);
+        ids.sort();
+        ids.dedup();
+        let (more, failed) = resolve(&ids, false);
+        songs.extend(more);
         errors.extend(failed);
     }
-    let mut seen = HashSet::new();
-    songs.retain(|song| match op {
-        "download" | "sync" => seen.insert(download::path(song, cfg)),
-        _ => seen.insert(PathBuf::from(&song.url)),
-    });
     (songs, errors)
 }
 
-fn process_songs(
-    songs: Vec<Song>,
-    op: &str,
-    cfg: &Value,
-    pool: &rayon::ThreadPool,
-    lyrics_tx: Option<&std::sync::mpsc::Sender<download::LyricsJob>>,
-) -> Vec<(Song, R<PathBuf>)> {
-    pool.install(|| {
-        songs
-            .into_par_iter()
-            .enumerate()
-            .with_max_len(1)
-            .map(|(index, song)| download::process(song, op, cfg, index, lyrics_tx))
-            .collect()
-    })
-}
-
-fn m3u_entry(song: &Path, playlist: &Path) -> R<String> {
-    let song = std::path::absolute(song)?;
-    let dir = std::path::absolute(playlist)?.parent().map(PathBuf::from).unwrap_or_default();
-    let shared = song.components().zip(dir.components()).take_while(|(a, b)| a == b).count();
+fn relative(file: &Path, list: &Path) -> R<String> {
+    let file = std::path::absolute(file)?;
+    let dir = std::path::absolute(list)?.parent().map(PathBuf::from).unwrap_or_default();
+    let shared = file.components().zip(dir.components()).take_while(|(a, b)| a == b).count();
     let up = std::iter::repeat_n(std::path::Component::ParentDir, dir.components().count() - shared);
-    Ok(up.chain(song.components().skip(shared)).collect::<PathBuf>().display().to_string())
+    Ok(up.chain(file.components().skip(shared)).collect::<PathBuf>().display().to_string())
 }
 
-fn write_m3u(done: &[(Song, R<PathBuf>)], op: &str, cfg: &Value) -> R<()> {
-    let Some(pattern) = cfg["m3u"].as_str().filter(|_| op != "url") else {
-        return Ok(());
+/// One `.m3u8` per list name, with every song of every query, including duplicates that were downloaded once.
+fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
+    let pattern = match &cfg()["m3u"] {
+        Value::String(pattern) if op != "url" => pattern.as_str(),
+        Value::Bool(true) if op != "url" => "",
+        _ => return Ok(()),
     };
-    let pattern = if pattern.is_empty() || pattern == "true" { "{list[0]}.m3u8" } else { pattern };
-    let suffix = match pattern {
-        name if name.ends_with('/') => "{list[0]}.m3u8",
-        name if name.ends_with(".m3u") || name.ends_with(".m3u8") => "",
-        _ => ".m3u8",
+    let pattern = match pattern {
+        "" | "true" => "{list[0]}.m3u8".into(),
+        name if name.ends_with('/') => format!("{name}{{list[0]}}.m3u8"),
+        name if name.ends_with(".m3u") || name.ends_with(".m3u8") => name.into(),
+        name => format!("{name}.m3u8"),
     };
-    let first = done.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song, cfg));
-    let mut files = std::collections::BTreeMap::<String, String>::new();
-    let keep = |result: &R<PathBuf>| {
-        op == "save" || cfg["add_unavailable"] == true || result.as_ref().is_ok_and(|path| path.is_file())
-    };
-    for (song, result) in done.iter().filter(|(_, result)| keep(result)) {
-        let path = result.as_ref().map_or_else(|_| download::path(song, cfg), Clone::clone);
-        let name = download::fill(&format!("{pattern}{suffix}"), song, cfg).replace("{list[0]}", &first);
-        let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", song, cfg);
-        let entry = m3u_entry(&path, Path::new(&name))?;
-        let file = files.entry(name).or_insert_with(|| "#EXTM3U\n".into());
-        file.push_str(&format!("{line}\n{entry}\n"));
+    let first = listed.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song));
+    let mut files = BTreeMap::<String, String>::new();
+    for (song, result) in listed {
+        if !(op == "save" || on("add_unavailable") || result.as_ref().is_ok_and(|path| path.is_file())) {
+            continue;
+        }
+        let path = result.as_ref().map_or_else(|_| download::path(song), Clone::clone);
+        let name = download::fill(&pattern, song).replace("{list[0]}", &first);
+        let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", song);
+        let entry = relative(&path, Path::new(&name))?;
+        files.entry(name).or_insert_with(|| "#EXTM3U\n".into()).push_str(&format!("{line}\n{entry}\n"));
     }
     for (name, text) in files {
-        let parent = Path::new(&name).parent().filter(|parent| !parent.as_os_str().is_empty());
-        fs::create_dir_all(parent.unwrap_or(Path::new(".")))?;
+        fs::create_dir_all(
+            Path::new(&name).parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")),
+        )?;
         fs::write(name, text)?;
     }
     Ok(())
 }
 
-fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>, cfg: &Value) -> R<()> {
-    let failed = done.iter().filter_map(|(song, result)| result.as_ref().err().map(|error| (song, error)));
-    errors.extend(failed.map(|(song, error)| format!("{} - {}: {error}", song.artist, song.name)));
-    if cfg["print_errors"] == true {
+fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>) -> R<()> {
+    let failed = done.iter().filter_map(|(song, result)| Some((song, result.as_ref().err()?)));
+    errors.extend(failed.map(|(song, error)| format!("{} ({} - {}): {error}", song.url, song.artist, song.name)));
+    if on("print_errors") {
         errors.iter().for_each(|error| eprintln!("{error}"));
     }
-    if let Some(path) = cfg["save_errors"].as_str().filter(|_| !errors.is_empty()) {
+    if let Some(path) = text("save_errors").filter(|_| !errors.is_empty()) {
         let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-        let time = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
-        std::io::Write::write_all(&mut file, format!("{time}\n{}\n", errors.join("\n")).as_bytes())?;
+        std::io::Write::write_all(&mut file, format!("{}\n{}\n", now(), errors.join("\n")).as_bytes())?;
     }
-    eprintln!(
-        "{} succeeded, {} failed",
-        done.len() - done.iter().filter(|(_, result)| result.is_err()).count(),
-        errors.len()
-    );
+    let failures = done.iter().filter(|(_, result)| result.is_err()).count();
+    eprintln!("{} succeeded, {} failed", done.len() - failures, errors.len());
     match errors.len() {
         0 => Ok(()),
         count => Err(format!("{count} downloads failed").into()),
@@ -517,103 +359,84 @@ fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>, cfg: &Value) -> 
 }
 
 fn run() -> R<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().any(|arg| arg == name);
-    let sync_file = |queries: &[String], songs: &[Song]| -> R<String> {
-        Ok(serde_json::to_string_pretty(&json!({"type": "sync", "query": queries, "songs": songs}))?)
-    };
     if flag("--version") {
         println!("spotdl {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if flag("--generate-config") {
-        return write_default_config();
-    }
-    let (op, original, mut cfg) = settings(&args[1..])?;
-    init_agent(&cfg);
-    if let Some(tool) = ["ffmpeg", "deno", "yt-dlp"].into_iter().find(|tool| flag(&format!("--download-{tool}"))) {
-        return install(tool, &cfg);
-    }
-    if flag("--check-for-updates") {
-        return check_for_updates(&cfg);
-    }
-    let save_file = cfg["save_file"].as_str().map(String::from);
-    if save_file.as_deref().is_some_and(|path| path != "-" && !path.ends_with(".spotdl")) {
-        return Err("save file must end with .spotdl or be '-'".into());
-    }
-    if original.is_empty() || flag("--help") || flag("-h") {
-        println!("Usage: spotdl [download|save|sync|url|meta] <query>... [options]");
+        fs::create_dir_all(&*HOME)?;
+        fs::write(HOME.join("config.json"), serde_json::to_vec_pretty(&serde_json::from_str::<Value>(DEFAULTS)?)?)?;
+        println!("Config file generated at {}", HOME.join("config.json").display());
         return Ok(());
     }
-    if cfg["user_auth"] == true && cfg["auth_token"].is_null() {
-        cfg["auth_token"] = json!(spotify::token(&cfg, true)?);
+    let (op, queries) = if flag("--help") || flag("-h") { Default::default() } else { settings(&args)? };
+    if queries.is_empty() {
+        println!("Usage: spotdl [download|save|sync|url|meta] <query>... [--option value]...");
+        return Ok(());
     }
-    if !cfg["auth_token"].is_null() {
-        cfg["use_official_api"] = json!(true);
+    let save_file = text("save_file");
+    if save_file.is_some_and(|path| path != "-" && !path.ends_with(".spotdl")) {
+        return Err("save file must end with .spotdl or be '-'".into());
     }
-    let meta_threads = cfg["meta_threads"].as_u64().unwrap_or(128).max(1) as usize;
+    if op == "save" && save_file.is_none() {
+        return Err("save file is not specified".into());
+    }
+    let meta_threads = number("meta_threads").max(1) as usize;
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
     if op == "meta" {
-        return download::meta(&original, &cfg);
+        return download::meta(&queries);
     }
-    let sync = (op == "sync" && original.len() == 1 && original[0].ends_with(".spotdl"))
-        .then(|| -> R<_> { Ok(serde_json::from_slice::<Value>(&fs::read(&original[0])?)?) })
-        .transpose()?;
-    if sync.as_ref().is_some_and(|file| file["type"] != "sync" || !file["songs"].is_array()) {
+    let sync_file = queries.first().filter(|query| op == "sync" && queries.len() == 1 && query.ends_with(".spotdl"));
+    let read = |path: &String| -> R<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
+    let synced = sync_file.map(read).transpose()?;
+    if synced.as_ref().is_some_and(|file| file["type"] != "sync" || !file["songs"].is_array()) {
         return Err("sync file is not valid".into());
     }
-    let queries: Vec<String> = match &sync {
+    let sync_file = sync_file.cloned();
+    let queries: Vec<String> = match &synced {
         Some(file) => serde_json::from_value(file["query"].clone())?,
-        None => original.clone(),
+        None => queries,
     };
-    let (songs, errors) = resolve(&queries, &op, &cfg);
-    let resolution_succeeded = errors.is_empty();
-    if let Some(file) = sync.as_ref().filter(|_| resolution_succeeded && cfg["sync_without_deleting"] != true) {
-        download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs, &cfg);
+    let downloads = matches!(op.as_str(), "download" | "sync");
+    let (songs, errors) = resolve(&queries, downloads && on("fetch_albums"));
+    if let Some(file) = synced.filter(|_| errors.is_empty() && !on("sync_without_deleting")) {
+        download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs);
     }
-    let sync_path = sync.as_ref().map(|_| original[0].clone()).or(save_file.clone()).filter(|_| op == "sync");
-    if let Some(path) = sync_path.as_ref().filter(|_| resolution_succeeded && sync.is_none()) {
-        fs::write(path, sync_file(&queries, &songs)?)?;
+    // One job per output file (per URL when nothing is written); a pinned YouTube URL beats a search.
+    let (mut jobs, mut slots, mut index) = (Vec::<Song>::new(), HashMap::new(), Vec::new());
+    for song in &songs {
+        let key = if downloads { download::path(song) } else { PathBuf::from(&song.url) };
+        let slot = *slots.entry(key).or_insert_with(|| {
+            jobs.push(song.clone());
+            jobs.len() - 1
+        });
+        if jobs[slot].download_url.is_none() {
+            jobs[slot].download_url.clone_from(&song.download_url);
+        }
+        index.push(slot);
     }
-    let threads = if op == "save" { meta_threads } else { cfg["threads"].as_u64().unwrap_or(16).max(1) as usize };
+    let threads = if op == "save" { meta_threads } else { number("threads").max(1) as usize };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
-    let lyrics_stage = matches!(op.as_str(), "download" | "sync")
-        && cfg["lyrics_providers"].as_array().is_some_and(|providers| !providers.is_empty());
-    let done = if lyrics_stage {
-        let lyrics_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
-        let (sender, receiver) = std::sync::mpsc::channel::<download::LyricsJob>();
-        std::thread::scope(|scope| -> R<_> {
-            let lyrics = scope.spawn(|| {
-                lyrics_pool.install(|| {
-                    receiver
-                        .into_iter()
-                        .par_bridge()
-                        .map(|(index, song, path)| (index, download::add_lyrics(&song, &path, &cfg)))
-                        .collect::<Vec<_>>()
-                })
-            });
-            let mut done = process_songs(songs, &op, &cfg, &pool, Some(&sender));
-            drop(sender);
-            for (index, text) in lyrics.join().map_err(|_| "lyrics stage panicked")? {
-                if let Some(text) = text {
-                    done[index].0.lyrics = Some(text);
-                }
-            }
-            Ok(done)
-        })?
-    } else {
-        process_songs(songs, &op, &cfg, &pool, None)
-    };
-    let saved = done.iter().map(|(song, _)| song.clone()).collect::<Vec<_>>();
-    match (op.as_str(), save_file.as_deref(), sync_path) {
-        ("sync", _, Some(path)) if resolution_succeeded => fs::write(path, sync_file(&queries, &saved)?)?,
-        ("save", Some("-"), _) => println!("{}", serde_json::to_string_pretty(&saved)?),
-        ("save" | "download", Some(path), _) => fs::write(path, serde_json::to_string_pretty(&saved)?)?,
-        ("save", None, _) => return Err("save file is not specified".into()),
-        _ => {}
+    let done: Vec<(Song, R<PathBuf>)> =
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
+    let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
+    let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
+    if let Some(path) = sync_path {
+        let file = json!({"type": "sync", "query": queries, "songs": saved});
+        fs::write(path, serde_json::to_string_pretty(&file)?)?;
+    } else if let Some(path) = save_file.filter(|_| op == "save" || op == "download") {
+        let text = serde_json::to_string_pretty(&saved)?;
+        if path == "-" {
+            println!("{text}");
+        } else {
+            fs::write(path, text)?;
+        }
     }
-    write_m3u(&done, &op, &cfg)?;
-    report(&done, errors, &cfg)
+    let listed: Vec<_> = songs.iter().zip(index).map(|(song, slot)| (song, &done[slot].1)).collect();
+    write_m3u(&listed, &op)?;
+    report(&done, errors)
 }
 
 fn main() {

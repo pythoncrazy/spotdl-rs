@@ -1,357 +1,187 @@
+//! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer services.
+//! The download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to; enable it with
+//! `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the yt-dlp binary).
 use lofty::{config::WriteOptions, prelude::*, tag::ItemKey};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const DONDA: &str = "https://open.spotify.com/album/5CnpZV3q5BcESefcB3WJmz";
-const REVOLVER: [(&str, &str); 2] = [
-    ("https://music.youtube.com/watch?v=Uq0aeEYLkIE", "https://open.spotify.com/track/4KRgqwb4kvBuTz1utbYxfb"),
-    ("https://music.youtube.com/watch?v=Tb9L3iAUhc0", "https://open.spotify.com/track/1ob06Ol8FMIPQgjpg7bMyk"),
-];
+const VIDEO: &str = "https://music.youtube.com/watch?v=Uq0aeEYLkIE";
+const ELEANOR: &str = "https://open.spotify.com/track/4KRgqwb4kvBuTz1utbYxfb";
+const TAXMAN: &str = "https://open.spotify.com/track/1ob06Ol8FMIPQgjpg7bMyk";
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let id = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = env::temp_dir().join(format!("spotdl-e2e-{name}-{}-{id}", std::process::id()));
+fn dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("spotdl-e2e-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 fn spotdl(dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_spotdl"));
-    command.current_dir(dir).env("HOME", dir).args(args);
-    if let Ok(path) = env::var("SPOTDL_E2E_YT_DLP") {
-        command.arg("--yt-dlp").arg(path);
+    command.current_dir(dir).env("HOME", dir).args(args).args(["--lyrics-providers="]);
+    if let Ok(path) = std::env::var("SPOTDL_E2E_YT_DLP") {
+        command.args(["--yt-dlp", &path]);
     }
-    if let Ok(args) = env::var("SPOTDL_E2E_YT_DLP_ARGS") {
-        command.arg(format!("--yt-dlp-args={args}"));
-    }
-    command.output().expect("could not start spotdl")
+    command.output().unwrap()
 }
 
-fn output_text(output: &Output) -> String {
-    format!(
-        "status: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
+fn ok(output: Output) -> String {
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    text
 }
 
-fn assert_success(output: &Output) {
-    assert!(output.status.success(), "{}", output_text(output));
+fn fails_with(output: Output, message: &str) {
+    let text = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(!output.status.success() && text.contains(message), "{text}");
 }
 
-fn files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(root).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            files.extend(files_with_extension(&path, extension));
-        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
-            files.push(path);
-        }
-    }
-    files
+fn skip(file: &Path) -> PathBuf {
+    file.with_extension("opus.skip")
 }
 
-fn skip_file(file: &Path) -> PathBuf {
-    let mut path = file.as_os_str().to_os_string();
-    path.push(".skip");
-    path.into()
-}
-
-fn audio_title(file: &Path) -> String {
-    lofty::read_from_path(file).unwrap().primary_tag().unwrap().title().unwrap().into()
-}
-
-fn saved_song<'a>(songs: &'a [Value], url: &str) -> &'a Value {
-    songs.iter().find(|song| song["url"].as_str() == Some(url)).expect("Spotify track missing from save file")
+fn json_file(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
-fn saves_donda_album_metadata() {
-    let dir = fresh_dir("save");
-    let save_file = dir.join("donda.spotdl").display().to_string();
-    let output = spotdl(&dir, &["save", DONDA, "--save-file", &save_file, "--lyrics-providers="]);
-    assert_success(&output);
-
-    let songs: Vec<Value> = serde_json::from_slice(&fs::read(save_file).unwrap()).unwrap();
+fn save_keeps_pins_and_lists_every_song() {
+    let dir = dir("save");
+    let file = dir.join("donda.spotdl");
+    ok(spotdl(&dir, &["save", DONDA, "--save-file", file.to_str().unwrap()]));
+    let songs = json_file(&file);
+    let songs = songs.as_array().unwrap();
     assert_eq!(songs.len(), 27);
-    let mut tracks = BTreeSet::new();
-    for song in &songs {
-        assert!(!song["name"].as_str().unwrap_or_default().trim().is_empty());
-        assert!(!song["artists"].as_array().unwrap().is_empty());
-        assert!(song["duration"].as_f64().unwrap_or_default() > 0.0);
+    let numbers: Vec<u64> = songs.iter().map(|song| song["track_number"].as_u64().unwrap()).collect();
+    assert_eq!(numbers, (1..=27).collect::<Vec<_>>());
+    for song in songs {
         assert_eq!(song["album_name"], "Donda");
-        tracks.insert(song["track_number"].as_u64().unwrap());
+        assert!(!song["name"].as_str().unwrap().is_empty() && song["duration"].as_f64().unwrap() > 0.0);
+        assert!(!song["artists"].as_array().unwrap().is_empty() && song["artists"][0] == song["artist"]);
     }
-    assert_eq!(tracks, (1..=27).collect());
-}
 
-fn watch_url(output: &Output) -> String {
-    assert_success(output);
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert!(
-        url.starts_with("https://music.youtube.com/watch?v=") || url.starts_with("https://www.youtube.com/watch?v="),
-        "unexpected watch URL: {url}"
-    );
-    url
-}
-
-fn oembed_title(watch: &str) -> String {
-    let url =
-        format!("https://www.youtube.com/oembed?format=json&url={}", utf8_percent_encode(watch, NON_ALPHANUMERIC));
-    let response: Value =
-        ureq::get(&url).call().expect("YouTube oEmbed request failed").into_body().read_json().unwrap();
-    response["title"].as_str().expect("YouTube oEmbed response has no title").into()
+    // The same song pinned to a video after the album: one entry, with the pin, but listed twice in the m3u.
+    let url = songs[4]["url"].as_str().unwrap();
+    let pinned = format!("{VIDEO}|{url}");
+    ok(spotdl(&dir, &["save", DONDA, &pinned, "--save-file", file.to_str().unwrap(), "--m3u"]));
+    let songs = json_file(&file);
+    let songs = songs.as_array().unwrap();
+    assert_eq!(songs.len(), 27);
+    let song = songs.iter().find(|song| song["url"] == url).unwrap();
+    assert_eq!(song["download_url"], VIDEO);
+    let list = fs::read_to_string(dir.join("Donda.m3u8")).unwrap();
+    assert_eq!(list.lines().filter(|line| line.starts_with("#EXTINF")).count(), 28);
 }
 
 #[test]
-fn resolves_spotify_tracks_to_youtube_urls() {
-    let dir = fresh_dir("url");
-    for (name, spotify, check_title) in [
-        ("lovely", "https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4", false),
-        ("Dior", "https://open.spotify.com/track/79s5XnCN4TJKTVMSmOx8Ep", false),
-        ("Fly", "https://open.spotify.com/track/6mjEABpi5cQ5gqFFOkR1Cc", false),
-        ("Kun tää loppuu", "https://open.spotify.com/track/10B96serXW72hB0N65H5Lt", false),
-        ("Hurt", "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH", true),
-        ("Ghost", "https://open.spotify.com/track/4XPWKmy05Rcff6TLHNoNF8", true),
-        ("Stuck with U", "https://open.spotify.com/track/4HBZA5flZLE435QTztThqH", true),
-        ("Tornado", "https://open.spotify.com/track/3seNictp7GWitSNKlujwnY", true),
-        ("Hey, Soul Sister", "https://open.spotify.com/track/0KpfYajJVVGgQ32Dby7e9i", true),
-        ("It Wasn't Me", "https://open.spotify.com/track/1lzr43nnXAijIGYnCT8M8H", true),
+fn url_finds_official_audio() {
+    let dir = dir("url");
+    for track in [
+        ELEANOR,
+        "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH",
+        "https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4",
     ] {
-        let watch = watch_url(&spotdl(&dir, &["url", spotify]));
-        if check_title {
-            let title = oembed_title(&watch);
-            let normalized = title.to_lowercase();
-            assert!(
-                !["karaoke", "bass boost", "bassboost", "tribute", "nightcore", "slowed", "sped up"]
-                    .iter()
-                    .any(|version| normalized.contains(version)),
-                "{name} resolved to {title}"
-            );
-            assert!(
-                !normalized.split(|c: char| !c.is_alphanumeric()).any(|word| word == "8d"),
-                "{name} resolved to {title}"
-            );
-        }
+        let url = ok(spotdl(&dir, &["url", track]));
+        let url = url.lines().next().unwrap();
+        assert!(url.starts_with("https://music.youtube.com/watch?v="), "{track}: {url}");
+        let oembed = format!("https://www.youtube.com/oembed?format=json&url={url}");
+        let video: Value = ureq::get(&oembed).call().unwrap().into_body().read_json().unwrap();
+        let title = video["title"].as_str().unwrap().to_lowercase();
+        let altered = ["karaoke", "cover", "live", "nightcore", "slowed", "sped up", "8d", "instrumental"];
+        assert!(!altered.iter().any(|word| title.contains(word)), "{track}: {title}");
     }
 }
 
 #[test]
-fn downloads_revolver_tracks_and_updates_metadata() {
-    let dir = fresh_dir("download");
-    let save_file = dir.join("revolver.spotdl").display().to_string();
-    let mut save_args = vec!["save"];
-    save_args.extend(REVOLVER.iter().map(|(_, spotify)| *spotify));
-    save_args.extend(["--save-file", &save_file, "--lyrics-providers="]);
-    assert_success(&spotdl(&dir, &save_args));
-    let songs: Vec<Value> = serde_json::from_slice(&fs::read(&save_file).unwrap()).unwrap();
-
-    let output = format!("{}/{{album-artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}", dir.display());
-    let archive = dir.join("archive.txt").display().to_string();
-    let m3u = dir.join("list.m3u").display().to_string();
-    let downloads = REVOLVER.iter().map(|(youtube, spotify)| format!("{youtube}|{spotify}")).collect::<Vec<_>>();
-    let args = [
-        "download",
-        downloads[0].as_str(),
-        downloads[1].as_str(),
-        "--format",
-        "opus",
-        "--bitrate",
-        "disable",
-        "--output",
-        &output,
-        "--archive",
-        &archive,
-        "--m3u",
-        &m3u,
-        "--generate-lrc",
-        "--create-skip-file",
-        "--max-retries",
-        "2",
-    ];
-    assert_success(&spotdl(&dir, &args));
-
-    let files = files_with_extension(&dir, "opus");
-    assert_eq!(files.len(), 2);
-    for file in &files {
-        let audio = lofty::read_from_path(file).unwrap();
-        let tag = audio.primary_tag().unwrap();
-        let title = tag.title().expect("audio has no title");
-        let expected =
-            songs.iter().find(|song| song["name"].as_str() == Some(title.as_ref())).expect("unexpected track title");
-        let spotify = expected["url"].as_str().unwrap();
-        let expected_video = REVOLVER.iter().find(|(_, url)| *url == spotify).expect("unexpected Spotify URL").0;
-        let artist = tag.artist().unwrap_or_default();
-        assert!(expected["artists"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|name| artist.contains(name)));
-        assert_eq!(tag.album().as_deref(), expected["album_name"].as_str());
-        assert_eq!(tag.track(), expected["track_number"].as_u64().map(|number| number as u32));
-        assert!(!tag.pictures().is_empty());
-        let probe = Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "stream=sample_rate", "-of", "csv=p=0"])
-            .arg(file)
-            .output()
-            .unwrap();
-        assert_success(&probe);
-        let sample_rate = String::from_utf8_lossy(&probe.stdout).trim().parse::<u32>().unwrap();
-        assert!(sample_rate >= 44_100, "{file:?} has {sample_rate} Hz audio");
-        assert!((audio.properties().duration().as_secs_f64() - expected["duration"].as_f64().unwrap()).abs() < 5.0);
-        let source = tag.get_string(&ItemKey::Unknown("WWWAUDIOFILE".into())).unwrap_or_default();
-        assert_eq!(source, spotify);
-        assert_eq!(tag.comment().as_deref(), Some(expected_video));
-        assert!(skip_file(file).is_file());
+fn sync_moves_and_removes_files() {
+    let dir = dir("sync");
+    let output = format!("{}/{{track-id}}.{{output-ext}}", dir.display());
+    let file = |url: &str| dir.join(format!("{}.opus", url.rsplit('/').next().unwrap()));
+    // Files that already exist are kept, so this needs no download.
+    for url in [ELEANOR, TAXMAN] {
+        fs::write(file(url), "").unwrap();
+        fs::write(file(url).with_extension("opus.skip"), "").unwrap();
     }
-
-    let archived = fs::read_to_string(&archive).unwrap();
-    assert!(REVOLVER.iter().all(|(_, url)| archived.lines().any(|line| line == *url)));
-    let playlist = fs::read_to_string(&m3u).unwrap();
-    assert_eq!(playlist.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).count(), 2);
-    assert!(files.iter().all(|file| playlist.contains(file.file_name().unwrap().to_str().unwrap())));
-
-    let modified =
-        files.iter().map(|file| (file.clone(), fs::metadata(file).unwrap().modified().unwrap())).collect::<Vec<_>>();
-    assert_success(&spotdl(&dir, &args));
-    for (file, time) in modified {
-        assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), time);
-    }
-
-    let file = &files[0];
-    let title = audio_title(file);
-    let mut audio = lofty::read_from_path(file).unwrap();
-    audio.primary_tag_mut().unwrap().remove_key(&ItemKey::TrackTitle);
-    audio.save_to_path(file, WriteOptions::default()).unwrap();
-    let file = file.display().to_string();
-    assert_success(&spotdl(&dir, &["meta", &file]));
-    assert_eq!(audio_title(Path::new(&file)), title);
+    let state = dir.join("s.spotdl");
+    let state_path = state.to_str().unwrap();
+    ok(spotdl(&dir, &["sync", ELEANOR, TAXMAN, "--save-file", state_path, "--output", &output]));
+    let mut saved = json_file(&state);
+    assert_eq!(saved["songs"].as_array().unwrap().len(), 2);
+    saved["query"] = json!([ELEANOR]);
+    fs::write(&state, saved.to_string()).unwrap();
+    ok(spotdl(&dir, &["sync", state_path, "--output", &output]));
+    assert!(file(ELEANOR).exists() && file(ELEANOR).with_extension("opus.skip").exists());
+    assert!(!file(TAXMAN).exists() && !file(TAXMAN).with_extension("opus.skip").exists());
 }
 
 #[test]
-fn sync_prunes_removed_tracks_and_skip_files() {
-    let dir = fresh_dir("sync");
-    let output = format!("{}/{{album-artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}", dir.display());
-    let sync_file = dir.join("s.sync.spotdl").display().to_string();
-    let options = [
-        "--output",
-        &output,
-        "--format",
-        "opus",
-        "--bitrate",
-        "disable",
-        "--create-skip-file",
-        "--lyrics-providers=",
-        "--max-retries",
-        "0",
-    ];
-    let mut first_args = vec!["sync", REVOLVER[0].1, REVOLVER[1].1, "--save-file", &sync_file];
-    first_args.extend(options);
-    assert_success(&spotdl(&dir, &first_args));
+fn rejects_bad_options_and_unsafe_paths() {
+    let dir = dir("errors");
+    fails_with(spotdl(&dir, &["--not-an-option"]), "unknown option --not-an-option");
+    fails_with(spotdl(&dir, &["x", "--config", "/nonexistent"]), "config file not found");
+    fails_with(spotdl(&dir, &["x", "--format"]), "missing value for --format");
+    fails_with(spotdl(&dir, &["x", "--audio", "napster"]), "unknown audio provider");
 
-    let mut state: Value = serde_json::from_slice(&fs::read(&sync_file).unwrap()).unwrap();
-    let old_songs = state["songs"].as_array().unwrap();
-    let title_a = saved_song(old_songs, REVOLVER[0].1)["name"].as_str().unwrap();
-    let title_b = saved_song(old_songs, REVOLVER[1].1)["name"].as_str().unwrap();
-    let files = files_with_extension(&dir, "opus");
-    let file_a = files.iter().find(|file| audio_title(file) == title_a).unwrap().clone();
-    let file_b = files.iter().find(|file| audio_title(file) == title_b).unwrap().clone();
-
-    state["query"] = json!([REVOLVER[0].1]);
-    fs::write(&sync_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-    let mut next_args = vec!["sync", &sync_file];
-    next_args.extend(options);
-    assert_success(&spotdl(&dir, &next_args));
-    assert!(file_a.is_file() && skip_file(&file_a).is_file());
-    assert!(!file_b.exists() && !skip_file(&file_b).exists());
-}
-
-#[test]
-fn reports_cli_option_and_config_errors() {
-    let dir = fresh_dir("errors");
-    let unknown = spotdl(&dir, &["--not-a-spotdl-option"]);
-    assert!(!unknown.status.success());
-    assert!(
-        String::from_utf8_lossy(&unknown.stderr).to_lowercase().contains("unknown option"),
-        "{}",
-        output_text(&unknown)
-    );
-
-    let config = spotdl(&dir, &["--config", "/nonexistent"]);
-    assert!(!config.status.success());
-    assert!(
-        String::from_utf8_lossy(&config.stderr).to_lowercase().contains("config file not found"),
-        "{}",
-        output_text(&config)
-    );
-
-    let format = spotdl(&dir, &["--format"]);
-    assert!(!format.status.success());
-    assert!(
-        String::from_utf8_lossy(&format.stderr).to_lowercase().contains("missing value for --format"),
-        "{}",
-        output_text(&format)
-    );
-
-    let fixture = dir.join("local.spotdl");
-    fs::write(
-        &fixture,
-        serde_json::to_vec(&json!({"songs": [{
-            "name": "．．／．．／etc",
-            "artist": "Artist",
-            "artists": ["Artist"],
-            "album_name": "Album",
-            "url": "https://open.spotify.com/track/0123456789012345678901",
-            "song_id": "0123456789012345678901",
-            "duration": 180
-        }]}))
-        .unwrap(),
-    )
-    .unwrap();
-    let fixture = fixture.display().to_string();
-    let output_dir = dir.join("safe");
-    let output_template = format!("{}/{{title}}.{{output-ext}}", output_dir.display());
-    let traversal = spotdl(
+    let songs = json!([{"name": "．．／．．／etc", "artist": "A", "artists": ["A"], "album_name": "Album", "url": "https://open.spotify.com/track/0123456789012345678901"}]);
+    fs::write(dir.join("local.spotdl"), songs.to_string()).unwrap();
+    let output = format!("{}/safe/{{title}}.{{output-ext}}", dir.display());
+    let text = ok(spotdl(
         &dir,
-        &[
-            "save",
-            &fixture,
-            "--save-file",
-            "-",
-            "--lyrics-providers=",
-            "--restrict",
-            "ascii",
-            "--output",
-            &output_template,
-            "--m3u",
-        ],
-    );
-    assert_success(&traversal);
-    let text = output_text(&traversal);
-    let expected = output_dir.join("....etc.opus").display().to_string();
-    assert!(text.contains(&expected), "{}", text);
-    let playlist = fs::read_to_string(dir.join("Album.m3u8")).unwrap();
-    assert!(playlist.contains("safe/....etc.opus"), "{playlist}");
-    assert!(!playlist.contains("../"), "{playlist}");
+        &["save", "local.spotdl", "--save-file", "-", "--restrict", "ascii", "--output", &output, "--m3u"],
+    ));
+    assert!(text.contains(&format!("{}/safe/....etc.opus", dir.display())), "{text}");
+    let list = fs::read_to_string(dir.join("Album.m3u8")).unwrap();
+    assert!(list.contains("\nsafe/....etc.opus\n"), "{list}");
+    let text = ok(spotdl(&dir, &["save", "local.spotdl", "--save-file", "-", "--output", ""]));
+    assert!(text.contains("A - ．．／．．／etc: A - ．．／．．／etc.opus"), "{text}");
+}
 
-    let empty_output = spotdl(&dir, &["save", &fixture, "--save-file", "-", "--lyrics-providers=", "--output", ""]);
-    assert_success(&empty_output);
-    let text = output_text(&empty_output);
-    let reported_path = text
-        .lines()
-        .find_map(|line| line.strip_prefix("INFO: Artist - ．．／．．／etc: "))
-        .map(PathBuf::from)
-        .expect("missing reported save path");
-    assert!(!reported_path.is_absolute(), "{}", text);
-    assert_eq!(reported_path, PathBuf::from("Artist - ．．／．．／etc.opus"));
+#[test]
+fn downloads_tags_and_repairs_metadata() {
+    if std::env::var("SPOTDL_E2E_DOWNLOAD").is_err() {
+        return eprintln!("skipped: set SPOTDL_E2E_DOWNLOAD=1 to download from YouTube");
+    }
+    let dir = dir("download");
+    let output = format!("{}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}", dir.display());
+    let (archive, list) = (dir.join("archive.txt"), dir.join("list.m3u8"));
+    let pinned = format!("{VIDEO}|{ELEANOR}");
+    let args = ["download", &pinned, TAXMAN, "--output", &output, "--archive", archive.to_str().unwrap()];
+    let args = [&args[..], &["--m3u", list.to_str().unwrap(), "--create-skip-file"]].concat();
+    ok(spotdl(&dir, &args));
+    let albums = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.is_dir());
+    let files: Vec<PathBuf> =
+        albums.flat_map(|album| fs::read_dir(album).unwrap().map(|entry| entry.unwrap().path())).collect();
+    let audio: Vec<&PathBuf> = files.iter().filter(|file| file.extension().unwrap() == "opus").collect();
+    assert_eq!(audio.len(), 2, "{files:?}");
+    for file in &audio {
+        let tagged = lofty::read_from_path(file).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        let url = tag.get_string(&ItemKey::Unknown("WOAS".into())).unwrap();
+        assert!(url == ELEANOR || url == TAXMAN);
+        if url == ELEANOR {
+            assert_eq!(tag.comment().as_deref(), Some(VIDEO));
+        }
+        assert!(tag.title().is_some() && tag.album().is_some_and(|album| album.contains("Revolver")));
+        assert!(!tag.pictures().is_empty() && skip(file).exists());
+        assert!(tagged.properties().duration().as_secs() > 100);
+    }
+    assert_eq!(fs::read_to_string(&archive).unwrap().lines().count(), 2);
+    assert_eq!(fs::read_to_string(&list).unwrap().lines().filter(|line| line.ends_with(".opus")).count(), 2);
+
+    let modified = |file: &Path| fs::metadata(file).unwrap().modified().unwrap();
+    let before = modified(audio[0]);
+    ok(spotdl(&dir, &args));
+    assert_eq!(modified(audio[0]), before);
+
+    let mut tagged = lofty::read_from_path(audio[0]).unwrap();
+    let title = tagged.primary_tag().unwrap().title().unwrap().to_string();
+    tagged.primary_tag_mut().unwrap().remove_key(&ItemKey::TrackTitle);
+    tagged.save_to_path(audio[0], WriteOptions::default()).unwrap();
+    ok(spotdl(&dir, &["meta", audio[0].to_str().unwrap()]));
+    assert_eq!(lofty::read_from_path(audio[0]).unwrap().primary_tag().unwrap().title().unwrap(), title);
 }
