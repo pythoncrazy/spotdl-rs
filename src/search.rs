@@ -12,11 +12,45 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// YouTube Music's own classification of a video (`musicVideoType`).
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Kind {
+    /// Label-provided audio ("Art Track"): the exact studio recording, no intro or outro.
+    Atv,
+    /// Official music video: right recording, but may carry skits, intros or a different edit.
+    Omv,
+    /// User upload, or a result whose type YouTube Music didn't report (yt-dlp searches).
+    #[default]
+    Other,
+}
+
+impl Kind {
+    fn parse(value: &str) -> Self {
+        match value {
+            "MUSIC_VIDEO_TYPE_ATV" => Self::Atv,
+            "MUSIC_VIDEO_TYPE_OMV" => Self::Omv,
+            _ => Self::Other,
+        }
+    }
+
+    /// Ranking offset: official audio first, then official videos, then everything else.
+    fn bonus(self) -> f64 {
+        match self {
+            Self::Atv => 0.0,
+            Self::Omv => -5.0,
+            Self::Other => -12.0,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Hit {
     song: Song,
     verified: bool,
     isrc: bool,
+    kind: Kind,
+    /// YouTube Music's explicit badge; only meaningful for verified (song) results.
+    explicit: bool,
 }
 
 fn hit_song(url: String, name: String, artists: Vec<String>, album: String, duration: f64) -> Song {
@@ -297,7 +331,21 @@ fn ytm_hits(v: &Value, songs: bool, isrc: bool) -> R<Vec<Hit>> {
                 Some(_) => artists,
                 None => vec![meta.first()?["text"].as_str()?.into()],
             };
+            let config = "/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType";
+            let video_type = [
+                format!("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint{config}"),
+                format!("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint{config}"),
+            ]
+            .iter()
+            .find_map(|path| r.pointer(path).and_then(Value::as_str))
+            .map_or(Kind::Other, Kind::parse);
+            let badges = r["badges"].as_array().into_iter().flatten();
+            let explicit = badges
+                .filter_map(|badge| badge["musicInlineBadgeRenderer"]["icon"]["iconType"].as_str())
+                .any(|icon| icon == "MUSIC_EXPLICIT_BADGE");
             Some(Hit {
+                kind: video_type,
+                explicit,
                 song: hit_song(
                     format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?),
                     columns[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"].as_str()?.into(),
@@ -349,9 +397,12 @@ pub fn isrc_hit(song: &Song, cfg: &Value) -> R<Option<String>> {
     };
     let filter = cfg["filter_results"] != false;
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
+    // This hit skips the text search, so it must also be the same edit: a clean ISRC for an explicit song
+    // (or the reverse) falls through to the text search, which ranks both edits.
     Ok(ytm(isrc, true, true, cfg)?
         .into_iter()
-        .filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && rank(hit) > 0.0)
+        .filter(|hit| (hit.song.duration - song.duration).abs() < 10.0 && hit.explicit == song.explicit)
+        .filter(|hit| rank(hit) > 0.0)
         .max_by(|a, b| rank(a).total_cmp(&rank(b)))
         .map(|hit| hit.song.url))
 }
@@ -406,7 +457,8 @@ fn clean_name(name: &str, artists: &[String]) -> String {
         clean.push_str(&rest[..open]);
         let group = &rest[open + 1..close];
         let words = slug(group, "-");
-        let feature = matches!(words.split('-').next(), Some("feat" | "ft" | "featuring" | "with"));
+        // "(From SUITS: Season 6)" / "(From "Top Gun")" name the soundtrack, not a different recording.
+        let feature = matches!(words.split('-').next(), Some("feat" | "ft" | "featuring" | "with" | "from"));
         if !feature && !is_version_suffix(group) {
             clean.push_str(&rest[open..=close]);
         }
@@ -433,9 +485,14 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let versionless_name = versionless(&s.name);
     let versionless = slug(versionless_name, "-");
     let combined_artists = slug(&hit.artists.join(" "), "-");
+    // One name as whole words of the other ("ADIAM" / "Adiam Dymott"); short names could match anything.
+    let same_artist = |a: &str, b: &str| {
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        ratio(a, b) > 85.0 || (short.len() >= 4 && format!("-{long}-").contains(&format!("-{short}-")))
+    };
     let found = |a: &String| {
         let artist = slug(a, "-");
-        hit.artists.iter().any(|r| ratio(&artist, &slug(r, "-")) > 85.0)
+        hit.artists.iter().any(|r| same_artist(&artist, &slug(r, "-")))
             || ratio(&artist, &combined_artists) > 85.0
             || rname.contains(&artist)
     };
@@ -459,11 +516,20 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let album =
         if hit.album_name.is_empty() { 0.0 } else { ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) };
     let avg = (artists + name) / 2.0;
-    let avg =
-        if h.verified && !h.isrc && !hit.album_name.is_empty() && album <= 80.0 { (avg + album) / 2.0 } else { avg };
     let skip = rejected || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
-    (avg.min(100.0) - 15.0 * penalized).max(1.0) * f64::from(u8::from(!skip))
+    // A different album is not evidence of a different recording: the same studio track is published on
+    // singles, deluxe editions and compilations, and the duration already tells versions apart. Penalizing
+    // it (as Python spotDL does) made album-less user uploads beat the label's own audio, so a matching
+    // album only breaks ties.
+    let album = if album > 80.0 { 3.0 } else { 0.0 };
+    // Clean and explicit edits are separate tracks with identical titles; YouTube Music badges them.
+    let edit = if h.verified && h.explicit != s.explicit { -10.0 } else { 0.0 };
+    // A perfect name and artist match skips the time average above, so without this two equally named
+    // official tracks (an original master and a remaster) would tie and the first search result would win.
+    let closeness = -(0.5 * (s.duration - hit.duration).abs()).min(5.0);
+    let adjusted = avg.min(100.0) - 15.0 * penalized + album + edit + closeness + h.kind.bonus();
+    adjusted.max(1.0) * f64::from(u8::from(!skip))
 }
 
 pub fn find(song: &Song, cfg: &Value, prior_error: Option<String>) -> R<Vec<String>> {

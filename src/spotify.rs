@@ -168,7 +168,8 @@ fn deezer_get(url: &str, cfg: &Value) -> R<Value> {
 }
 
 fn fetch_deezer_album(album_id: &str, artist: &str, title: &str, cfg: &Value) -> R<Value> {
-    cached(&format!("deezer:{album_id}"), cfg["no_cache"] != true, false, || {
+    // v2: tracks also carry duration and explicit flag (older cache entries lack them).
+    cached(&format!("deezer2:{album_id}"), cfg["no_cache"] != true, false, || {
         let search =
             format!("https://api.deezer.com/search/album?q={}", crate::url_encode(&format!("{artist} {title}")));
         let hits = deezer_get(&search, cfg)?;
@@ -195,7 +196,12 @@ fn fetch_deezer_album(album_id: &str, artist: &str, title: &str, cfg: &Value) ->
             .map(|(index, track)| {
                 let disc = track["disk_number"].as_u64().unwrap_or(1);
                 let position = track["track_position"].as_u64().unwrap_or(index as u64 + 1);
-                (format!("{disc}:{position}"), json!({"isrc": track["isrc"]}))
+                let track_data = json!({
+                    "isrc": track["isrc"],
+                    "duration": track["duration"],
+                    "explicit": track["explicit_lyrics"],
+                });
+                (format!("{disc}:{position}"), track_data)
             })
             .collect::<serde_json::Map<String, Value>>();
         let genres =
@@ -235,8 +241,14 @@ pub fn enrich(song: &mut Song, cfg: &Value) {
             song.date.clone()
         };
         if song.isrc.as_deref().is_none_or(str::is_empty) {
+            // The Deezer album is found by title search, so it can be another edition (clean vs explicit,
+            // remaster, different track order). The ISRC search then wins over every text match, so only
+            // trust the position when the track there is the same length and has the same explicit flag.
             let track = &deezer["tracks"][format!("{}:{}", song.disc_number, song.track_number)];
-            song.isrc = track["isrc"].as_str().filter(|isrc| !isrc.is_empty()).map(String::from);
+            let same_length = track["duration"].as_f64().is_some_and(|length| (length - song.duration).abs() <= 3.0);
+            let same_edit = track["explicit"].as_bool().is_none_or(|explicit| explicit == song.explicit);
+            song.isrc =
+                track["isrc"].as_str().filter(|isrc| !isrc.is_empty() && same_length && same_edit).map(String::from);
         }
     }
     if let Some(isrc) = song.isrc.as_deref().filter(|isrc| !isrc.is_empty()) {
@@ -497,6 +509,26 @@ fn album(uri: &str, cfg: &Value) -> R<Vec<Value>> {
         .collect())
 }
 
+/// `getTrack` has no disc number, so a single-track URL from disc 2 would be tagged disc 1 and get disc 1's
+/// Deezer data (ISRC, BPM, gain). The album's track list has it; only multi-disc albums need the lookup.
+fn disc_number(track: &mut Value, cfg: &Value) -> R<()> {
+    if track["discNumber"].is_u64() {
+        return Ok(());
+    }
+    let Some(album_uri) = track["albumOfTrack"]["uri"].as_str().map(String::from) else {
+        return Ok(());
+    };
+    if album_meta(&album_uri, cfg)?["discs"]["totalCount"].as_u64().unwrap_or(1) <= 1 {
+        return Ok(());
+    }
+    let uri = &track["uri"];
+    let disc = album(&album_uri, cfg)?.iter().find(|item| item["uri"] == *uri).map(|item| item["discNumber"].clone());
+    if let Some(disc) = disc.filter(Value::is_u64) {
+        track["discNumber"] = disc;
+    }
+    Ok(())
+}
+
 fn artist(uri: &str, cfg: &Value) -> R<Vec<Song>> {
     let id = uri.rsplit(':').next().unwrap_or_default();
     let api = cfg["use_official_api"] == true;
@@ -660,7 +692,11 @@ pub fn resolve(text: &str, cfg: &Value) -> R<Vec<Song>> {
     let kind = uri.split(':').nth(1).unwrap_or_default();
     let tracks = match (kind, api) {
         ("track", true) => official(&format!("tracks/{id}"), cfg)?,
-        ("track", false) => vec![query("getTrack", json!({"uri": uri}), cfg)?["data"]["trackUnion"].take()],
+        ("track", false) => {
+            let mut track = query("getTrack", json!({"uri": uri}), cfg)?["data"]["trackUnion"].take();
+            disc_number(&mut track, cfg)?;
+            vec![track]
+        }
         ("album", true) => {
             let mut tracks = official(&format!("albums/{id}/tracks?limit=50"), cfg)?;
             tracks.iter_mut().for_each(|track| track["albumOfTrack"]["uri"] = json!(uri));
