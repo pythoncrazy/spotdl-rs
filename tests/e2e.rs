@@ -79,17 +79,19 @@ fn save_keeps_pins_and_lists_every_song() {
 }
 
 #[test]
-fn artist_keeps_original_albums_whole() {
+fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
     let dir = dir("artist");
     let file = dir.join("kendrick.spotdl");
     let kendrick = "https://open.spotify.com/artist/2YZyLoL8N0Wb9xBt1NhZWg";
     ok(spotdl(&dir, &["save", kendrick, "--save-file", file.to_str().unwrap()]));
     let songs = json_file(&file);
     let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
-    // The standard albums keep all their songs; reissues add only the songs that the originals do not have.
+    // An album keeps all its songs; a reissue under another title adds only the songs that are new.
     assert_eq!(album("DAMN."), 14);
     assert_eq!(album("DAMN. COLLECTORS EDITION."), 0);
-    assert_eq!(album("good kid, m.A.A.d city"), 13);
+    // A deluxe edition that has the standard edition's songs replaces it and is kept whole.
+    assert_eq!(album("good kid, m.A.A.d city (Deluxe)"), 17);
+    assert_eq!(album("good kid, m.A.A.d city"), 0);
 }
 
 #[test]
