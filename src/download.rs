@@ -276,6 +276,18 @@ fn lrclib(song: &Song) -> Vec<String> {
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
 /// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
 fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
+    // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
+    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::LazyLock::new(Default::default);
+    let key = format!("{artist}\n{}\n{}\n{max}", lyrics_title(song), song.year);
+    if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+        return pages.clone();
+    }
+    let pages = genius_pages(song, artist, max);
+    FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
+    pages
+}
+
+fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
     let headers: Vec<(&str, &str)> = auth.iter().map(|auth| ("Authorization", auth.as_str())).collect();
@@ -297,9 +309,14 @@ fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
             && !hit_title.is_empty()
             && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
     };
-    let hits = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
+    let mut hits: Vec<Value> = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
+    hits.retain(|hit| same(&hit));
+    // An artist can have two songs with one title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026): the song
+    // of the release's year goes first.
+    let year = |hit: &Value| hit["result"]["release_date_components"]["year"].as_u64();
+    hits.sort_by_key(|hit| song.year == 0 || year(hit) != Some(u64::from(song.year)));
     let pages: Vec<String> =
-        hits.iter().filter(same).filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
+        hits.iter().filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
     pages
         .iter()
         .filter_map(|page| {
@@ -314,7 +331,10 @@ fn provider(name: &str, song: &Song) -> Option<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let (artist, title) = (&song.artist, lyrics_title(song));
     let lyrics = match name {
-        "synced" => lrclib(song).into_iter().next()?,
+        "synced" => {
+            let words = genius(song, artist, 1).into_iter().next();
+            lrclib(song).into_iter().find(|lyrics| words.as_ref().is_none_or(|words| same_lyrics(lyrics, words)))?
+        }
         "genius" => genius(song, artist, 1).into_iter().next()?,
         "azlyrics" => {
             let url = format!(
@@ -356,6 +376,42 @@ fn plain_lyrics(lyrics: &str) -> String {
         line.to_string()
     };
     lyrics.lines().map(untimed).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether two lyrics are the words of one song: at least 30% of the word pairs of the shorter are in the longer.
+/// Lyrics sites write a song a little differently (ad-libs, spellings), but another song shares only common pairs
+/// ("i dont", "you know"): on 92 songs of a library, LRCLIB and Genius shared 80% of the pairs of a song (median)
+/// and at most 8% with another song.
+fn same_lyrics(a: &str, b: &str) -> bool {
+    let pairs = |lyrics: &str| -> HashSet<(String, String)> {
+        let words: Vec<String> = plain_lyrics(lyrics)
+            .lines()
+            .filter(|line| !(line.trim_start().starts_with('[') && line.trim_end().ends_with(']')))
+            .flat_map(|line| {
+                line.to_lowercase()
+                    .replace(['\'', '’'], "")
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        words.windows(2).map(|pair| (pair[0].clone(), pair[1].clone())).collect()
+    };
+    let (a, b) = (pairs(a), pairs(b));
+    let shorter = a.len().min(b.len());
+    // A few words (an instrumental's "[Instrumental]", a skit) cannot tell.
+    shorter < 5 || a.intersection(&b).count() * 10 >= shorter * 3
+}
+
+/// The words that the song's lyrics must have: its own plain lyrics (from the first lyrics provider that had
+/// them; Genius by default), or else its Genius page. Genius has a page for each song, with the artists and the
+/// release date; LRCLIB is a crowd's uploads and has, for example, "KING" from VULTURES 1 under BULLY's "KING".
+fn reference(song: &Song, own: Option<&String>) -> Option<String> {
+    own.filter(|lyrics| !is_synced(lyrics)).cloned().or_else(|| {
+        let artists = song.artists.iter().chain([&song.artist]);
+        artists.filter(|artist| !artist.is_empty()).find_map(|artist| genius(song, artist, 1).into_iter().next())
+    })
 }
 
 /// What the `lyrics_aligner` command made of the lyrics.
@@ -422,16 +478,24 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let recording = Song { duration: length, ..song.clone() };
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
-    // Without an aligner, or when it cannot hear the words, synced lyrics as long as the file are trusted.
-    let trusted = |own: Option<String>| -> R<bool> {
-        let synced = own.filter(|lyrics| fits && is_synced(lyrics));
-        if let Some(lrc) = synced.or_else(|| lrclib(&recording).into_iter().find(|lyrics| is_synced(lyrics))) {
+    // Without an aligner, or when it cannot hear the words, synced lyrics are used when they were timed to a
+    // recording as long as the file and their words are the song's (see `reference`): the song's own, else LRCLIB's.
+    // Without such lyrics, an old `.lrc` with the words of another song is removed.
+    let checked = |own: Option<String>| -> R<bool> {
+        let reference = reference(song, own.as_ref());
+        let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
+        let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
+        let found = std::iter::once_with(|| lrclib(&recording)).flatten().filter(|lyrics| is_synced(lyrics));
+        if let Some(lrc) = own_synced.into_iter().chain(found).find(agrees) {
             fs::write(&sidecar, lrc)?;
+        } else if replace && fs::read_to_string(&sidecar).is_ok_and(|old| !agrees(&old)) {
+            log("WARNING", &format!("{}: removed, its lyrics are another song's", sidecar.display()));
+            fs::remove_file(&sidecar)?;
         }
         Ok(true)
     };
     if !text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty()) {
-        return trusted(own);
+        return checked(own);
     }
     // The aligner checks each candidate against the recording, in this order, and times the first that fits: the
     // old `.lrc`, the song's own synced lyrics, LRCLIB's versions as long as the file, the song's own plain lyrics,
@@ -466,7 +530,7 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
             Aligned::NoFit => no_fit = true,
             // One transcript serves every candidate, so the others cannot tell either. An old `.lrc` stays.
             Aligned::Unsure if sidecar.exists() => return Ok(true),
-            Aligned::Unsure => return trusted(own),
+            Aligned::Unsure => return checked(own),
             Aligned::Failed => return Ok(true),
         }
     }
