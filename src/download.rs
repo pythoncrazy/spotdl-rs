@@ -239,9 +239,21 @@ fn lrclib_search(url: &str) -> Option<Vec<Value>> {
 }
 
 fn lrclib(song: &Song) -> Vec<String> {
+    // LRCLIB files a song under one of its artists ("KING" of ¥$ is under Kanye West).
+    let mut artists = vec![&song.artist];
+    artists.extend(song.artists.iter().filter(|artist| **artist != song.artist));
+    artists
+        .into_iter()
+        .filter(|artist| !artist.is_empty())
+        .map(|artist| lrclib_by(song, artist))
+        .find(|found| !found.is_empty())
+        .unwrap_or_default()
+}
+
+fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
-        url_encode(&song.artist),
+        url_encode(artist),
         url_encode(lyrics_title(song))
     );
     // The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often busy, so it is asked once
@@ -311,10 +323,11 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
     };
     let mut hits: Vec<Value> = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
     hits.retain(|hit| same(&hit));
-    // An artist can have two songs with one title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026): the song
-    // of the release's year goes first.
+    // The same title goes before a longer one ("Intro" before "Intro (Skit)"), and as an artist can have two songs
+    // with one title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026), the song of the release's year first.
     let year = |hit: &Value| hit["result"]["release_date_components"]["year"].as_u64();
-    hits.sort_by_key(|hit| song.year == 0 || year(hit) != Some(u64::from(song.year)));
+    let exact = |hit: &Value| plain_title(hit["result"]["title"].as_str().unwrap_or_default()) == song_title;
+    hits.sort_by_key(|hit| (!exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year))));
     let pages: Vec<String> =
         hits.iter().filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
     pages
@@ -856,14 +869,15 @@ fn meta_file(file: &Path) -> R<()> {
         artist: artists.first().cloned().unwrap_or_default(),
         artists,
         album_name: tag.album().unwrap_or_default().into(),
+        year: tag.year().unwrap_or_default(),
         duration: audio.properties().duration().as_secs_f64(),
         lyrics: lyrics.clone(),
         ..Song::default()
     };
-    if complete && !force && !redownload {
-        // `--overwrite metadata` or `force` checks the `.lrc` files that exist again.
-        let replace = matches!(text("overwrite"), Some("force" | "metadata"));
-        if !on("generate_lrc") || (file.with_extension("lrc").exists() && !replace) {
+    // `--overwrite metadata` or `force` checks the files' lyrics again.
+    let replace = matches!(text("overwrite"), Some("force" | "metadata"));
+    if complete && !force && !redownload && !replace {
+        if !on("generate_lrc") || file.with_extension("lrc").exists() {
             return Ok(());
         }
         if lyrics.as_deref().is_some_and(is_synced) {
@@ -893,9 +907,25 @@ fn meta_file(file: &Path) -> R<()> {
     // `force` fetches the lyrics again, for example to get synced lyrics that were not available before.
     song.lyrics =
         if force { find_lyrics(&song).or(lyrics.clone()) } else { lyrics.clone().or_else(|| find_lyrics(&song)) };
+    // Lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under BULLY's) are replaced by the
+    // song's Genius lyrics.
+    if replace && !force {
+        let words = song.lyrics.as_ref().and_then(|_| reference(&song, None));
+        if let Some(words) = words.filter(|words| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, words))) {
+            log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
+            song.lyrics = Some(words);
+        }
+    }
     if on_spotify {
         if !complete || force {
             write_tags(file, &song)?;
+        } else if song.lyrics != lyrics {
+            let mut audio = lofty::read_from_path(file)?;
+            audio
+                .primary_tag_mut()
+                .ok_or("no tags")?
+                .insert_text(ItemKey::Lyrics, song.lyrics.clone().unwrap_or_default());
+            audio.save_to_path(file, WriteOptions::default())?;
         }
         write_lrc(file, &song)?;
     } else {
