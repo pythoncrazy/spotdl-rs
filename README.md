@@ -35,7 +35,7 @@ Use `--generate-lrc` to write a synced `.lrc` file next to each song. Synced lyr
 
 It keeps each transcript in `$ALIGN_CACHE` (default `~/.cache/align-lyrics`), by the audio's SHA-1, and `--cache AUDIO...` only fills that cache. OUT can be `-` for stdout.
 
-With `meta`, a song without a Spotify URL takes the tags of a Spotify search result only when that result has the same title, artist, and length. Otherwise the song keeps its tags, and only its lyrics change. Such a song (for example, an unreleased one) has many versions of about the same length, so its lyrics are always timed by the aligner when one is set. Without other lyrics, the aligner times the words of its old `.lrc` file again.
+`meta` works on `--threads` files at a time. With `meta`, a song without a Spotify URL takes the tags of a Spotify search result only when that result has the same title, artist, and length. Otherwise the song keeps its tags, and only its lyrics change. Such a song (for example, an unreleased one) has many versions of about the same length, so its lyrics are always timed by the aligner when one is set. Without other lyrics, the aligner times the words of its old `.lrc` file again.
 
 Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` to add all songs from each album. Use `--ytm-data` to use the title and artist from a YouTube Music page.
 
