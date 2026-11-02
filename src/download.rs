@@ -1,4 +1,4 @@
-use crate::{http, list, log, number, on, search, spotify, text, url_encode, Pace, Song, R};
+use crate::{http, http_retrying, list, log, number, on, search, spotify, text, url_encode, Pace, Song, R};
 use lofty::{
     config::WriteOptions,
     picture::{MimeType, Picture, PictureType},
@@ -306,20 +306,53 @@ fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
     if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return pages.clone();
     }
-    let pages = genius_pages(song, artist, max);
+    // A failed request is not kept: the next ask tries again.
+    let Some(pages) = genius_pages(song, artist, max) else { return vec![] };
     FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
     pages
 }
 
-fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
-    let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
-    let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
-    let headers: Vec<(&str, &str)> = auth.iter().map(|auth| ("Authorization", auth.as_str())).collect();
+/// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
+/// skip the songs of that moment (no page would leave their lyrics unchecked), all threads wait, longer each time,
+/// and then try again.
+fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
+    for attempt in 0..12 {
+        GENIUS.wait();
+        match http_retrying(url, headers, None, 0) {
+            Ok(bytes) => return String::from_utf8(bytes).ok(),
+            Err(error) if error.to_string().contains("HTTP 429") => {
+                GENIUS.hold(std::time::Duration::from_secs(30 << attempt.min(3)));
+            }
+            Err(error) => {
+                log("WARNING", &format!("Genius: {error}"));
+                return None;
+            }
+        }
+    }
+    log("WARNING", &format!("Genius: still too many requests for {url}"));
+    None
+}
+
+/// The pages, or nothing when Genius could not be asked.
+fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<(String, bool)>> {
     let title = lyrics_title(song);
-    GENIUS.wait();
-    let url = format!("https://genius.com/api/search/song?q={}", url_encode(&format!("{artist} {title}")));
-    let Some(reply) = get(&url, &headers).and_then(|reply| serde_json::from_str::<Value>(&reply).ok()) else {
-        return vec![];
+    let query = url_encode(&format!("{artist} {title}"));
+    // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
+    // which is asked when the API cannot answer (a token that many people use is often out of requests).
+    let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
+    let from_api = auth.and_then(|auth| {
+        GENIUS.wait();
+        let url = format!("https://api.genius.com/search?q={query}");
+        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0).ok()?;
+        serde_json::from_slice::<Value>(&reply).ok()?["response"]["hits"].as_array().cloned()
+    });
+    let mut hits = match from_api {
+        Some(hits) => hits,
+        None => {
+            let url = format!("https://genius.com/api/search/song?q={query}");
+            let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok()?;
+            reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default()
+        }
     };
     let (artist, song_title) = (search::slug(artist, ""), plain_title(title));
     // The same artist and the same title: the artist's first hit can be another of the artist's songs. The
@@ -333,7 +366,6 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
             && !hit_title.is_empty()
             && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
     };
-    let mut hits: Vec<Value> = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
     hits.retain(|hit| same(&hit));
     // The page of the song's whole title goes first: "WHISKEY (RELEASE ME)" before Maroon 5's "Whiskey" (feat.
     // A$AP Rocky), and "For No One" before "For No One (Take 10 / Backing Track)", a session take from the 2022 box
@@ -366,13 +398,11 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
         .filter_map(|hit| Some((hit["result"]["url"].as_str()?.to_string(), titled(hit))))
         .take(max)
         .collect();
-    pages
-        .into_iter()
-        .filter_map(|(page, same)| {
-            GENIUS.wait();
-            Some((genius_lyrics(&get(&page, &[])?)?, same))
-        })
-        .collect()
+    let mut lyrics = vec![];
+    for (page, same) in pages {
+        lyrics.extend(genius_lyrics(&genius_get(&page, &[])?).map(|text| (text, same)));
+    }
+    Some(lyrics)
 }
 
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.

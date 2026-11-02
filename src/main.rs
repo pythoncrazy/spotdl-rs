@@ -146,6 +146,11 @@ pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 
 /// GET (or POST, given a body), retrying connection errors, 429 and 5xx with exponential backoff.
 pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8>> {
+    http_retrying(url, headers, body, number("max_retries"))
+}
+
+/// [`http`] with `retries` retries; 0 for a caller that paces its own retries.
+pub fn http_retrying(url: &str, headers: &[(&str, &str)], body: Option<&str>, retries: u64) -> R<Vec<u8>> {
     let mut attempt = 0;
     loop {
         let method = if body.is_some() { "POST" } else { "GET" };
@@ -153,7 +158,7 @@ pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8
         let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
         let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
         let retry = reply.as_ref().map_or(true, |reply| reply.status() == 429 || reply.status().is_server_error());
-        if retry && attempt < number("max_retries") {
+        if retry && attempt < retries {
             attempt += 1;
             std::thread::sleep(Duration::from_secs(1 << attempt));
             continue;
