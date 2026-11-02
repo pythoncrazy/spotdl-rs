@@ -22,7 +22,16 @@ Use `--max-retries 3` to set the number of retries after a failed request. Use `
 
 Use `--meta-threads N` to set the number of metadata workers; `save` uses them for searches and lyrics. Lyrics are fetched while the audio downloads.
 
-Use `--generate-lrc` to write a synced `.lrc` file next to each song. Synced lyrics are timed to one recording, so they are used only when they were timed to a recording as long as the file. Use `--lyrics-aligner CMD` to time plain lyrics to the file when no synced lyrics fit it. The program runs `CMD AUDIO LYRICS.txt OUT.lrc`, for one song at a time. A failed command writes no `.lrc` file. Exit status 3 means that the lyrics are another song's: an old `.lrc` file is then removed when `--overwrite` is `metadata` or `force`. `scripts/align_lyrics.py` is such a command (`--lyrics-aligner scripts/align_lyrics.py`, with `uv` in `PATH`). It uses Whisper to drop the lines that the recording does not have, add the verses that the text does not have, repeat choruses that the text has once, and time each line.
+Use `--generate-lrc` to write a synced `.lrc` file next to each song. Synced lyrics are timed to one recording, so they are used only when they were timed to a recording as long as the file. Same titles and lengths do not make the same song ("KING" on BULLY and on VULTURES 1 have one length), so use `--lyrics-aligner CMD` to check lyrics against the recording. The program runs `CMD AUDIO LYRICS OUT.lrc` for each candidate, in this order, until one fits: the song's own lyrics, LRCLIB's versions as long as the file (same album first, synced first), and for a song that is not on Spotify, the Genius pages of each of its artists. LYRICS is synced or plain text. The command writes the `.lrc` file, or exits with status 3 when the lyrics are another song's. When no candidate fits, an old `.lrc` file is removed if `--overwrite` is `metadata` or `force`. Any other failure writes no `.lrc` file. `--lyrics-aligner-jobs N` runs the command for N songs at a time (default 1).
+
+`scripts/align_lyrics.py` is such a command (`--lyrics-aligner scripts/align_lyrics.py`, with `uv` in `PATH`). It uses Whisper to transcribe the recording, and matches the lyric words to the heard words:
+
+- Synced lyrics whose times agree with the heard words are kept as they are; other lyrics are timed again.
+- Lines that the recording does not have are dropped (an intro of another version).
+- Verses that the text does not have are added from the transcript, and choruses that the text has once are repeated.
+- Lyrics are another song's (exit 3) when less than 40% of the lines are heard and no 8 lines in a row are.
+
+It keeps each transcript in `$ALIGN_CACHE` (default `~/.cache/align-lyrics`), by the audio's SHA-1, and `--cache AUDIO...` only fills that cache. OUT can be `-` for stdout.
 
 With `meta`, a song without a Spotify URL takes the tags of a Spotify search result only when that result has the same title, artist, and length. Otherwise the song keeps its tags, and only its lyrics change. Such a song (for example, an unreleased one) has many versions of about the same length, so its lyrics are always timed by the aligner when one is set. Without other lyrics, the aligner times the words of its old `.lrc` file again.
 
