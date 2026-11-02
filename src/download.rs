@@ -210,19 +210,23 @@ fn plain_title(title: &str) -> String {
 }
 
 /// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones.
-/// LRCLIB's search results for a URL. LRCLIB refuses requests (429, 503) when it is busy. All threads wait, then
-/// try again, so that a busy moment does not replace synced lyrics with plain ones.
+/// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy, so that a busy moment does not
+/// replace synced lyrics with plain ones, all threads wait and then try again: long after 429 (too many requests
+/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests).
 fn lrclib_search(url: &str) -> Option<Vec<Value>> {
     let mut body = None;
-    for attempt in 0..6 {
+    for attempt in 0..12 {
         LRCLIB.wait();
         match http(url, &[], None) {
             Ok(bytes) => {
                 body = String::from_utf8(bytes).ok();
                 break;
             }
-            Err(error) if ["HTTP 429", "HTTP 503"].iter().any(|code| error.to_string().contains(code)) => {
+            Err(error) if error.to_string().contains("HTTP 429") => {
                 LRCLIB.hold(std::time::Duration::from_secs(15 << attempt.min(3)));
+            }
+            Err(error) if error.to_string().contains("HTTP 503") => {
+                LRCLIB.hold(std::time::Duration::from_secs(2 + 2 * attempt.min(10)));
             }
             Err(error) => {
                 log("WARNING", &format!("LRCLIB: {error}"));
