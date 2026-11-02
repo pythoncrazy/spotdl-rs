@@ -92,6 +92,15 @@ fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
     // A deluxe edition that has the standard edition's songs replaces it and is kept whole.
     assert_eq!(album("good kid, m.A.A.d city (Deluxe)"), 17);
     assert_eq!(album("good kid, m.A.A.d city"), 0);
+
+    // The anniversary edition is kept whole, with its "Intro": an "Intro" on another album is another song.
+    let file = dir.join("cole.spotdl");
+    let cole = "https://open.spotify.com/artist/6l3HvQ5sa6mXTsMTB19rO5";
+    ok(spotdl(&dir, &["save", cole, "--save-file", file.to_str().unwrap(), "--audio-providers="]));
+    let songs = json_file(&file);
+    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
+    assert_eq!(album("2014 Forest Hills Drive (10 Year Anniversary Edition)"), 21);
+    assert_eq!(album("2014 Forest Hills Drive"), 0);
 }
 
 #[test]
