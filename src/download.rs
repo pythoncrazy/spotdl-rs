@@ -492,14 +492,17 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
     // Without an aligner, or when it cannot hear the words, synced lyrics are used when they were timed to a
-    // recording as long as the file and their words are the song's (see `reference`): the song's own, else LRCLIB's.
+    // recording as long as the file and their words are the song's (see `reference`): the song's own, the old
+    // `.lrc`, or LRCLIB's.
     // Without such lyrics, an old `.lrc` with the words of another song is removed.
     let checked = |own: Option<String>| -> R<bool> {
         let reference = reference(song, own.as_ref());
         let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
+        // The old `.lrc` goes before LRCLIB, which is often busy.
         let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
+        let old = fs::read_to_string(&sidecar).ok().filter(|lyrics| is_synced(lyrics));
         let found = std::iter::once_with(|| lrclib(&recording)).flatten().filter(|lyrics| is_synced(lyrics));
-        if let Some(lrc) = own_synced.into_iter().chain(found).find(agrees) {
+        if let Some(lrc) = own_synced.into_iter().chain(old).chain(found).find(agrees) {
             fs::write(&sidecar, lrc)?;
         } else if replace && fs::read_to_string(&sidecar).is_ok_and(|old| !agrees(&old)) {
             log("WARNING", &format!("{}: removed, its lyrics are another song's", sidecar.display()));
