@@ -288,8 +288,20 @@ fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
 /// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
 fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
+    genius_titled(song, artist, max).into_iter().map(|(lyrics, _)| lyrics).collect()
+}
+
+/// Genius's lyrics of the song, only from a page with the song's title: the check that replaces lyrics must not
+/// take another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
+fn genius_same(song: &Song, artist: &str) -> Option<String> {
+    genius_titled(song, artist, 1).into_iter().next().filter(|(_, same)| *same).map(|(lyrics, _)| lyrics)
+}
+
+/// [`genius`]'s pages, each with whether its title is the song's.
+fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
     // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::LazyLock::new(Default::default);
+    type Pages = Vec<(String, bool)>;
+    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Pages>>> = std::sync::LazyLock::new(Default::default);
     let key = format!("{artist}\n{}\n{}\n{max}", song.name, song.year);
     if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return pages.clone();
@@ -299,7 +311,7 @@ fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
     pages
 }
 
-fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
+fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
     let headers: Vec<(&str, &str)> = auth.iter().map(|auth| ("Authorization", auth.as_str())).collect();
@@ -334,21 +346,31 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
     }
     let whole_title = search::clean_name(search::versionless(&song.name), &song.artists);
     let whole = |hit: &Value| search::clean_name(hit_title(hit), &song.artists) == whole_title;
+    // A question or exclamation mark tells two titles apart where the words are the same ("In the Flesh?").
+    let marks = |title: &str| -> String {
+        let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
+        title[..end].chars().filter(|c| matches!(c, '?' | '!')).collect()
+    };
+    let song_marks = marks(search::versionless(&song.name));
+    let titled = |hit: &Value| whole(hit) && marks(hit_title(hit)) == song_marks;
     let own = |hit: &Value| {
         let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
         !primary.is_empty() && artist.contains(&primary)
     };
     let exact = |hit: &Value| plain_title(hit_title(hit)) == song_title;
     hits.sort_by_key(|hit| {
-        (!whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
+        (!titled(hit), !whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
     });
-    let pages: Vec<String> =
-        hits.iter().filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
-    pages
+    let pages: Vec<(String, bool)> = hits
         .iter()
-        .filter_map(|page| {
+        .filter_map(|hit| Some((hit["result"]["url"].as_str()?.to_string(), titled(hit))))
+        .take(max)
+        .collect();
+    pages
+        .into_iter()
+        .filter_map(|(page, same)| {
             GENIUS.wait();
-            genius_lyrics(&get(page, &[])?)
+            Some((genius_lyrics(&get(&page, &[])?)?, same))
         })
         .collect()
 }
@@ -437,7 +459,7 @@ fn same_lyrics(a: &str, b: &str) -> bool {
 fn reference(song: &Song, own: Option<&String>) -> Option<String> {
     own.filter(|lyrics| !is_synced(lyrics)).cloned().or_else(|| {
         let artists = song.artists.iter().chain([&song.artist]);
-        artists.filter(|artist| !artist.is_empty()).find_map(|artist| genius(song, artist, 1).into_iter().next())
+        artists.filter(|artist| !artist.is_empty()).find_map(|artist| genius_same(song, artist))
     })
 }
 
