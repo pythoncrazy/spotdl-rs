@@ -1,7 +1,11 @@
 //! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer services.
 //! The download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to; enable it with
 //! `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the yt-dlp binary).
-use lofty::{config::WriteOptions, prelude::*, tag::ItemKey};
+use lofty::{
+    config::WriteOptions,
+    prelude::*,
+    tag::{ItemKey, Tag},
+};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -215,4 +219,75 @@ fn downloads_tags_and_repairs_metadata() {
     tagged.save_to_path(audio[0], WriteOptions::default()).unwrap();
     ok(spotdl(&dir, &["meta", audio[0].to_str().unwrap()]));
     assert_eq!(lofty::read_from_path(audio[0]).unwrap().primary_tag().unwrap().title().unwrap(), title);
+}
+
+/// A 10-second silent song with only a title, an artist and an album: no Spotify song is that short.
+fn local_song(dir: &Path) -> PathBuf {
+    let file = dir.join("song.opus");
+    let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "10"];
+    let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+    assert!(status.success());
+    let mut tagged = lofty::read_from_path(&file).unwrap();
+    let mut tag = Tag::new(tagged.primary_tag_type());
+    tag.set_title("That's Where You're Wrong".into());
+    tag.set_artist("Arctic Monkeys".into());
+    tag.set_album("Demos".into());
+    tagged.insert_tag(tag);
+    tagged.save_to_path(&file, WriteOptions::default()).unwrap();
+    file
+}
+
+fn meta(dir: &Path, file: &Path, args: &[&str]) -> String {
+    let mut meta = Command::new(env!("CARGO_BIN_EXE_spotdl"));
+    let args = [&["meta", file.to_str().unwrap(), "--lyrics-providers", "genius"], args].concat();
+    ok(meta.current_dir(dir).env("HOME", dir).args(args).output().unwrap())
+}
+
+fn lyrics(file: &Path) -> Option<String> {
+    lofty::read_from_path(file).unwrap().primary_tag().unwrap().get_string(&ItemKey::Lyrics).map(String::from)
+}
+
+#[test]
+fn meta_keeps_tags_of_songs_not_on_spotify_and_reads_only_genius_lyrics() {
+    let dir = dir("meta");
+    let file = local_song(&dir);
+    meta(&dir, &file, &[]);
+    let tagged = lofty::read_from_path(&file).unwrap();
+    let tag = tagged.primary_tag().unwrap();
+    assert_eq!(tag.album().as_deref(), Some("Demos"));
+    assert!(tag.pictures().is_empty());
+    let lyrics = lyrics(&file).unwrap();
+    assert!(lyrics.contains("[Verse 1]") && lyrics.lines().count() > 20, "{lyrics}");
+    for junk in ["You might also like", "Contributors", "Embed", "Translations"] {
+        assert!(!lyrics.contains(junk), "{junk}: {lyrics}");
+    }
+}
+
+#[test]
+fn lyrics_aligner_times_lyrics_and_removes_lyrics_of_another_song() {
+    let dir = dir("aligner");
+    let file = local_song(&dir);
+    let lrc = file.with_extension("lrc");
+    let aligner = |name: &str, body: &str| {
+        let script = dir.join(name);
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        Command::new("chmod").arg("+x").arg(&script).status().unwrap();
+        script.to_str().unwrap().to_string()
+    };
+    let args = ["--generate-lrc", "--overwrite", "metadata", "--lyrics-aligner"];
+
+    // The aligner gets the audio, the plain lyrics and the .lrc to write.
+    let fits = aligner("fits.sh", r#"[ -f "$1" ] && grep -q "Verse 1" "$2" && echo "[00:01.00]timed" > "$3""#);
+    meta(&dir, &file, &[&args[..], &[&fits]].concat());
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]timed\n");
+    assert!(lyrics(&file).is_some());
+
+    // Exit status 3: the lyrics are another song's, so the old .lrc goes and no lyrics go into the tags.
+    let mut tagged = lofty::read_from_path(&file).unwrap();
+    tagged.primary_tag_mut().unwrap().remove_key(&ItemKey::Lyrics);
+    tagged.save_to_path(&file, WriteOptions::default()).unwrap();
+    let other = aligner("other.sh", "exit 3");
+    let output = meta(&dir, &file, &[&args[..], &[&other]].concat());
+    assert!(!lrc.exists(), "{output}");
+    assert!(lyrics(&file).is_none());
 }
