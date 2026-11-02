@@ -36,7 +36,7 @@ Transcripts are cached by the audio's content in $ALIGN_CACHE (default ~/.cache/
 lyrics for one song transcribes it once. For a GPU, run the script with a Python that has a CUDA build of torch.
 
 It exits with status 3 and writes nothing when the lyrics are for another song: fewer than 40% of the lyric lines
-are heard, and no 8 lines in a row are heard. It exits with status 4 when Whisper hears fewer than 20 different
+are heard, no 8 lines in a row are heard, and fewer than 15% of the heard words are words of heard lines. It exits with status 4 when Whisper hears fewer than 20 different
 words (shouted vocals, an instrumental): the transcript then cannot tell.
 """
 
@@ -56,7 +56,8 @@ NO_FIT = 3  # Exit status when the lyrics are not the words of the recording.
 UNSURE = 4  # Exit status when Whisper hears too few words to tell (a shouted or noisy song, an instrumental).
 MIN_SAID = 20  # Different words that Whisper must hear to tell.
 MIN_HEARD = 0.4  # Part of the lyric lines that must be heard, or the lyrics are for another song,
-MIN_RUN = 8  # unless this many lines in a row are heard, with no two lines in a row missed.
+MIN_RUN = 8  # unless this many lines in a row are heard, with no two lines in a row missed,
+MIN_SHARE = 0.15  # or this part of the transcript words are words of heard lines.
 LINE_HEARD = 0.25  # Part of a line's words that must be heard for the line to count as heard.
 WORD_TIME = 0.25  # Seconds that a word takes at least.
 MAX_DRIFT = 2.0  # Seconds that an aligned line can be away from its matched words.
@@ -255,6 +256,51 @@ def write(out, lines):
         f.writelines(lines)
 
 
+def match_lines(lines, said):
+    """The lyric words (word, line), the matched transcript word of each lyric word, the matched transcript words of
+    each line, and whether each line is heard."""
+    # Each lyric word, the line it is on; matched to transcript words in order.
+    lyric = [(w, i) for i, line in enumerate(lines) for w in words(line)]
+    matcher = difflib.SequenceMatcher(None, [w for w, _ in lyric], [s[0] for s in said], autojunk=False)
+    match = {}  # lyric word index -> transcript word index
+    for block in matcher.get_matching_blocks():
+        match.update({block.a + k: block.b + k for k in range(block.size)})
+    count = [len(words(line)) for line in lines]
+    found = [[] for _ in lines]  # transcript word indexes per line
+    for a, b in match.items():
+        found[lyric[a][1]].append(b)
+    # A line is sung in a few seconds: of its matched words, only the most that lie that close together count.
+    for i in range(len(lines)):
+        span = max(LINE_SPAN, WORD_TIME * 4 * count[i])
+        best = []
+        for k, b in enumerate(found[i]):
+            close = [c for c in found[i][k:] if said[c][1] - said[b][1] <= span]
+            if len(close) > len(best):
+                best = close
+        found[i] = best
+    match = {a: b for a, b in match.items() if b in found[lyric[a][1]]}
+    is_heard = [len(found[i]) >= max(min(2, count[i]), LINE_HEARD * count[i]) for i in range(len(lines))]
+    return lyric, match, found, is_heard
+
+
+def fits(lines, said, lyric, match, is_heard):
+    """Whether the lyrics are the words of the recording, and why not."""
+    # The words of another song match a line here and there; the words of another version of this song match
+    # most lines, or a whole verse in a row.
+    # A run of heard lines goes on past one line that is not heard (Whisper misses a line here and there).
+    run = longest = missed = 0
+    for heard_line in is_heard:
+        missed = 0 if heard_line else missed + 1
+        run = run + 1 if heard_line else 0 if missed > 1 else run
+        longest = max(longest, run)
+    # Hard-to-hear songs (live, long instrumental parts) have fewer lines heard, but the words Whisper does hear are
+    # the lyrics': at least 18% of them fell in heard lines for 102 right lyrics, at most 9% for 277 wrong ones.
+    share = sum(1 for a in match if is_heard[lyric[a][1]]) / len(said)
+    if sum(is_heard) < MIN_HEARD * len(lines) and longest < MIN_RUN and share < MIN_SHARE:
+        return False, f"{sum(is_heard)} of {len(lines)} lines heard, {share:.0%} of the heard words"
+    return True, ""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default="large-v3-turbo", help="Whisper model (default: large-v3-turbo)")
@@ -295,37 +341,11 @@ def main():
         print(f"Whisper heard too few words to check the lyrics: {len(said)}", file=sys.stderr)
         sys.exit(UNSURE)
 
-    # Each lyric word, the line it is on; matched to transcript words in order.
-    lyric = [(w, i) for i, line in enumerate(lines) for w in words(line)]
-    matcher = difflib.SequenceMatcher(None, [w for w, _ in lyric], [s[0] for s in said], autojunk=False)
-    match = {}  # lyric word index -> transcript word index
-    for block in matcher.get_matching_blocks():
-        match.update({block.a + k: block.b + k for k in range(block.size)})
+    lyric, match, found, is_heard = match_lines(lines, said)
     count = [len(words(line)) for line in lines]
-    found = [[] for _ in lines]  # transcript word indexes per line
-    for a, b in match.items():
-        found[lyric[a][1]].append(b)
-    # A line is sung in a few seconds: of its matched words, only the most that lie that close together count.
-    for i in range(len(lines)):
-        span = max(LINE_SPAN, WORD_TIME * 4 * count[i])
-        best = []
-        for k, b in enumerate(found[i]):
-            close = [c for c in found[i][k:] if said[c][1] - said[b][1] <= span]
-            if len(close) > len(best):
-                best = close
-        found[i] = best
-    match = {a: b for a, b in match.items() if b in found[lyric[a][1]]}
-    is_heard = [len(found[i]) >= max(min(2, count[i]), LINE_HEARD * count[i]) for i in range(len(lines))]
-    # The words of another song match a line here and there; the words of another version of this song match
-    # most lines, or a whole verse in a row.
-    # A run of heard lines goes on past one line that is not heard (Whisper misses a line here and there).
-    run = longest = missed = 0
-    for heard_line in is_heard:
-        missed = 0 if heard_line else missed + 1
-        run = run + 1 if heard_line else 0 if missed > 1 else run
-        longest = max(longest, run)
-    if sum(is_heard) < MIN_HEARD * len(lines) and longest < MIN_RUN:
-        print(f"lyrics do not fit the recording: {sum(is_heard)} of {len(lines)} lines heard", file=sys.stderr)
+    fit, why = fits(lines, said, lyric, match, is_heard)
+    if not fit:
+        print(f"lyrics do not fit the recording: {why}", file=sys.stderr)
         sys.exit(NO_FIT)
     # A word or two of a line that is not heard match by chance (a "we" in another part); they do not place it.
     for i in range(len(lines)):

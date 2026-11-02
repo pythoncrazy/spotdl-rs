@@ -29,7 +29,7 @@ Use `--generate-lrc` to write a synced `.lrc` file next to each song. Synced lyr
 - Synced lyrics whose times agree with the heard words are kept as they are; other lyrics are timed again.
 - Lines that the recording does not have are dropped (an intro of another version).
 - Verses that the text does not have are added from the transcript, and choruses that the text has once are repeated.
-- Lyrics are another song's (exit 3) when less than 40% of the lines are heard and no 8 lines in a row are.
+- Lyrics are another song's (exit 3) when less than 40% of the lines are heard, no 8 lines in a row are, and less than 15% of the words Whisper hears are words of heard lines. On 400 songs of a library, right lyrics had at least 18% and other songs' lyrics at most 9%.
 - It cannot tell (exit 4) when Whisper hears fewer than 20 different words: shouted vocals, or an instrumental.
 - Whisper finds the language of the song, so lyrics in any language are checked.
 
