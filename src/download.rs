@@ -314,7 +314,7 @@ fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
 
 /// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
 /// skip the songs of that moment (no page would leave their lyrics unchecked), all threads wait, longer each time,
-/// and then try again.
+/// and then try again. A timeout or a server error is tried again a few times.
 fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
     for attempt in 0..12 {
         GENIUS.wait();
@@ -323,8 +323,12 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
             Err(error) if error.to_string().contains("HTTP 429") => {
                 GENIUS.hold(std::time::Duration::from_secs(30 << attempt.min(3)));
             }
+            // A timeout, a lost connection or a server error passes; a page that is not there does not.
+            Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
+                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
+            }
             Err(error) => {
-                log("WARNING", &format!("Genius: {error}"));
+                log("WARNING", &format!("Genius: {error} ({url})"));
                 return None;
             }
         }
