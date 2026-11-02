@@ -323,11 +323,16 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
     };
     let mut hits: Vec<Value> = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
     hits.retain(|hit| same(&hit));
-    // The same title goes before a longer one ("Intro" before "Intro (Skit)"), and as an artist can have two songs
-    // with one title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026), the song of the release's year first.
+    // The same title goes before a longer one ("Intro" before "Intro (Skit)"), and the title without a note before
+    // one with a note ("For No One" before "For No One (Take 10 / Backing Track)", a session take from a 2022 box set:
+    // the song is the plain title's page even if its release is the box set). As an artist can have two songs with one
+    // title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026), the song of the release's year goes first after that.
     let year = |hit: &Value| hit["result"]["release_date_components"]["year"].as_u64();
-    let exact = |hit: &Value| plain_title(hit["result"]["title"].as_str().unwrap_or_default()) == song_title;
-    hits.sort_by_key(|hit| (!exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year))));
+    let hit_title = |hit: &Value| hit["result"]["title"].as_str().unwrap_or_default().to_lowercase();
+    let whole_title = search::slug(&title.to_lowercase(), "");
+    let same_title = |hit: &Value| search::slug(&hit_title(hit), "") == whole_title;
+    let exact = |hit: &Value| plain_title(&hit_title(hit)) == song_title;
+    hits.sort_by_key(|hit| (!same_title(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year))));
     let pages: Vec<String> =
         hits.iter().filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
     pages
