@@ -449,8 +449,9 @@ fn same_lyrics(a: &str, b: &str) -> bool {
     };
     let (a, b) = (pairs(a), pairs(b));
     let shorter = a.len().min(b.len());
-    // A few words (an instrumental's "[Instrumental]", a skit) cannot tell.
-    shorter < 5 || a.intersection(&b).count() * 10 >= shorter * 3
+    // A few words cannot tell: an instrumental's "[Instrumental]", or a backing track's count-in that one site writes
+    // "1,2,3,4 (instrumental)" and another, with the studio talk, "One, two, three, four".
+    shorter < 20 || a.intersection(&b).count() * 10 >= shorter * 3
 }
 
 /// The words that the song's lyrics must have: its own plain lyrics (from the first lyrics provider that had
@@ -1043,5 +1044,9 @@ mod tests {
         assert!(!same_lyrics(VULTURES_KING, BULLY_KING));
         // Too few words to tell.
         assert!(same_lyrics("[Instrumental]", BULLY_KING));
+        let count_in = "Drive my car take 1\n\n1,2,3,4\n\n(instrumental)\n\n2\n\n1,2,3,4\n\n(instrumental)";
+        let talk = "[00:01.30]\"Drive My Car,\" take one\n[00:12.63]Can you take it a little bit slower this time?\n\
+            [00:17.37]One, two, three, four\n[01:02.16]Two\n[01:13.77]That's the coming in part\n[01:15.61]One, two";
+        assert!(same_lyrics(count_in, talk));
     }
 }
