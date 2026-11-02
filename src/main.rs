@@ -21,7 +21,7 @@ pub static HOME: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(home.unwrap_or_default()).join(".spotdl")
 });
 
-const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
+const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"lyrics_aligner":null,"lyrics_aligner_jobs":1,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
 const ALIASES: [(&str, &str); 4] = [
     ("audio", "audio_providers"),
     ("lyrics", "lyrics_providers"),
@@ -126,6 +126,12 @@ impl Pace {
         };
         std::thread::sleep(slot.saturating_duration_since(Instant::now()));
     }
+
+    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down.
+    pub fn hold(&self, pause: Duration) {
+        let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *next = Some(next.unwrap_or_else(Instant::now).max(Instant::now() + pause));
+    }
 }
 
 pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -140,6 +146,11 @@ pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 
 /// GET (or POST, given a body), retrying connection errors, 429 and 5xx with exponential backoff.
 pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8>> {
+    http_retrying(url, headers, body, number("max_retries"))
+}
+
+/// [`http`] with `retries` retries; 0 for a caller that paces its own retries.
+pub fn http_retrying(url: &str, headers: &[(&str, &str)], body: Option<&str>, retries: u64) -> R<Vec<u8>> {
     let mut attempt = 0;
     loop {
         let method = if body.is_some() { "POST" } else { "GET" };
@@ -147,7 +158,7 @@ pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8
         let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
         let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
         let retry = reply.as_ref().map_or(true, |reply| reply.status() == 429 || reply.status().is_server_error());
-        if retry && attempt < number("max_retries") {
+        if retry && attempt < retries {
             attempt += 1;
             std::thread::sleep(Duration::from_secs(1 << attempt));
             continue;
