@@ -49,6 +49,7 @@ import os
 import re
 import statistics
 import sys
+import time
 import unicodedata
 
 NO_FIT = 3  # Exit status when the lyrics are not the words of the recording.
@@ -107,8 +108,10 @@ def transcribe(audio, model_name, model):
     else:
         # Greedy decoding: three times faster than faster-whisper's 5 beams, and it hears as many sung words. The
         # language is found from several parts of the song, as an intro can sound like any language.
-        result = model().transcribe(
-            samples(audio), word_timestamps=True, verbose=None, beam_size=1, language_detection_segments=4
+        result = on_gpu(
+            lambda: model().transcribe(
+                samples(audio), word_timestamps=True, verbose=None, beam_size=1, language_detection_segments=4
+            )
         )
         heard = {
             "language": result.language,
@@ -124,6 +127,17 @@ def transcribe(audio, model_name, model):
         for k, w in enumerate(words(text))
     ]
     return heard["language"], paced(said)
+
+
+def on_gpu(run, tries=5):
+    """run(), tried again a few times when the GPU is out of memory for a moment (other songs share it)."""
+    for attempt in range(tries):
+        try:
+            return run()
+        except RuntimeError as error:
+            if "out of memory" not in str(error) or attempt == tries - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
 
 
 def paced(said):
@@ -356,7 +370,11 @@ def main():
         heard_there = [s[0] for s in said[before(i) + 1 : after(end)] if s[0] != "music"]
         run_words = [w for line in lines[i : end + 1] for w in words(line)]
         same = difflib.SequenceMatcher(None, run_words, heard_there, autojunk=False).get_matching_blocks()
-        other = end - i + 1 >= OTHER_LINES and len(heard_there) >= NEW_WORDS and sum(b.size for b in same) < OTHER_WORDS * len(heard_there)
+        other = (
+            end - i + 1 >= OTHER_LINES
+            and len(heard_there) >= NEW_WORDS
+            and sum(b.size for b in same) < OTHER_WORDS * len(heard_there)
+        )
         if stop - start < WORD_TIME * sum(count[i : end + 1]) or other:
             keep[i : end + 1] = [False] * (end + 1 - i)
         i = end + 1
@@ -402,7 +420,11 @@ def main():
         out += [(text, t) for t, text in added.pop(left)]
 
     # Whisper aligns the text; matched words correct lines that it puts far away.
-    aligned = model().align(samples(args.audio), "\n".join(text for text, _ in out), language=language, original_split=True)
+    aligned = on_gpu(
+        lambda: model().align(
+            samples(args.audio), "\n".join(text for text, _ in out), language=language, original_split=True
+        )
+    )
     starts = [seg.start for seg in aligned.segments if seg.text.strip()]
     if len(starts) != len(out):
         print(f"aligner returned {len(starts)} lines for {len(out)}; using matched words only", file=sys.stderr)
