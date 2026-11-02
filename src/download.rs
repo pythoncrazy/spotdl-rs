@@ -12,7 +12,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Mutex, OnceLock, PoisonError,
+    },
 };
 
 /// Template fields that only exist after Deezer enrichment.
@@ -204,9 +207,11 @@ fn provider(name: &str, song: &Song) -> Option<String> {
                 }
             }
             let tracks: Vec<Value> = serde_json::from_str(&body?).ok()?;
+            // Of the versions as long as the song, one with synced lyrics; the first one often has plain lyrics only.
             let same = |track: &&Value| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0;
-            let track = tracks.iter().find(same)?;
-            track["syncedLyrics"].as_str().or(track["plainLyrics"].as_str())?.into()
+            let synced = |track: &&Value| track["syncedLyrics"].as_str().is_some_and(|lyrics| !lyrics.is_empty());
+            let track = tracks.iter().filter(same).find(synced).or_else(|| tracks.iter().find(same))?;
+            track["syncedLyrics"].as_str().filter(|lyrics| !lyrics.is_empty()).or(track["plainLyrics"].as_str())?.into()
         }
         "genius" => {
             let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
@@ -292,8 +297,10 @@ enum Aligned {
 fn align(file: &Path, lyrics: &str) -> Aligned {
     let mut command = text("lyrics_aligner").unwrap_or_default().split_whitespace();
     let Some(program) = command.next() else { return Aligned::Failed };
-    let temp = file.with_extension("align");
-    let (input, output) = (temp.with_extension("align.txt"), temp.with_extension("align.lrc"));
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let temp =
+        std::env::temp_dir().join(format!("spotdl-align-{}-{}", std::process::id(), COUNT.fetch_add(1, Relaxed)));
+    let (input, output) = (temp.with_extension("txt"), temp.with_extension("lrc"));
     if fs::write(&input, plain_lyrics(lyrics)).is_err() {
         return Aligned::Failed;
     }
