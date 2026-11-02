@@ -95,7 +95,8 @@ def transcribe(audio, model_name, model):
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return paced([tuple(w) for w in json.load(f)])
-    heard = model().transcribe(samples(audio), language="en", word_timestamps=True, verbose=None)
+    # Greedy decoding: three times faster than faster-whisper's 5 beams, and it hears as many sung words.
+    heard = model().transcribe(samples(audio), language="en", word_timestamps=True, verbose=None, beam_size=1)
     said = [
         (w, word.start, word.word if k == 0 else "", word.probability)
         for seg in heard.segments
