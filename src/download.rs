@@ -5,6 +5,7 @@ use lofty::{
     prelude::*,
     tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
 };
+use rayon::prelude::*;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
@@ -865,16 +866,24 @@ pub fn meta(paths: &[String]) -> R<()> {
             false => audio_files(path, &mut files),
         }
     }
-    let failed = files.iter().filter(|file| {
-        let result = meta_file(file);
-        println!(
-            "{}: {}",
-            file.display(),
-            result.as_ref().map_or_else(|error| error.to_string(), |()| "updated".into())
-        );
-        result.is_err()
+    // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites and the aligner.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(number("threads").max(1) as usize).build()?;
+    let failed = pool.install(|| {
+        files
+            .par_iter()
+            .with_max_len(1)
+            .filter(|file| {
+                let result = meta_file(file);
+                println!(
+                    "{}: {}",
+                    file.display(),
+                    result.as_ref().map_or_else(|error| error.to_string(), |()| "updated".into())
+                );
+                result.is_err()
+            })
+            .count()
     });
-    match failed.count() {
+    match failed {
         0 => Ok(()),
         count => Err(format!("{count} of {} files failed", files.len()).into()),
     }
