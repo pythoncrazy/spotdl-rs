@@ -345,12 +345,14 @@ enum Aligned {
     Lrc(String),
     /// The lyrics are not the words of this recording (exit status 3).
     NoFit,
+    /// The recording cannot tell: its words are not heard (exit status 4).
+    Unsure,
     Failed,
 }
 
 /// Plain lyrics timed to the recording by the `lyrics_aligner` command. The command gets the audio file, a text
 /// file with the lyrics and the `.lrc` file to write. It exits with status 3 when the lyrics do not fit the
-/// recording.
+/// recording, and with status 4 when it cannot tell (the words of the recording are not heard).
 fn align(file: &Path, lyrics: &str) -> Aligned {
     let mut command = text("lyrics_aligner").unwrap_or_default().split_whitespace();
     let Some(program) = command.next() else { return Aligned::Failed };
@@ -374,10 +376,10 @@ fn align(file: &Path, lyrics: &str) -> Aligned {
             let error = String::from_utf8_lossy(&result.stderr);
             let error = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default();
             log("WARNING", &format!("lyrics aligner: {}: {}", file.display(), error.trim()));
-            if result.status.code() == Some(3) {
-                Aligned::NoFit
-            } else {
-                Aligned::Failed
+            match result.status.code() {
+                Some(3) => Aligned::NoFit,
+                Some(4) => Aligned::Unsure,
+                _ => Aligned::Failed,
             }
         }
         Err(error) => {
@@ -402,19 +404,22 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let recording = Song { duration: length, ..song.clone() };
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
-    if !text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty()) {
-        // Without an aligner, synced lyrics as long as the file are trusted.
+    // Without an aligner, or when it cannot hear the words, synced lyrics as long as the file are trusted.
+    let trusted = |own: Option<String>| -> R<bool> {
         let synced = own.filter(|lyrics| fits && is_synced(lyrics));
         if let Some(lrc) = synced.or_else(|| lrclib(&recording).into_iter().find(|lyrics| is_synced(lyrics))) {
-            fs::write(sidecar, lrc)?;
+            fs::write(&sidecar, lrc)?;
         }
-        return Ok(true);
+        Ok(true)
+    };
+    if !text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty()) {
+        return trusted(own);
     }
     // The aligner checks each candidate against the recording, in this order, and times the first that fits:
     // the song's own lyrics, LRCLIB's versions as long as the file, and for a song that is not on Spotify, the
     // Genius pages of each of its artists. Same titles and lengths do not make the same song ("KING" on BULLY
     // and on VULTURES 1).
-    let mut candidates: Vec<String> = own.into_iter().collect();
+    let mut candidates: Vec<String> = own.clone().into_iter().collect();
     candidates.extend(lrclib(&recording));
     if song.song_id.is_empty() {
         for artist in song.artists.iter().chain([&song.artist]) {
@@ -430,6 +435,9 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
                 return Ok(true);
             }
             Aligned::NoFit => no_fit = true,
+            // One transcript serves every candidate, so the others cannot tell either. An old `.lrc` stays.
+            Aligned::Unsure if sidecar.exists() => return Ok(true),
+            Aligned::Unsure => return trusted(own),
             Aligned::Failed => return Ok(true),
         }
     }

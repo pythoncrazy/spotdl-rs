@@ -264,7 +264,7 @@ fn meta_keeps_tags_of_songs_not_on_spotify_and_reads_only_genius_lyrics() {
 }
 
 #[test]
-fn lyrics_aligner_times_lyrics_and_removes_lyrics_of_another_song() {
+fn lyrics_aligner_times_lyrics_keeps_them_when_unsure_and_removes_lyrics_of_another_song() {
     let dir = dir("aligner");
     let file = local_song(&dir);
     let lrc = file.with_extension("lrc");
@@ -281,6 +281,11 @@ fn lyrics_aligner_times_lyrics_and_removes_lyrics_of_another_song() {
     meta(&dir, &file, &[&args[..], &[&fits]].concat());
     assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]timed\n");
     assert!(lyrics(&file).is_some());
+
+    // Exit status 4: the aligner cannot hear the words, so the old .lrc stays.
+    let unsure = aligner("unsure.sh", "exit 4");
+    let output = meta(&dir, &file, &[&args[..], &[&unsure]].concat());
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]timed\n", "{output}");
 
     // Exit status 3: the lyrics are another song's, so the old .lrc goes and no lyrics go into the tags.
     let mut tagged = lofty::read_from_path(&file).unwrap();

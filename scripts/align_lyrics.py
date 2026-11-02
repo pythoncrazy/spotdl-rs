@@ -36,7 +36,8 @@ Transcripts are cached by the audio's content in $ALIGN_CACHE (default ~/.cache/
 lyrics for one song transcribes it once. For a GPU, run the script with a Python that has a CUDA build of torch.
 
 It exits with status 3 and writes nothing when the lyrics are for another song: fewer than 40% of the lyric lines
-are heard, and no 8 lines in a row are heard.
+are heard, and no 8 lines in a row are heard. It exits with status 4 when Whisper hears fewer than 20 different
+words (shouted vocals, an instrumental): the transcript then cannot tell.
 """
 
 import argparse
@@ -48,8 +49,11 @@ import os
 import re
 import statistics
 import sys
+import unicodedata
 
 NO_FIT = 3  # Exit status when the lyrics are not the words of the recording.
+UNSURE = 4  # Exit status when Whisper hears too few words to tell (a shouted or noisy song, an instrumental).
+MIN_SAID = 20  # Different words that Whisper must hear to tell.
 MIN_HEARD = 0.4  # Part of the lyric lines that must be heard, or the lyrics are for another song,
 MIN_RUN = 8  # unless this many lines in a row are heard, with no two lines in a row missed.
 LINE_HEARD = 0.25  # Part of a line's words that must be heard for the line to count as heard.
@@ -69,7 +73,10 @@ CREDIT = re.compile(r"作曲|作词|编曲|^(composer|lyricist|producer|written 
 
 
 def words(text):
-    return [w for w in re.sub(r"[^a-z0-9' ]", " ", text.lower().replace("’", "'")).replace("'", "").split() if w]
+    """The words of a text, lowercase and without accents; each Chinese, Japanese or Korean character is a word."""
+    text = unicodedata.normalize("NFKD", text.lower().replace("’", "'").replace("'", ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.findall(r"[^\W_]+", re.sub(r"([\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af])", r" \1 ", text))
 
 
 def lyric_lines(path):
@@ -86,28 +93,37 @@ def lyric_lines(path):
 
 
 def transcribe(audio, model_name, model):
-    """Transcript words (word, start, text, probability), cached by the audio's content: a song is transcribed
-    once, also when several lyrics are tried for it. A word like "5-0" is two words, with its text on the first."""
+    """The language and the transcript words (word, start, text, probability), cached by the audio's content: a
+    song is transcribed once, also when several lyrics are tried for it. A word like "5-0" is two words, with its
+    text on the first."""
     with open(audio, "rb") as f:
         key = hashlib.sha1(f.read()).hexdigest()
-    cache = os.path.join(os.environ.get("ALIGN_CACHE", os.path.expanduser("~/.cache/align-lyrics")), model_name)
-    path = os.path.join(cache, key + ".json")
+    # The cache keeps Whisper's words as they are (start, text, probability), so that changes to words() apply.
+    base = os.environ.get("ALIGN_CACHE", os.path.expanduser("~/.cache/align-lyrics"))
+    path = os.path.join(base, "v2", model_name, key + ".json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            return paced([tuple(w) for w in json.load(f)])
-    # Greedy decoding: three times faster than faster-whisper's 5 beams, and it hears as many sung words.
-    heard = model().transcribe(samples(audio), language="en", word_timestamps=True, verbose=None, beam_size=1)
+            heard = json.load(f)
+    else:
+        # Greedy decoding: three times faster than faster-whisper's 5 beams, and it hears as many sung words. The
+        # language is found from several parts of the song, as an intro can sound like any language.
+        result = model().transcribe(
+            samples(audio), word_timestamps=True, verbose=None, beam_size=1, language_detection_segments=4
+        )
+        heard = {
+            "language": result.language,
+            "words": [[word.start, word.word, word.probability] for seg in result.segments for word in seg.words],
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(heard, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
     said = [
-        (w, word.start, word.word if k == 0 else "", word.probability)
-        for seg in heard.segments
-        for word in seg.words
-        for k, w in enumerate(words(word.word))
+        (w, start, text if k == 0 else "", probability)
+        for start, text, probability in heard["words"]
+        for k, w in enumerate(words(text))
     ]
-    os.makedirs(cache, exist_ok=True)
-    with open(path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(said, f)
-    os.replace(path + ".tmp", path)
-    return paced(said)
+    return heard["language"], paced(said)
 
 
 def paced(said):
@@ -260,7 +276,10 @@ def main():
     if not timed:
         sys.exit("no lyrics")
     lines = [text for text, _ in timed]
-    said = transcribe(args.audio, args.model, model)
+    language, said = transcribe(args.audio, args.model, model)
+    if len({w for w, *_ in said}) < MIN_SAID:
+        print(f"Whisper heard too few words to check the lyrics: {len(said)}", file=sys.stderr)
+        sys.exit(UNSURE)
 
     # Each lyric word, the line it is on; matched to transcript words in order.
     lyric = [(w, i) for i, line in enumerate(lines) for w in words(line)]
@@ -383,7 +402,7 @@ def main():
         out += [(text, t) for t, text in added.pop(left)]
 
     # Whisper aligns the text; matched words correct lines that it puts far away.
-    aligned = model().align(samples(args.audio), "\n".join(text for text, _ in out), language="en", original_split=True)
+    aligned = model().align(samples(args.audio), "\n".join(text for text, _ in out), language=language, original_split=True)
     starts = [seg.start for seg in aligned.segments if seg.text.strip()]
     if len(starts) != len(out):
         print(f"aligner returned {len(starts)} lines for {len(out)}; using matched words only", file=sys.stderr)
