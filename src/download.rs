@@ -432,17 +432,28 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     if !text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty()) {
         return trusted(own);
     }
-    // The aligner checks each candidate against the recording, in this order, and times the first that fits:
-    // the song's own lyrics, LRCLIB's versions as long as the file, and for a song that is not on Spotify, the
-    // Genius pages of each of its artists. Same titles and lengths do not make the same song ("KING" on BULLY
-    // and on VULTURES 1).
-    let mut candidates: Vec<String> = own.clone().into_iter().collect();
-    candidates.extend(lrclib(&recording));
-    if song.song_id.is_empty() {
-        for artist in song.artists.iter().chain([&song.artist]) {
-            candidates.extend(genius(song, artist, 4));
-        }
-    }
+    // The aligner checks each candidate against the recording, in this order, and times the first that fits: the
+    // old `.lrc`, the song's own synced lyrics, LRCLIB's versions as long as the file, the song's own plain lyrics,
+    // and for a song that is not on Spotify, the Genius pages of each of its artists. Same titles and lengths do not
+    // make the same song ("KING" on BULLY and on VULTURES 1). LRCLIB is often busy, so it is asked only when the
+    // lyrics before it do not fit.
+    let old = fs::read_to_string(&sidecar).ok().filter(|lrc| is_synced(lrc));
+    let (own_synced, own_plain): (Vec<String>, Vec<String>) = own.clone().into_iter().partition(|l| is_synced(l));
+    let sources: [Box<dyn FnOnce() -> Vec<String> + '_>; 5] = [
+        Box::new(|| old.into_iter().collect()),
+        Box::new(|| own_synced),
+        Box::new(|| lrclib(&recording)),
+        Box::new(|| own_plain),
+        Box::new(|| {
+            let artists = song.artists.iter().chain([&song.artist]);
+            if song.song_id.is_empty() {
+                artists.flat_map(|artist| genius(song, artist, 4)).collect()
+            } else {
+                vec![]
+            }
+        }),
+    ];
+    let candidates = sources.into_iter().flat_map(|source| source());
     let mut tried = HashSet::new();
     let mut no_fit = false;
     for lyrics in candidates.into_iter().filter(|lyrics| tried.insert(plain_lyrics(lyrics))) {
