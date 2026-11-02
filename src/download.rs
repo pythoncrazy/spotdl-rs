@@ -210,18 +210,13 @@ fn plain_title(title: &str) -> String {
 }
 
 /// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones.
-fn lrclib(song: &Song) -> Vec<String> {
-    let url = format!(
-        "https://lrclib.net/api/search?artist_name={}&track_name={}",
-        url_encode(&song.artist),
-        url_encode(lyrics_title(song))
-    );
-    // LRCLIB refuses requests (429, 503) when it is busy. All threads wait, then try again, so that a busy moment
-    // does not replace synced lyrics with plain ones.
+/// LRCLIB's search results for a URL. LRCLIB refuses requests (429, 503) when it is busy. All threads wait, then
+/// try again, so that a busy moment does not replace synced lyrics with plain ones.
+fn lrclib_search(url: &str) -> Option<Vec<Value>> {
     let mut body = None;
     for attempt in 0..6 {
         LRCLIB.wait();
-        match http(&url, &[], None) {
+        match http(url, &[], None) {
             Ok(bytes) => {
                 body = String::from_utf8(bytes).ok();
                 break;
@@ -235,7 +230,25 @@ fn lrclib(song: &Song) -> Vec<String> {
             }
         }
     }
-    let Some(tracks) = body.and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok()) else { return vec![] };
+    body.and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
+}
+
+fn lrclib(song: &Song) -> Vec<String> {
+    let url = format!(
+        "https://lrclib.net/api/search?artist_name={}&track_name={}",
+        url_encode(&song.artist),
+        url_encode(lyrics_title(song))
+    );
+    // The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often busy, so it is asked once
+    // and the second search takes the results (they are then not kept: a library has many songs).
+    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Value>>>> = std::sync::LazyLock::new(Default::default);
+    let found = FOUND.lock().unwrap_or_else(PoisonError::into_inner).remove(&url);
+    let tracks = found.or_else(|| {
+        let tracks = lrclib_search(&url)?;
+        FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(url.clone(), tracks.clone());
+        Some(tracks)
+    });
+    let Some(tracks) = tracks else { return vec![] };
     let album = plain_title(&song.album_name);
     let text =
         |track: &Value, key: &str| track[key].as_str().filter(|lyrics| !lyrics.trim().is_empty()).map(String::from);
