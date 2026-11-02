@@ -288,20 +288,47 @@ fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
 /// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
 fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
-    genius_titled(song, artist, max).into_iter().map(|(lyrics, _)| lyrics).collect()
+    genius_titled(song, artist, max).into_iter().map(|page| page.lyrics).collect()
 }
 
-/// Genius's lyrics of the song, only from a page with the song's title: the check that replaces lyrics must not
-/// take another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
-fn genius_same(song: &Song, artist: &str) -> Option<String> {
-    genius_titled(song, artist, 1).into_iter().next().filter(|(_, same)| *same).map(|(lyrics, _)| lyrics)
+/// A Genius page of lyrics.
+#[derive(Clone)]
+struct Page {
+    lyrics: String,
+    /// Genius's song id.
+    id: u64,
+    /// The page has the song's title.
+    titled: bool,
+    /// Genius dates the song to the year of the song's release.
+    same_year: bool,
 }
 
-/// [`genius`]'s pages, each with whether its title is the song's.
-fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<(String, bool)> {
+/// Genius's page of the song, only one with the song's title: the check that replaces lyrics must not take
+/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
+fn genius_same(song: &Song, artist: &str) -> Option<Page> {
+    genius_titled(song, artist, 1).into_iter().next().filter(|page| page.titled)
+}
+
+/// Whether the page is the song's recording and not another of the artist's songs with that title: Genius dates it
+/// to the release's year or has it on the release's album. Spotify calls Until the End of Time's "When I Get Free
+/// II (Remix)" "When I Get Free", the title of a song from R U Still Down; Genius has that song on R U Still Down
+/// and Euthanasia.
+fn released_on(song: &Song, page: &Page) -> bool {
+    page.same_year || {
+        let url = format!("https://genius.com/api/songs/{}", page.id);
+        let album = plain_title(&song.album_name);
+        let reply = genius_get(&url, &[]).and_then(|reply| serde_json::from_str::<Value>(&reply).ok());
+        let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
+        albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
+            !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
+        })
+    }
+}
+
+/// [`genius`]'s pages.
+fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<Page> {
     // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
-    type Pages = Vec<(String, bool)>;
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Pages>>> = std::sync::LazyLock::new(Default::default);
+    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Page>>>> = std::sync::LazyLock::new(Default::default);
     let key = format!("{artist}\n{}\n{}\n{max}", song.name, song.year);
     if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return pages.clone();
@@ -338,7 +365,7 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
 }
 
 /// The pages, or nothing when Genius could not be asked.
-fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<(String, bool)>> {
+fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     let title = lyrics_title(song);
     let query = url_encode(&format!("{artist} {title}"));
     // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
@@ -397,16 +424,14 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<(String, bo
     hits.sort_by_key(|hit| {
         (!titled(hit), !whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
     });
-    let pages: Vec<(String, bool)> = hits
-        .iter()
-        .filter_map(|hit| Some((hit["result"]["url"].as_str()?.to_string(), titled(hit))))
-        .take(max)
-        .collect();
-    let mut lyrics = vec![];
-    for (page, same) in pages {
-        lyrics.extend(genius_lyrics(&genius_get(&page, &[])?).map(|text| (text, same)));
+    let same_year = |hit: &Value| song.year != 0 && year(hit) == Some(u64::from(song.year));
+    let mut pages = vec![];
+    for hit in hits.iter().take(max) {
+        let (Some(url), Some(id)) = (hit["result"]["url"].as_str(), hit["result"]["id"].as_u64()) else { continue };
+        let Some(lyrics) = genius_lyrics(&genius_get(url, &[])?) else { continue };
+        pages.push(Page { lyrics, id, titled: titled(hit), same_year: same_year(hit) });
     }
-    Some(lyrics)
+    Some(pages)
 }
 
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
@@ -494,7 +519,8 @@ fn same_lyrics(a: &str, b: &str) -> bool {
 fn reference(song: &Song, own: Option<&String>) -> Option<String> {
     own.filter(|lyrics| !is_synced(lyrics)).cloned().or_else(|| {
         let artists = song.artists.iter().chain([&song.artist]);
-        artists.filter(|artist| !artist.is_empty()).find_map(|artist| genius_same(song, artist))
+        let mut pages = artists.filter(|artist| !artist.is_empty()).filter_map(|artist| genius_same(song, artist));
+        pages.find(|page| released_on(song, page)).map(|page| page.lyrics)
     })
 }
 
@@ -984,10 +1010,13 @@ fn meta_file(file: &Path) -> R<()> {
     // Lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under BULLY's) are replaced by the
     // song's Genius lyrics.
     if replace && !force {
-        let words = song.lyrics.as_ref().and_then(|_| reference(&song, None));
-        if let Some(words) = words.filter(|words| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, words))) {
+        // Genius's page is asked for its albums only when the lyrics differ.
+        let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
+        let page = song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist)));
+        let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
+        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page)) {
             log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
-            song.lyrics = Some(words);
+            song.lyrics = Some(page.lyrics);
         }
     }
     if on_spotify {
