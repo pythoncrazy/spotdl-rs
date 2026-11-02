@@ -12,7 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock, PoisonError},
 };
 
 /// Template fields that only exist after Deezer enrichment.
@@ -23,6 +23,7 @@ static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
 static GENIUS: Pace = Pace::new(1000);
+static ALIGNER: Mutex<()> = Mutex::new(());
 
 fn path_safe(value: &str) -> String {
     value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect()
@@ -151,19 +152,58 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
     Some(out.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
 }
 
+/// Genius lyrics: the text of each `data-lyrics-container` div. The page puts song lists ("You might also
+/// like") and ads between these divs, so only the divs are read.
+fn genius_lyrics(page: &str) -> Option<String> {
+    let blocks = page.split("data-lyrics-container=\"true\"").skip(1).filter_map(|part| {
+        let mut depth = 1;
+        let end = part.match_indices('<').find_map(|(i, _)| {
+            let tag = &part[i + 1..];
+            depth += usize::from(tag.starts_with("div"));
+            depth -= usize::from(tag.starts_with("/div"));
+            (depth == 0).then_some(i)
+        })?;
+        html(&part[..end], ">", "\0")
+    });
+    let text: Vec<String> = blocks.map(|block| block.trim().to_string()).filter(|block| !block.is_empty()).collect();
+    Some(text.join("\n")).filter(|text| !text.is_empty())
+}
+
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
 fn provider(name: &str, song: &Song) -> Option<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
-    let (artist, title) = (&song.artist, search::versionless(&song.name));
+    // The title without " - Remastered" or "(feat. ...)" notes, which lyrics sites leave out.
+    let title = search::versionless(&song.name);
+    let lower = title.to_ascii_lowercase();
+    let feat = [" (feat", " (with", " (ft.", " [feat", " [with"].iter().filter_map(|note| lower.find(note)).min();
+    let (artist, title) = (&song.artist, &title[..feat.unwrap_or(title.len())]);
     let lyrics = match name {
         "synced" => {
-            LRCLIB.wait();
             let url = format!(
                 "https://lrclib.net/api/search?artist_name={}&track_name={}",
                 url_encode(artist),
                 url_encode(title)
             );
-            let tracks: Vec<Value> = serde_json::from_str(&get(&url, &[])?).ok()?;
+            // LRCLIB refuses requests (429, 503) when it is busy. All threads wait, then try again, so that a
+            // busy moment does not replace synced lyrics with plain ones.
+            let mut body = None;
+            for attempt in 0..6 {
+                LRCLIB.wait();
+                match http(&url, &[], None) {
+                    Ok(bytes) => {
+                        body = String::from_utf8(bytes).ok();
+                        break;
+                    }
+                    Err(error) if ["HTTP 429", "HTTP 503"].iter().any(|code| error.to_string().contains(code)) => {
+                        LRCLIB.hold(std::time::Duration::from_secs(15 << attempt.min(3)));
+                    }
+                    Err(error) => {
+                        log("WARNING", &format!("LRCLIB: {error}"));
+                        break;
+                    }
+                }
+            }
+            let tracks: Vec<Value> = serde_json::from_str(&body?).ok()?;
             let same = |track: &&Value| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0;
             let track = tracks.iter().find(same)?;
             track["syncedLyrics"].as_str().or(track["plainLyrics"].as_str())?.into()
@@ -175,14 +215,26 @@ fn provider(name: &str, song: &Song) -> Option<String> {
             let url = format!("https://genius.com/api/search/song?q={}", url_encode(&format!("{artist} {title}")));
             let reply: Value = serde_json::from_str(&get(&url, &headers)?).ok()?;
             let artist = search::slug(artist, "");
+            // The same artist and the same title: the artist's first hit can be another of the artist's songs.
+            let name = |title: &str| {
+                let title = title.to_lowercase();
+                let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
+                search::slug(&title[..end], "")
+            };
+            let song_title = name(title);
             let same = |hit: &&Value| {
                 let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
-                !artist.is_empty() && !primary.is_empty() && (primary.contains(&artist) || artist.contains(&primary))
+                let hit_title = name(hit["result"]["title"].as_str().unwrap_or_default());
+                !artist.is_empty()
+                    && !primary.is_empty()
+                    && (primary.contains(&artist) || artist.contains(&primary))
+                    && !hit_title.is_empty()
+                    && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
             };
             let page =
                 reply["response"]["sections"][0]["hits"].as_array()?.iter().find(same)?["result"]["url"].as_str()?;
             GENIUS.wait();
-            html(&get(page, &[])?, "data-lyrics-container=\"true\"", "LyricsFooter")?
+            genius_lyrics(&get(page, &[])?)?
         }
         "azlyrics" => {
             let url = format!(
@@ -214,18 +266,99 @@ fn is_synced(lyrics: &str) -> bool {
     })
 }
 
-/// The `.lrc` next to the file, from the song's lyrics or else from LRCLIB, when they are synced.
-fn write_lrc(file: &Path, song: &Song) -> R<()> {
+/// The lyrics without `[mm:ss.xx]` timestamps.
+fn plain_lyrics(lyrics: &str) -> String {
+    let untimed = |line: &str| {
+        let mut line = line.trim_start();
+        while let Some(rest) = line.strip_prefix('[').filter(|_| is_synced(line)) {
+            line = rest.split_once(']').map_or("", |(_, rest)| rest).trim_start();
+        }
+        line.to_string()
+    };
+    lyrics.lines().map(untimed).collect::<Vec<_>>().join("\n")
+}
+
+/// What the `lyrics_aligner` command made of the lyrics.
+enum Aligned {
+    Lrc(String),
+    /// The lyrics are not the words of this recording (exit status 3).
+    NoFit,
+    Failed,
+}
+
+/// Plain lyrics timed to the recording by the `lyrics_aligner` command. The command gets the audio file, a text
+/// file with the lyrics and the `.lrc` file to write. It exits with status 3 when the lyrics do not fit the
+/// recording.
+fn align(file: &Path, lyrics: &str) -> Aligned {
+    let mut command = text("lyrics_aligner").unwrap_or_default().split_whitespace();
+    let Some(program) = command.next() else { return Aligned::Failed };
+    let temp = file.with_extension("align");
+    let (input, output) = (temp.with_extension("align.txt"), temp.with_extension("align.lrc"));
+    if fs::write(&input, plain_lyrics(lyrics)).is_err() {
+        return Aligned::Failed;
+    }
+    // One song at a time: the aligner uses every CPU core, or the GPU.
+    let result = {
+        let _turn = ALIGNER.lock().unwrap_or_else(PoisonError::into_inner);
+        Command::new(program).args(command).arg(file).arg(&input).arg(&output).output()
+    };
+    let lrc = match result {
+        Ok(result) if result.status.success() => {
+            fs::read_to_string(&output).ok().filter(|lrc| is_synced(lrc)).map_or(Aligned::Failed, Aligned::Lrc)
+        }
+        Ok(result) => {
+            let error = String::from_utf8_lossy(&result.stderr);
+            let error = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default();
+            log("WARNING", &format!("lyrics aligner: {}: {}", file.display(), error.trim()));
+            if result.status.code() == Some(3) {
+                Aligned::NoFit
+            } else {
+                Aligned::Failed
+            }
+        }
+        Err(error) => {
+            log("WARNING", &format!("lyrics aligner: {program}: {error}"));
+            Aligned::Failed
+        }
+    };
+    let _ = (fs::remove_file(&input), fs::remove_file(&output));
+    lrc
+}
+
+/// The `.lrc` next to the file; false when the aligner finds that the song's lyrics are another song's. Synced lyrics are timed to one recording, so they are used only when they were
+/// timed to a recording as long as the file: the song's own lyrics, or else LRCLIB's for the file's length.
+/// Otherwise the `lyrics_aligner` times the plain lyrics to the file. A song that is not on Spotify (unreleased)
+/// has many versions of about the same length, so the aligner, when there is one, times its lyrics.
+fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let sidecar = file.with_extension("lrc");
     let replace = matches!(text("overwrite"), Some("force" | "metadata"));
     if !on("generate_lrc") || (sidecar.exists() && !replace) {
-        return Ok(());
+        return Ok(true);
     }
-    let synced = song.lyrics.clone().filter(|lyrics| is_synced(lyrics));
-    if let Some(lyrics) = synced.or_else(|| provider("synced", song).filter(|lyrics| is_synced(lyrics))) {
-        fs::write(sidecar, lyrics)?;
+    let length = lofty::read_from_path(file)?.properties().duration().as_secs_f64();
+    let recording = Song { duration: length, ..song.clone() };
+    let fits = (length - song.duration).abs() < 4.0;
+    let aligner = text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty());
+    let trusted = !song.song_id.is_empty() || !aligner;
+    let lrclib = || provider("synced", &recording).filter(|lyrics| is_synced(lyrics));
+    let own = song.lyrics.clone().filter(|lyrics| fits && is_synced(lyrics));
+    let synced = if trusted { own.or_else(lrclib) } else { None };
+    // Without other lyrics, the words of LRCLIB's version are aligned to the file.
+    let lyrics = if synced.is_none() && aligner { song.lyrics.clone().or_else(lrclib) } else { None };
+    let lyrics = lyrics.filter(|lyrics| !lyrics.trim().is_empty());
+    match (synced, lyrics.map(|lyrics| align(file, &lyrics))) {
+        (Some(lrc), _) | (None, Some(Aligned::Lrc(lrc))) => fs::write(sidecar, lrc)?,
+        // An old `.lrc` with the words of another recording is removed.
+        (None, Some(Aligned::NoFit)) => {
+            if sidecar.exists() {
+                log("WARNING", &format!("{}: removed, its lyrics do not fit the song", sidecar.display()));
+                fs::remove_file(sidecar)?;
+            }
+            return Ok(false);
+        }
+        _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Where the Spotify URL goes: the keys Python spotDL uses, so either tool can rescan the other's files.
@@ -532,25 +665,71 @@ fn meta_file(file: &Path) -> R<()> {
         && (on("skip_album_art") || !tag.pictures().is_empty());
     let lyrics = tag.get_string(&ItemKey::Lyrics).map(String::from);
     let (force, redownload) = (on("force_update_metadata"), on("redownload"));
+    // The song as the file's own tags describe it.
+    let mut artists: Vec<String> = tag.get_strings(&ItemKey::TrackArtists).map(String::from).collect();
+    if artists.len() < 2 {
+        artists = tag.artist().map(|a| a.split(['/', ';']).map(|a| a.trim().into()).collect()).unwrap_or_default();
+    }
+    let local = Song {
+        name: tag.title().unwrap_or_default().into(),
+        artist: artists.first().cloned().unwrap_or_default(),
+        artists,
+        album_name: tag.album().unwrap_or_default().into(),
+        duration: audio.properties().duration().as_secs_f64(),
+        lyrics: lyrics.clone(),
+        ..Song::default()
+    };
     if complete && !force && !redownload {
         if !on("generate_lrc") || file.with_extension("lrc").exists() {
             return Ok(());
         }
         if lyrics.as_deref().is_some_and(is_synced) {
-            return write_lrc(file, &Song { lyrics, ..Song::default() });
+            return write_lrc(file, &local).map(drop);
         }
     }
     let url = source_url(tag).filter(|url| url.contains("spotify"));
-    let query =
-        url.unwrap_or_else(|| format!("{} - {}", tag.artist().unwrap_or_default(), tag.title().unwrap_or_default()));
-    let mut song = spotify::resolve(&query)?.into_iter().next().ok_or("no match")?;
-    spotify::enrich(&mut song);
-    song.lyrics = lyrics.or_else(|| find_lyrics(&song));
-    if !complete || force {
-        write_tags(file, &song)?;
+    let found = match &url {
+        Some(url) => spotify::resolve(url)?.into_iter().next(),
+        // Without a Spotify URL the search result must be the same song, so that a song that is not on Spotify
+        // (an unreleased one) does not take the tags of a released song with the same title.
+        None => spotify::resolve(&format!("{} - {}", local.artist, local.name))
+            .ok()
+            .and_then(|songs| songs.into_iter().next())
+            .filter(|song| {
+                let same = |a: &str, b: &str| search::versionless(a).eq_ignore_ascii_case(search::versionless(b));
+                same(&song.name, &local.name)
+                    && song.artists.contains(&local.artist)
+                    && (song.duration - local.duration).abs() < 4.0
+            }),
+    };
+    let Some(mut song) = found.or_else(|| url.is_none().then(|| local.clone())) else { return Err("no match".into()) };
+    let on_spotify = !song.song_id.is_empty();
+    if on_spotify {
+        spotify::enrich(&mut song);
     }
-    write_lrc(file, &song)?;
-    if redownload {
+    // `force` fetches the lyrics again, for example to get synced lyrics that were not available before.
+    song.lyrics =
+        if force { find_lyrics(&song).or(lyrics.clone()) } else { lyrics.clone().or_else(|| find_lyrics(&song)) };
+    if on_spotify {
+        if !complete || force {
+            write_tags(file, &song)?;
+        }
+        write_lrc(file, &song)?;
+    } else {
+        // A song that is not on Spotify keeps its own tags. Without other lyrics, the words of its old `.lrc` file
+        // are timed again. New lyrics go into the tags unless the aligner finds that they are another song's.
+        let new = song.lyrics.clone().filter(|_| song.lyrics != lyrics);
+        if song.lyrics.is_none() {
+            song.lyrics = fs::read_to_string(file.with_extension("lrc")).ok().map(|lrc| plain_lyrics(&lrc));
+        }
+        let fits = write_lrc(file, &song)?;
+        if let Some(new) = new.filter(|_| fits) {
+            let mut audio = lofty::read_from_path(file)?;
+            audio.primary_tag_mut().ok_or("no tags")?.insert_text(ItemKey::Lyrics, new);
+            audio.save_to_path(file, WriteOptions::default())?;
+        }
+    }
+    if redownload && on_spotify {
         let album = format!("https://open.spotify.com/album/{}", song.album_id);
         let songs = if on("fetch_albums") { spotify::resolve(&album)? } else { vec![song] };
         for song in songs {

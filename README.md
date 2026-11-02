@@ -22,6 +22,10 @@ Use `--max-retries 3` to set the number of retries after a failed request. Use `
 
 Use `--meta-threads N` to set the number of metadata workers; `save` uses them for searches and lyrics. Lyrics are fetched while the audio downloads.
 
+Use `--generate-lrc` to write a synced `.lrc` file next to each song. Synced lyrics are timed to one recording, so they are used only when they were timed to a recording as long as the file. Use `--lyrics-aligner CMD` to time plain lyrics to the file when no synced lyrics fit it. The program runs `CMD AUDIO LYRICS.txt OUT.lrc`, for one song at a time. A failed command writes no `.lrc` file. Exit status 3 means that the lyrics are another song's: an old `.lrc` file is then removed when `--overwrite` is `metadata` or `force`. `scripts/align_lyrics.py` is such a command (`--lyrics-aligner scripts/align_lyrics.py`, with `uv` in `PATH`). It uses Whisper to drop the lines that the recording does not have, add the verses that the text does not have, repeat choruses that the text has once, and time each line.
+
+With `meta`, a song without a Spotify URL takes the tags of a Spotify search result only when that result has the same title, artist, and length. Otherwise the song keeps its tags, and only its lyrics change. Such a song (for example, an unreleased one) has many versions of about the same length, so its lyrics are always timed by the aligner when one is set. Without other lyrics, the aligner times the words of its old `.lrc` file again.
+
 Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` to add all songs from each album. Use `--ytm-data` to use the title and artist from a YouTube Music page.
 
 Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover. Use `--m3u` to write one playlist file per list; it includes every song of the list, also those that another query already downloaded.
