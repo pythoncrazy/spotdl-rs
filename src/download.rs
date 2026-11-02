@@ -290,7 +290,7 @@ fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
 fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
     // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
     static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::LazyLock::new(Default::default);
-    let key = format!("{artist}\n{}\n{}\n{max}", lyrics_title(song), song.year);
+    let key = format!("{artist}\n{}\n{}\n{max}", song.name, song.year);
     if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return pages.clone();
     }
@@ -323,16 +323,25 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Vec<String> {
     };
     let mut hits: Vec<Value> = reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default();
     hits.retain(|hit| same(&hit));
-    // The same title goes before a longer one ("Intro" before "Intro (Skit)"), and the title without a note before
-    // one with a note ("For No One" before "For No One (Take 10 / Backing Track)", a session take from a 2022 box set:
-    // the song is the plain title's page even if its release is the box set). As an artist can have two songs with one
-    // title ("KING" on VULTURES 1 in 2024 and on BULLY in 2026), the song of the release's year goes first after that.
+    // The page of the song's whole title goes first: "WHISKEY (RELEASE ME)" before Maroon 5's "Whiskey" (feat.
+    // A$AP Rocky), and "For No One" before "For No One (Take 10 / Backing Track)", a session take from the 2022 box
+    // set whose "For No One - 2022 Mix" is the song. Then the artist's own page, then the same title without notes
+    // ("Intro" before "Intro (Skit)"), and as an artist can have two songs with one title ("KING" on VULTURES 1 in
+    // 2024 and on BULLY in 2026), the song of the release's year.
     let year = |hit: &Value| hit["result"]["release_date_components"]["year"].as_u64();
-    let hit_title = |hit: &Value| hit["result"]["title"].as_str().unwrap_or_default().to_lowercase();
-    let whole_title = search::slug(&title.to_lowercase(), "");
-    let same_title = |hit: &Value| search::slug(&hit_title(hit), "") == whole_title;
-    let exact = |hit: &Value| plain_title(&hit_title(hit)) == song_title;
-    hits.sort_by_key(|hit| (!same_title(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year))));
+    fn hit_title(hit: &Value) -> &str {
+        hit["result"]["title"].as_str().unwrap_or_default()
+    }
+    let whole_title = search::clean_name(search::versionless(&song.name), &song.artists);
+    let whole = |hit: &Value| search::clean_name(hit_title(hit), &song.artists) == whole_title;
+    let own = |hit: &Value| {
+        let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
+        !primary.is_empty() && artist.contains(&primary)
+    };
+    let exact = |hit: &Value| plain_title(hit_title(hit)) == song_title;
+    hits.sort_by_key(|hit| {
+        (!whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
+    });
     let pages: Vec<String> =
         hits.iter().filter_map(|hit| hit["result"]["url"].as_str().map(String::from)).take(max).collect();
     pages

@@ -158,7 +158,7 @@ pub fn edition_title(name: &str) -> String {
 }
 
 /// The slugged title without featured artists, soundtrack notes and version groups.
-fn clean_name(name: &str, artists: &[String]) -> String {
+pub fn clean_name(name: &str, artists: &[String]) -> String {
     let (mut clean, mut rest) = (String::new(), name);
     while let Some(open) = rest.find(['(', '[']) {
         let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else { break };
