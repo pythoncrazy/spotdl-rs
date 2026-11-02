@@ -26,7 +26,7 @@ const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
-static GENIUS: Pace = Pace::new(1000);
+static GENIUS: Pace = Pace::new(500);
 static ALIGNING: Mutex<usize> = Mutex::new(0);
 static ALIGNED: Condvar = Condvar::new();
 
@@ -980,5 +980,29 @@ pub fn meta(paths: &[String]) -> R<()> {
     match failed {
         0 => Ok(()),
         count => Err(format!("{count} of {} files failed", files.len()).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_lyrics;
+
+    const BULLY_KING: &str =
+        "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
+        Now is the time, for nature and all her glory have named you her king\nShe has named you the king\n\
+        This that feelin' we need more of\nThe hatin' just brought me more love";
+    const VULTURES_KING: &str =
+        "[00:05.86]After everything said, huh, man, man\n[00:12.00]After everything said, huh\n\
+        [00:18.27]\"Crazy, bipolar, antisemite\"\n[00:23.04]And I'm still the king\n\
+        [00:31.56]They thought headlines was my kryptonite\n[00:36.14]Still the king";
+
+    #[test]
+    fn lyrics_of_one_song_agree_and_of_two_songs_do_not() {
+        let synced = "[00:00.30]The time is now, right now\n[00:04.18]This is the hour, this is the new dawn, \
+            this is the new day\n[00:10.38]Now is the time, for nature and all her glory have named you her king";
+        assert!(same_lyrics(synced, BULLY_KING));
+        assert!(!same_lyrics(VULTURES_KING, BULLY_KING));
+        // Too few words to tell.
+        assert!(same_lyrics("[Instrumental]", BULLY_KING));
     }
 }
