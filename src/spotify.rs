@@ -1,4 +1,4 @@
-use crate::{cached, http, http_json, number, on, search, url_encode, Pace, Song, HOME, R};
+use crate::{cached, http, http_json, http_paced, number, on, search, url_encode, Pace, Song, HOME, R};
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -27,6 +27,8 @@ type DeezerAlbum = Arc<Mutex<Result<Value, (u8, String)>>>;
 static DEEZER_ALBUMS: LazyLock<Mutex<HashMap<String, DeezerAlbum>>> = LazyLock::new(Default::default);
 /// Deezer allows 50 requests in 5 seconds.
 static DEEZER: Pace = Pace::new(110);
+/// Unspaced; held when Spotify's API answers 429, so that all threads wait together.
+static SPOTIFY: Pace = Pace::new(0);
 
 /// The web player's TOTP: HOTP-SHA1 of the 30-second step, keyed by the digits of the XOR-ed secret.
 fn totp(secret: &[u8]) -> String {
@@ -121,10 +123,14 @@ fn query(op: &str, variables: Value) -> R<Value> {
             let extensions = json!({"persistedQuery": {"version": 1, "sha256Hash": hash}}).to_string();
             let (variables, extensions) = (url_encode(&variables.to_string()), url_encode(&extensions));
             let url = format!("https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}");
-            match http_json::<Value>(&url, &[UA, ("Authorization", &format!("Bearer {token}"))], None) {
+            let headers = [UA, ("Authorization", &format!("Bearer {token}"))];
+            let reply = http_paced(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
+            match reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?)) {
                 Ok(reply) if reply.get("data").is_some() => return Ok(reply),
                 Ok(reply) => last = format!("{op}: {}", reply["errors"]),
-                Err(error) => last = error.to_string(),
+                Err(error) if error.to_string().starts_with("HTTP 401") => last = error.to_string(),
+                // Lost connections, 429 and 5xx were retried above: asking again here would square the requests.
+                Err(error) => return Err(error),
             }
             if ["401", "hash", "PersistedQuery"].iter().any(|word| last.contains(word)) {
                 rejected = Some(token.into());
