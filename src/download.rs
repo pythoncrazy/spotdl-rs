@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
         Condvar, Mutex, OnceLock, PoisonError,
     },
 };
@@ -286,9 +286,10 @@ fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
 }
 
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
-/// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
-fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
-    genius_titled(song, artist, max).into_iter().map(|page| page.lyrics).collect()
+/// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"), or nothing when
+/// Genius could not be asked.
+fn genius(song: &Song, artist: &str, max: usize) -> Option<Vec<String>> {
+    Some(genius_titled(song, artist, max)?.into_iter().map(|page| page.lyrics).collect())
 }
 
 /// A Genius page of lyrics.
@@ -304,25 +305,27 @@ struct Page {
 }
 
 /// Genius's page of the song, only one with the song's title: the check that replaces lyrics must not take
-/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
-fn genius_same(song: &Song, artist: &str) -> Option<Page> {
-    genius_titled(song, artist, 1).into_iter().next().filter(|page| page.titled)
+/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh"). The outer `None`: Genius
+/// could not be asked.
+fn genius_same(song: &Song, artist: &str) -> Option<Option<Page>> {
+    Some(genius_titled(song, artist, 1)?.into_iter().next().filter(|page| page.titled))
 }
 
 /// Whether the page is the song's recording and not another of the artist's songs with that title: Genius dates it
 /// to the release's year or has it on the release's album. Spotify calls Until the End of Time's "When I Get Free
 /// II (Remix)" "When I Get Free", the title of a song from R U Still Down; Genius has that song on R U Still Down
-/// and Euthanasia.
-fn released_on(song: &Song, page: &Page) -> bool {
-    page.same_year || {
-        let url = format!("https://genius.com/api/songs/{}", page.id);
-        let album = plain_title(&song.album_name);
-        let reply = genius_get(&url, &[]).and_then(|reply| serde_json::from_str::<Value>(&reply).ok());
-        let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
-        albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
-            !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
-        })
+/// and Euthanasia. `None` when Genius could not be asked.
+fn released_on(song: &Song, page: &Page) -> Option<bool> {
+    if page.same_year {
+        return Some(true);
     }
+    let url = format!("https://genius.com/api/songs/{}", page.id);
+    let album = plain_title(&song.album_name);
+    let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok();
+    let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
+    Some(albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
+        !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
+    }))
 }
 
 /// The pages Genius gave for each song and artist. The lyrics provider and the `.lrc` writer both ask; Genius is
@@ -334,15 +337,41 @@ fn genius_key(song: &Song, artist: &str, max: usize) -> String {
     format!("{artist}\n{}\n{}\n{max}", song.name, song.year)
 }
 
-/// [`genius`]'s pages.
-fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<Page> {
+/// [`genius`]'s pages. `None` (Genius could not be asked) is not "no page": no page lets LRCLIB's lyrics in
+/// unchecked, while a Genius that cannot be asked leaves them for a later run that can check them.
+fn genius_titled(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     let key = genius_key(song, artist, max);
     if let Some(pages) = GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-        return pages.clone();
+        return Some(pages.clone());
     }
-    let Some(pages) = genius_pages(song, artist, max) else { return vec![] };
+    let pages = genius_pages(song, artist, max)?;
     GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
-    pages
+    Some(pages)
+}
+
+/// Genius's website answered 403: it blocks this client, so it is not asked again in this run (asking again would
+/// not be waiting out a limit but working around a block). The lyrics pages are on the website, so without it
+/// Genius cannot be asked at all.
+static GENIUS_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// The API's token is out of requests (the shared docs client has 100 an hour): the website's search is asked.
+static GENIUS_API_SPENT: AtomicBool = AtomicBool::new(false);
+/// The songs whose lyrics were left unchecked because Genius could not be asked, for [`report_unchecked`].
+static UNCHECKED: std::sync::LazyLock<Mutex<HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+fn unchecked(song: &Song) {
+    let mut songs = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner);
+    if songs.is_empty() {
+        log("WARNING", "Genius cannot be asked: LRCLIB lyrics, which it must check, are left for a later run");
+    }
+    songs.insert(format!("{} - {}", song.artist, song.name));
+}
+
+/// Says at the end of a run how many songs got no checked synced lyrics, so that a `meta` run adds them later.
+pub fn report_unchecked() {
+    let count = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner).len();
+    if count > 0 {
+        log("WARNING", &format!("{count} songs without LRCLIB lyrics or .lrc files: Genius could not be asked"));
+    }
 }
 
 /// Whether the lyrics providers asked Genius, the lyrics authority, for the song and it answered: only then is
@@ -358,11 +387,20 @@ fn genius_answered(song: &Song) -> bool {
 /// and then try again. A timeout or a server error is tried again a few times.
 fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
     for attempt in 0..12 {
+        if GENIUS_BLOCKED.load(Relaxed) {
+            return None;
+        }
         GENIUS.wait();
         match http_retrying(url, headers, None, 0) {
             Ok(bytes) => return String::from_utf8(bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
                 GENIUS.hold(std::time::Duration::from_secs(30 << attempt.min(3)));
+            }
+            Err(error) if error.to_string().contains("HTTP 403") => {
+                if !GENIUS_BLOCKED.swap(true, Relaxed) {
+                    log("WARNING", &format!("Genius: {error}: it is not asked again in this run"));
+                }
+                return None;
             }
             // A timeout, a lost connection or a server error passes; a page that is not there does not.
             Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
@@ -380,16 +418,23 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
 
 /// The pages, or nothing when Genius could not be asked.
 fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
+    if GENIUS_BLOCKED.load(Relaxed) {
+        return None;
+    }
     let title = lyrics_title(song);
     let query = url_encode(&format!("{artist} {title}"));
     // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
     // which is asked when the API cannot answer (a token that many people use is often out of requests).
-    let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
-    let from_api = auth.and_then(|auth| {
+    // A token out of requests stays so for the hour: it is not asked again in this run.
+    let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
+    let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
         GENIUS.wait();
         let url = format!("https://api.genius.com/search?q={query}");
-        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0).ok()?;
-        serde_json::from_slice::<Value>(&reply).ok()?["response"]["hits"].as_array().cloned()
+        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
+        if reply.as_ref().is_err_and(|error| error.to_string().contains("HTTP 429")) {
+            GENIUS_API_SPENT.store(true, Relaxed);
+        }
+        serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
     });
     let mut hits = match from_api {
         Some(hits) => hits,
@@ -453,11 +498,16 @@ fn provider(name: &str, song: &Song) -> Option<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let (artist, title) = (&song.artist, lyrics_title(song));
     let lyrics = match name {
+        // LRCLIB's lyrics are checked against Genius's; without an answer from Genius, they are left for a later run.
         "synced" => {
-            let words = genius(song, artist, 1).into_iter().next();
+            let Some(pages) = genius(song, artist, 1) else {
+                unchecked(song);
+                return None;
+            };
+            let words = pages.into_iter().next();
             lrclib(song).into_iter().find(|lyrics| words.as_ref().is_none_or(|words| same_lyrics(lyrics, words)))?
         }
-        "genius" => genius(song, artist, 1).into_iter().next()?,
+        "genius" => genius(song, artist, 1)?.into_iter().next()?,
         "azlyrics" => {
             let url = format!(
                 "https://www.azlyrics.com/lyrics/{}/{}.html",
@@ -530,12 +580,24 @@ fn same_lyrics(a: &str, b: &str) -> bool {
 /// The words that the song's lyrics must have: its own plain lyrics (from the first lyrics provider that had
 /// them; Genius by default), or else its Genius page. Genius has a page for each song, with the artists and the
 /// release date; LRCLIB is a crowd's uploads and has, for example, "KING" from VULTURES 1 under BULLY's "KING".
-fn reference(song: &Song, own: Option<&String>) -> Option<String> {
-    own.filter(|lyrics| !is_synced(lyrics)).cloned().or_else(|| {
-        let artists = song.artists.iter().chain([&song.artist]);
-        let mut pages = artists.filter(|artist| !artist.is_empty()).filter_map(|artist| genius_same(song, artist));
-        pages.find(|page| released_on(song, page)).map(|page| page.lyrics)
-    })
+/// `Some(None)`: Genius has no such page. `None`: Genius could not be asked, so nothing can be checked.
+fn reference(song: &Song, own: Option<&String>) -> Option<Option<String>> {
+    if let Some(own) = own.filter(|lyrics| !is_synced(lyrics)) {
+        return Some(Some(own.clone()));
+    }
+    let mut asked = true;
+    for artist in song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty()) {
+        let Some(page) = genius_same(song, artist) else {
+            asked = false;
+            continue;
+        };
+        match page.map(|page| (released_on(song, &page), page)) {
+            Some((Some(true), page)) => return Some(Some(page.lyrics)),
+            Some((None, _)) => asked = false,
+            _ => {}
+        }
+    }
+    asked.then_some(None)
 }
 
 /// What the `lyrics_aligner` command made of the lyrics.
@@ -606,8 +668,12 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     // recording as long as the file and their words are the song's (see `reference`): the song's own, the old
     // `.lrc`, or LRCLIB's.
     // Without such lyrics, an old `.lrc` with the words of another song is removed.
+    // Without an answer from Genius, nothing can be checked: no `.lrc` is written and none is removed.
     let checked = |own: Option<String>| -> R<bool> {
-        let reference = reference(song, own.as_ref());
+        let Some(reference) = reference(song, own.as_ref()) else {
+            unchecked(song);
+            return Ok(true);
+        };
         let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
         // The old `.lrc` goes before LRCLIB, which is often busy.
         let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
@@ -639,7 +705,7 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
         Box::new(|| {
             let artists = song.artists.iter().chain([&song.artist]);
             if song.song_id.is_empty() {
-                artists.flat_map(|artist| genius(song, artist, 4)).collect()
+                artists.filter_map(|artist| genius(song, artist, 4)).flatten().collect()
             } else {
                 vec![]
             }
@@ -1246,9 +1312,10 @@ fn meta_file(file: &Path) -> R<()> {
     if replace && !force {
         // Genius's page is asked for its albums only when the lyrics differ.
         let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
-        let page = song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist)));
+        let page =
+            song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist).flatten()));
         let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
-        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page)) {
+        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page) == Some(true)) {
             log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
             song.lyrics = Some(page.lyrics);
         }
@@ -1319,6 +1386,7 @@ pub fn meta(paths: &[String]) -> R<()> {
             .count()
     });
     album_gains(&files);
+    report_unchecked();
     match failed {
         0 => Ok(()),
         count => Err(format!("{count} of {} files failed", files.len()).into()),
@@ -1327,7 +1395,7 @@ pub fn meta(paths: &[String]) -> R<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::same_lyrics;
+    use super::{provider, reference, same_lyrics, Relaxed, Song, GENIUS_BLOCKED};
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -1350,5 +1418,19 @@ mod tests {
         let talk = "[00:01.30]\"Drive My Car,\" take one\n[00:12.63]Can you take it a little bit slower this time?\n\
             [00:17.37]One, two, three, four\n[01:02.16]Two\n[01:13.77]That's the coming in part\n[01:15.61]One, two";
         assert!(same_lyrics(count_in, talk));
+    }
+
+    /// A Genius that cannot be asked (its website answers 403) is not a Genius without the song's page, which
+    /// would let LRCLIB's lyrics in unchecked: BULLY's "KING" would get VULTURES 1's.
+    #[test]
+    fn lyrics_are_not_checked_against_a_genius_that_cannot_be_asked() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        GENIUS_BLOCKED.store(true, Relaxed);
+        let artists = vec!["¥$".to_string(), "Kanye West".to_string()];
+        let song = Song { name: "KING".into(), artist: "¥$".into(), artists, year: 2026, ..Song::default() };
+        assert_eq!(reference(&song, None), None);
+        assert_eq!(provider("synced", &song), None);
+        // The song's own plain lyrics still check synced lyrics.
+        assert_eq!(reference(&song, Some(&BULLY_KING.into())), Some(Some(BULLY_KING.into())));
     }
 }

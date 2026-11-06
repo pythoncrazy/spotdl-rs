@@ -452,6 +452,7 @@ fn run() -> R<()> {
     let done: Vec<(Song, R<PathBuf>)> =
         pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
     download::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
+    download::report_unchecked();
     let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
     let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
     if let Some(path) = sync_path {
