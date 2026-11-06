@@ -53,7 +53,7 @@ Use `--playlist-numbering` to use the playlist name as the album name and the pl
 
 Use `--print-errors` to print all errors at the end. Use `--save-errors errors.txt` to save them, with the Spotify URL of each song. Set `--log-level` and `--log-format` to change log output.
 
-You can use `--redownload` with `meta` to save the local songs again in the selected format. `sync` moves the files of songs whose output path changed and deletes the files of songs that are no longer listed; a file that a listed song writes is kept, also when the song's Spotify URL changed (a re-released album gives its songs new IDs). Use `--sync-remove-lrc` to remove or rename lyric files when `sync` changes files. Use `--add-unavailable` to add songs without a download to the archive and playlists.
+You can use `--redownload` with `meta` to save the local songs again in the selected format. `sync` moves the files of songs whose output path changed and deletes the files of songs that are no longer listed; a file that a listed song writes is kept, also when the song's Spotify URL changed (a re-released album gives its songs new IDs). A moved song keeps its lyrics and `.lrc` file, and its tags are written again for its new title, album or year; a folder left with nothing but `cover.jpg` or `artist.jpg` is removed. Use `--sync-remove-lrc` to also remove the lyric files of songs that are no longer listed. Use `--add-unavailable` to add songs without a download to the archive and playlists.
 
 The Spotify URL is stored in the `WOAS` tag (`----:spotdl:WOAS` in M4A), as Python spotDL does, so either program can scan the other's files.
 

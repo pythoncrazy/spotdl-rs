@@ -177,6 +177,40 @@ fn sync_keeps_the_files_of_songs_whose_url_changed() {
     assert!(dir.join("Art - A.opus").exists() && dir.join("Art - B.opus").exists());
 }
 
+/// A renamed album's songs move with their `.lrc` files into its new folder, which does not exist yet, and get
+/// its name in their tags; the old folder, left with only its cover, goes. Needs no download.
+#[test]
+fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
+    let dir = dir("move");
+    let song = |name: &str, album: &str| {
+        json!({"name": name, "artists": ["Art"], "artist": "Art", "album_name": album, "album_artist": "Art",
+            "duration": 10, "year": 2020, "date": "2020", "track_number": 1, "tracks_count": 1,
+            "url": format!("https://open.spotify.com/track/{name}"), "download_url": VIDEO})
+    };
+    fs::write(dir.join("new.spotdl"), json!([song("A", "Alb (Remastered)")]).to_string()).unwrap();
+    let state = dir.join("s.spotdl");
+    let old = json!({"type": "sync", "query": ["new.spotdl"], "songs": [song("A", "Alb"), song("B", "Alb")]});
+    fs::write(&state, old.to_string()).unwrap();
+    let (old, new) = (dir.join("Art/Alb"), dir.join("Art/Alb (Remastered)"));
+    fs::create_dir_all(&old).unwrap();
+    for name in ["A", "B"] {
+        fs::rename(local_song(&dir), old.join(format!("01 - {name}.opus"))).unwrap();
+    }
+    // The lyrics in its tags stay: they are not looked for again.
+    let mut tagged = lofty::read_from_path(old.join("01 - A.opus")).unwrap();
+    tagged.primary_tag_mut().unwrap().insert_text(ItemKey::Lyrics, "la".into());
+    tagged.save_to_path(old.join("01 - A.opus"), WriteOptions::default()).unwrap();
+    fs::write(old.join("01 - A.lrc"), "[00:01.00]la").unwrap();
+    fs::write(old.join("cover.jpg"), "").unwrap();
+    let output = "{album-artist}/{album}/{track-number} - {title}.{output-ext}";
+    // A download would fail.
+    ok(spotdl(&dir, &["sync", state.to_str().unwrap(), "--yt-dlp", "false", "--output", output]));
+    assert!(new.join("01 - A.lrc").exists() && !old.exists());
+    assert_eq!(lyrics(&new.join("01 - A.opus")).as_deref(), Some("la"));
+    let tagged = lofty::read_from_path(new.join("01 - A.opus")).unwrap();
+    assert_eq!(tagged.primary_tag().unwrap().album().as_deref(), Some("Alb (Remastered)"));
+}
+
 #[test]
 fn rejects_bad_options_and_unsafe_paths() {
     let dir = dir("errors");

@@ -25,6 +25,8 @@ const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
 
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+/// The files `sync` moved to a new path, whose tags are written again.
+static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
 static GENIUS: Pace = Pace::new(500);
 static ALIGNING: Mutex<usize> = Mutex::new(0);
@@ -129,6 +131,12 @@ pub fn path(s: &Song) -> PathBuf {
     let mut out = Path::new(if template.starts_with('/') { "/" } else { "" }).join(parts.collect::<PathBuf>());
     out.as_mut_os_string().push(format!(".{}", text("format").unwrap_or("opus")));
     out
+}
+
+/// The fixed folder of the output template, the part before its first `{field}`.
+fn output_root() -> PathBuf {
+    let output = Path::new(text("output").unwrap_or_default());
+    output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect()
 }
 
 fn skip_path(file: &Path) -> PathBuf {
@@ -1123,9 +1131,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     let out = path(s);
     let scan = || {
-        let output = Path::new(text("output").unwrap_or_default());
-        let root: PathBuf =
-            output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect();
+        let root = output_root();
         let mut files = Vec::new();
         audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
         let tagged = files
@@ -1142,7 +1148,10 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     });
     let skip = on("respect_skip_file") && skip_path(&target).exists();
     let (exists, overwrite) = (target.is_file(), text("overwrite").unwrap_or("skip"));
-    if op != "redownload" && (archived || skip || exists && overwrite == "skip" && !on("force_update_metadata")) {
+    // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
+    let moved = exists && MOVED.get().is_some_and(|moved| moved.contains(&target));
+    let keep = archived || skip || exists && overwrite == "skip" && !on("force_update_metadata");
+    if op != "redownload" && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
         }
@@ -1150,6 +1159,12 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     if !early {
         spotify::enrich(s);
+    }
+    // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
+    if moved && s.lyrics.is_none() {
+        let tag = lofty::read_from_path(&target).ok();
+        let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
+        s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
     // Lyrics sites are paced, so fetch them while the audio downloads.
     let song = s.clone();
@@ -1200,21 +1215,59 @@ pub fn prune(old: &[Song], new: &[Song]) {
     // songs new IDs): it is kept for the song's job, not deleted before a download that can fail.
     let kept: HashSet<PathBuf> = new.iter().map(path).collect();
     let files = |file: &Path| [file.to_path_buf(), skip_path(file), file.with_extension("lrc")];
+    let mut moved = HashSet::new();
     for song in old {
         let from = path(song);
         if kept.contains(&from) {
             continue;
         }
         let to = next.get(song.url.as_str()).map(|song| path(song));
-        let targets = to.filter(|to| !to.exists()).map(|to| files(&to));
-        for (i, source) in files(&from).iter().enumerate().take(if on("sync_remove_lrc") { 3 } else { 2 }) {
+        let targets = to.as_ref().filter(|to| !to.exists()).map(|to| files(to));
+        // A moved song's `.lrc` goes with it; `--sync-remove-lrc` decides only whether a removed song's goes.
+        let lrc = to.is_some() || on("sync_remove_lrc");
+        let had = from.is_file();
+        for (i, source) in files(&from).iter().enumerate().take(if lrc { 3 } else { 2 }) {
+            // Only a missing source is no error: a renamed album's new folder does not exist yet.
+            if !source.exists() {
+                continue;
+            }
             let result = match &targets {
-                Some(targets) => fs::rename(source, &targets[i]),
+                Some(targets) => fs::create_dir_all(targets[i].parent().unwrap_or(Path::new("")))
+                    .and_then(|()| fs::rename(source, &targets[i])),
                 None => fs::remove_file(source),
             };
-            if let Some(error) = result.err().filter(|error| error.kind() != std::io::ErrorKind::NotFound) {
+            if let Err(error) = result {
                 log("ERROR", &format!("could not move or remove {}: {error}", source.display()));
             }
+        }
+        // The file at the new path has the old title, album or year in its tags until they are written again.
+        if let Some(to) = to.filter(|to| had && to.is_file()) {
+            moved.insert(to);
+        }
+        remove_empty(&from);
+    }
+    let _ = MOVED.set(moved);
+}
+
+/// Removes the folders of `file` (up to the output's fixed folder) that hold nothing more than the folder
+/// images of songs that are gone, so that a renamed or removed album leaves no empty album in the library.
+fn remove_empty(file: &Path) {
+    let root = output_root();
+    let image = |file: &PathBuf| {
+        file.is_file() && file.file_name().is_some_and(|name| name == "cover.jpg" || name == "artist.jpg")
+    };
+    for dir in
+        file.ancestors().skip(1).take_while(|dir| !dir.as_os_str().is_empty() && dir.starts_with(&root) && *dir != root)
+    {
+        let Ok(entries) =
+            fs::read_dir(dir).map(|entries| entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>())
+        else {
+            return;
+        };
+        if !entries.iter().all(image)
+            || entries.iter().try_for_each(fs::remove_file).and_then(|()| fs::remove_dir(dir)).is_err()
+        {
+            return;
         }
     }
 }
