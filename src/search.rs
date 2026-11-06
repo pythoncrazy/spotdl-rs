@@ -129,7 +129,8 @@ fn words(song: &Song) -> HashSet<String> {
     words
 }
 
-fn altered(word: &str) -> bool {
+/// A word that names another recording: "remix", "live", "sped", "432hz".
+pub fn altered(word: &str) -> bool {
     let hertz = word.strip_suffix("hz").is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
     hertz || REJECTED.split(' ').any(|version| version == word)
 }

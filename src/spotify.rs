@@ -417,12 +417,58 @@ fn genres(album: &Value) -> Vec<Value> {
     album["genres"]["data"].as_array().into_iter().flatten().map(|genre| genre["name"].clone()).collect()
 }
 
+/// Whether the title has a note such as " (Remix)", " [SPED UP]" or " (Piano Version)": the release is another
+/// recording than the one titled without the note.
+fn version_note(title: &str) -> bool {
+    let words = search::slug(&title[base_title(title).len()..], "-");
+    let other = ["piano", "orchestral", "stripped", "unplugged", "demo"];
+    words.split('-').any(|word| search::altered(word) || other.contains(&word))
+}
+
+/// The ids of the Deezer albums that can be the Spotify album, best first, each with whether it fits in every
+/// way. A single, its album, the clean and explicit editions and a deluxe edition share a title, so hits rank by
+/// the same title, then a title close to it, then the same record type, track count (unknown in a discography)
+/// and explicit flag, then Deezer's order. A hit with only the base title ("Fever Ray" for "Fever Ray (Deluxe)")
+/// must be the same kind of release, and is never taken for a remix or sped-up release of the base title's song.
+fn ranked(hits: &[Value], title: &str, kind: &str, count: u64, explicit: bool) -> Vec<(u64, bool)> {
+    let slug = |text: &str| search::slug(text, "-");
+    let close = |a: &str, b: &str| search::ratio(&slug(a), &slug(b)) > 80.0;
+    let mut scored: Vec<_> = hits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hit)| {
+            let name = hit["title"].as_str().unwrap_or_default();
+            let (same_kind, same_count) =
+                (hit["record_type"] == kind, hit["nb_tracks"].as_u64().is_none_or(|n| n == count));
+            let full = close(title, name);
+            let base = same_kind && same_count && !version_note(title) && close(base_title(title), base_title(name));
+            let fits = (slug(title) == slug(name), full, same_kind, same_count, hit["explicit_lyrics"] == explicit);
+            Some((fits, std::cmp::Reverse(i), hit["id"].as_u64().filter(|_| full || base)?))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.cmp(a));
+    let mut seen = HashSet::new();
+    let best = scored.into_iter().filter(|(.., id)| seen.insert(*id));
+    best.map(|(fits, _, id)| (id, fits == (true, true, true, true, true))).collect()
+}
+
+/// Whether Deezer's tracks are the Spotify album's: at least half the positions of the longer list have a song as
+/// long (within 3 s). A title can still be another release's: a 2-song single's album, another recording of
+/// an opera.
+fn agrees(lengths: &HashMap<String, f64>, tracks: &serde_json::Map<String, Value>) -> bool {
+    let same = lengths.iter().filter(|(position, length)| {
+        tracks.get(*position).and_then(|track| track["duration"].as_f64()).is_some_and(|d| (d - **length).abs() <= 3.0)
+    });
+    same.count() * 2 >= lengths.len().max(tracks.len())
+}
+
 /// Deezer's copy of the song's album: genres, UPC, label, release date and track ISRCs. Deezer's search misses
-/// some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)"), so the album is
-/// also looked for in the artist's discography. When no album matches, the genres come from the album that has
-/// the song, or else from the artist's most common genre.
+/// some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)") or returns only the
+/// clean edition (GNX), so unless a search hit fits in every way the album is also looked for in the artist's
+/// discography. An album whose tracks are not the Spotify album's gives only its genres. When no album matches,
+/// the genres come from the album that has the song, or else from the artist's most common genre.
 fn deezer_album(song: &Song) -> R<Value> {
-    cached(&format!("deezer4:{}", song.album_id), 7, || {
+    cached(&format!("deezer5:{}", song.album_id), 7, || {
         let same = |a: &str, b: &Value| {
             search::ratio(&search::slug(a, "-"), &search::slug(b.as_str().unwrap_or_default(), "-")) > 80.0
         };
@@ -431,27 +477,34 @@ fn deezer_album(song: &Song) -> R<Value> {
         };
         let find =
             |kind: &str, query: &str| list(&format!("https://api.deezer.com/search/{kind}?q={}", url_encode(query)));
-        let title = |hit: &Value| base_title(hit["title"].as_str().unwrap_or_default()).to_string();
-        let pick = |albums: &[Value]| {
-            let full = albums.iter().find(|hit| same(&song.album_name, &hit["title"]));
-            full.or_else(|| albums.iter().find(|hit| same(base_title(&song.album_name), &json!(title(hit)))))
-                .and_then(|album| album["id"].as_u64())
+        let spotify = album(&format!("spotify:album:{}", song.album_id))?;
+        let length = |track: &Value| {
+            ["duration", "trackDuration"].iter().find_map(|key| track[key]["totalMilliseconds"].as_f64())
         };
+        let lengths: HashMap<String, f64> = spotify
+            .iter()
+            .map(|track| {
+                let position = format!("{}:{}", track["discNumber"].as_u64().unwrap_or(1), track["trackNumber"]);
+                (position, length(track).unwrap_or_default() / 1000.0)
+            })
+            .collect();
+        let explicit = spotify.iter().any(|track| track["contentRating"]["label"] == "EXPLICIT");
+        let kind = if song.album_type == "compilation" { "compile" } else { &song.album_type };
+        let rank = |albums: &[Value]| ranked(albums, &song.album_name, kind, lengths.len() as u64, explicit);
         let hits = find("album", &format!("{} {}", song.album_artist, base_title(&song.album_name)))?;
         let hits: Vec<Value> =
             hits.into_iter().filter(|hit| same(&song.album_artist, &hit["artist"]["name"])).collect();
         let mut discography = None;
-        let mut id = pick(&hits);
-        if id.is_none() {
+        let mut ids = rank(&hits);
+        if !ids.first().is_some_and(|(_, fits)| *fits) {
             let artists = find("artist", &song.album_artist)?;
             if let Some(artist) = artists.iter().find(|hit| same(&song.album_artist, &hit["name"])) {
                 let albums = list(&format!("https://api.deezer.com/artist/{}/albums?limit=500", artist["id"]))?;
-                id = pick(&albums);
+                ids = rank(&[hits, albums.clone()].concat());
                 discography = Some(albums);
             }
         }
-        if let Some(id) = id {
-            let details = deezer(&format!("https://api.deezer.com/album/{id}"))?;
+        for &(id, _) in ids.iter().take(3) {
             let tracks = deezer(&format!("https://api.deezer.com/album/{id}/tracks?limit=500"))?;
             let tracks = tracks["data"].as_array().into_iter().flatten().enumerate().map(|(i, track)| {
                 let (disc, position) = (track["disk_number"].as_u64().unwrap_or(1), track["track_position"].as_u64());
@@ -460,10 +513,18 @@ fn deezer_album(song: &Song) -> R<Value> {
                 (format!("{disc}:{}", position.unwrap_or(i as u64 + 1)), data)
             });
             let tracks: serde_json::Map<String, Value> = tracks.collect();
-            let (upc, label, date) = (&details["upc"], &details["label"], &details["release_date"]);
-            return Ok(
-                json!({"genres": genres(&details), "upc": upc, "label": label, "release_date": date, "tracks": tracks}),
-            );
+            if agrees(&lengths, &tracks) {
+                let details = deezer(&format!("https://api.deezer.com/album/{id}"))?;
+                let (upc, label, date) = (&details["upc"], &details["label"], &details["release_date"]);
+                return Ok(
+                    json!({"genres": genres(&details), "upc": upc, "label": label, "release_date": date, "tracks": tracks}),
+                );
+            }
+        }
+        // Another release of the same title by the artist still has the album's genres, but not its UPC, label or
+        // date.
+        if let Some((id, _)) = ids.first() {
+            return Ok(json!({"genres": genres(&deezer(&format!("https://api.deezer.com/album/{id}"))?)}));
         }
         let query = format!("artist:\"{}\" track:\"{}\"", song.artist, search::versionless(&song.name));
         let tracks = find("track", &query)?;
@@ -541,8 +602,56 @@ pub fn enrich(song: &mut Song) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dates, release_date};
+    use super::{agrees, dates, ranked, release_date};
     use serde_json::json;
+
+    #[test]
+    fn deezer_albums_rank_by_title_kind_count_and_explicit_flag_and_must_have_the_same_tracks() {
+        let hit = |id: u64, title: &str, kind: &str, count: Option<u64>, explicit: bool| json!({"id": id, "title": title, "record_type": kind, "nb_tracks": count, "explicit_lyrics": explicit});
+        let tbhc = [
+            hit(63203772, "Tranquility Base Hotel & Casino", "album", Some(11), true),
+            hit(78773022, "Tranquility Base Hotel & Casino", "single", Some(2), true),
+        ];
+        let ids = |hits: &[_], title, kind, count, explicit| -> Vec<u64> {
+            ranked(hits, title, kind, count, explicit).into_iter().map(|(id, _)| id).collect()
+        };
+        // The 2-song single is the single, not the album with its title.
+        assert_eq!(ids(&tbhc, "Tranquility Base Hotel & Casino", "single", 2, true), [78773022, 63203772]);
+        assert_eq!(ids(&tbhc, "Tranquility Base Hotel & Casino", "album", 11, true), [63203772, 78773022]);
+        // The exact title before the deluxe edition that Deezer lists first.
+        let gkmc = [
+            hit(7203293, "good kid, m.A.A.d city (Deluxe)", "album", Some(16), true),
+            hit(10222930, "good kid, m.A.A.d city", "album", Some(13), false),
+        ];
+        assert_eq!(ids(&gkmc, "good kid, m.A.A.d city", "album", 13, true)[0], 10222930);
+        // GNX's search finds only the clean edition, which does not fit; the discography's explicit one does.
+        let clean = [hit(674017741, "GNX", "album", Some(12), false)];
+        assert_eq!(ranked(&clean, "GNX", "album", 12, true), [(674017741, false)]);
+        let discography = [clean[0].clone(), hit(673968231, "GNX", "album", None, true)];
+        assert_eq!(ranked(&discography, "GNX", "album", 12, true), [(673968231, true), (674017741, false)]);
+        // Only the base title: a deluxe edition's standard album, but not a remix single's original.
+        let original = [hit(1, "Big Dawgs", "single", Some(1), true)];
+        assert_eq!(ids(&original, "Big Dawgs (Remix) [with A$AP Rocky]", "single", 1, true), [] as [u64; 0]);
+        assert_eq!(ids(&original, "Praise You (Piano Version)", "single", 1, true), [] as [u64; 0]);
+        assert_eq!(ids(&original, "Big Dawgs (Deluxe)", "single", 1, true), [1]);
+        assert_eq!(ids(&original, "Big Dawgs (Deluxe)", "album", 1, true), [] as [u64; 0]);
+        assert_eq!(ids(&original, "Big Dawgs (Deluxe)", "single", 3, true), [] as [u64; 0]);
+
+        let lengths = |pairs: &[(&str, f64)]| pairs.iter().map(|(key, length)| (key.to_string(), *length)).collect();
+        let tracks = |pairs: &[(&str, f64)]| {
+            pairs.iter().map(|(key, length)| (key.to_string(), json!({"duration": length}))).collect()
+        };
+        let twelve: Vec<(String, f64)> = (1..=12).map(|i| (format!("1:{i}"), 200.0 + i as f64)).collect();
+        let twelve: Vec<(&str, f64)> = twelve.iter().map(|(key, length)| (key.as_str(), *length)).collect();
+        // A 2-song single is not its 12-song album, though both start with the same songs.
+        assert!(!agrees(&lengths(&twelve[..2]), &tracks(&twelve)));
+        assert!(agrees(&lengths(&twelve), &tracks(&twelve)));
+        // A deluxe edition with two more songs, and lengths up to 3 s apart, are the same album.
+        assert!(agrees(&lengths(&twelve[..10]), &tracks(&twelve)));
+        assert!(agrees(&lengths(&[("1:1", 203.5), ("1:2", 202.0)]), &tracks(&twelve[..2])));
+        // A remix single, or another recording, has songs of other lengths.
+        assert!(!agrees(&lengths(&[("1:1", 230.0), ("1:2", 202.0), ("1:3", 260.0)]), &tracks(&twelve[..3])));
+    }
 
     #[test]
     fn dates_keep_only_the_known_part_and_take_the_day_from_deezer() {
