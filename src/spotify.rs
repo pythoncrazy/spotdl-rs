@@ -17,7 +17,8 @@ const UA: (&str, &str) = (
 const SECRETS: &str = "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json";
 /// Seconds by which two copies of one song can differ in length (a reissue, a remaster).
 const SAME_LENGTH: f64 = 5.0;
-const QUERIES: [&str; 5] = ["getTrack", "getAlbum", "fetchPlaylist", "queryArtistDiscographyAll", "searchDesktop"];
+const QUERIES: [&str; 6] =
+    ["getTrack", "getAlbum", "fetchPlaylist", "queryArtistDiscographyAll", "searchDesktop", "queryArtistOverview"];
 
 static SESSION: Mutex<Option<Arc<Value>>> = Mutex::new(None);
 static ALBUMS: LazyLock<Mutex<HashMap<String, Arc<Value>>>> = LazyLock::new(Default::default);
@@ -93,7 +94,7 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
 fn query(op: &str, variables: Value) -> R<Value> {
     let days = match op {
         "getTrack" if on("use_cache_file") => u64::MAX,
-        "getTrack" | "getAlbum" => 7,
+        "getTrack" | "getAlbum" | "queryArtistOverview" => 7,
         _ => 0,
     };
     cached(&format!("{op}{variables}"), days, || {
@@ -137,9 +138,16 @@ fn pages(op: &str, uri: &str, list: &str, limit: usize) -> R<(Value, Vec<Value>)
 fn cover(value: &Value) -> Option<String> {
     let size =
         |image: &&Value| image["width"].as_u64().unwrap_or_default() * image["height"].as_u64().unwrap_or_default();
-    let sources = [&value["images"], &value["images"]["items"], &value["coverArt"]["sources"]];
+    let sources = [&value["images"], &value["images"]["items"], &value["coverArt"]["sources"], &value["sources"]];
     let images = sources.into_iter().filter_map(Value::as_array);
     images.into_iter().find_map(|images| images.iter().max_by_key(size)?["url"].as_str().map(String::from))
+}
+
+/// The URL of the artist's largest picture.
+pub fn artist_image(artist_id: &str) -> Option<String> {
+    let uri = format!("spotify:artist:{artist_id}");
+    let reply = query("queryArtistOverview", json!({"uri": uri, "locale": "", "includePrerelease": true})).ok()?;
+    cover(&reply["data"]["artistUnion"]["visuals"]["avatarImage"])
 }
 
 fn album_meta(uri: &str) -> R<Arc<Value>> {
