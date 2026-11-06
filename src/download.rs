@@ -31,6 +31,9 @@ static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
 static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
 static GENIUS: Pace = Pace::new(500);
+/// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
+static AZLYRICS: Pace = Pace::new(1500);
+static MUSIXMATCH: Pace = Pace::new(1500);
 static ALIGNING: Mutex<usize> = Mutex::new(0);
 static ALIGNED: Condvar = Condvar::new();
 
@@ -624,6 +627,29 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     Some(pages)
 }
 
+/// azlyrics answered with its "request for access" page (a redirect to b.azlyrics.com, with status 200) instead of
+/// lyrics: it takes this client for a bot, so it is not asked again in this run (asking again would be working
+/// around the check). Without this, every song found "no lyrics" there and nothing said why.
+static AZLYRICS_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// An azlyrics page came without the marker before its lyrics: its layout changed, which is said once.
+static AZLYRICS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// The lyrics on an azlyrics page, or nothing (and a warning, once) for its access check or a page it no longer
+/// lays out as expected.
+fn azlyrics(page: &str) -> Option<String> {
+    if page.contains("AZLyrics - request for access") {
+        if !AZLYRICS_BLOCKED.swap(true, Relaxed) {
+            log("WARNING", "azlyrics asks for access (a bot check): it is not asked again in this run");
+        }
+        return None;
+    }
+    let lyrics = html(page, "<!-- Usage of azlyrics.com", "</div>");
+    if lyrics.is_none() && !AZLYRICS_CHANGED.swap(true, Relaxed) {
+        log("WARNING", "azlyrics: a page without its lyrics marker; its layout may have changed");
+    }
+    lyrics
+}
+
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
 fn provider(name: &str, song: &Song) -> Option<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
@@ -659,9 +685,14 @@ fn provider(name: &str, song: &Song) -> Option<String> {
                 search::slug(artist, ""),
                 search::slug(title, "")
             );
-            html(&get(&url, &[])?, "<!-- Usage of azlyrics.com", "</div>")?
+            if AZLYRICS_BLOCKED.load(Relaxed) {
+                return None;
+            }
+            AZLYRICS.wait();
+            azlyrics(&get(&url, &[])?)?
         }
         _ => {
+            MUSIXMATCH.wait();
             let url =
                 format!("https://www.musixmatch.com/lyrics/{}/{}", search::slug(artist, "-"), search::slug(title, "-"));
             let body = get(&url, &[])?.split_once("\"body\":")?.1.to_string();
@@ -1811,10 +1842,10 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_lyrics, lrclib_search,
-        lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics,
-        synced_first, temp_id, template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND,
-        LRCLIB_KEPT, REDOWNLOADS,
+        among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_lyrics,
+        lrclib_search, lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference,
+        release_type_key, same_lyrics, synced_first, temp_id, template_path, unlisted, write_tags, Relaxed, Song,
+        AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -2002,6 +2033,24 @@ mod tests {
         assert_eq!(provider("synced", &song), None);
         // The song's own plain lyrics still check synced lyrics.
         assert_eq!(reference(&song, Some(&BULLY_KING.into())), Some(Some(BULLY_KING.into())));
+    }
+
+    /// azlyrics's access check comes as a 200 page (from b.azlyrics.com): it was taken for a song without lyrics,
+    /// on every song, with nothing logged. It turns azlyrics off for the run; a lyrics page still gives its lyrics.
+    #[test]
+    fn azlyrics_access_check_turns_it_off() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let lyrics = "<div class=\"ringtone\"></div><div>\n<!-- Usage of azlyrics.com content by any third-party \
+            lyrics provider is prohibited. -->\nIs this the real life?<br>\nIs this just fantasy?\n</div>";
+        assert_eq!(azlyrics(lyrics).as_deref(), Some("Is this the real life?\nIs this just fantasy?"));
+        assert!(!AZLYRICS_BLOCKED.load(Relaxed));
+        let gate =
+            "<html><head><title>AZLyrics - request for access</title></head><body><form>...</form></body></html>";
+        assert_eq!(azlyrics(gate), None);
+        assert!(AZLYRICS_BLOCKED.load(Relaxed));
+        // Not asked again: no request is sent.
+        let song = Song { name: "Creep".into(), artist: "Radiohead".into(), ..Song::default() };
+        assert_eq!(provider("azlyrics", &song), None);
     }
 
     /// LRCLIB is asked again only through the paced loop: `http`'s own retries came 2, 4 and 8 seconds after a
