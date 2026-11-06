@@ -130,6 +130,8 @@ fn template_path(output: &str, s: &Song) -> PathBuf {
         if value == "." || value == ".." {
             return "_".into();
         }
+        // A name with one leading dot is hidden, and Navidrome's scanner skips it (`...And Justice for All` is not).
+        let value = if value.starts_with('.') && !value.starts_with("..") { format!("_{value}") } else { value };
         let mut part = String::new();
         for c in value.chars().take(if max == 0 { usize::MAX } else { max as usize }) {
             if part.len() + c.len_utf8() > 200 {
@@ -2095,6 +2097,34 @@ mod tests {
         // A filled part is still made safe: a value cannot climb out of the folder.
         let climb = Song { name: "../etc".into(), artists: vec!["Art".into()], ..Song::default() };
         assert_eq!(template_path("lib/{title}", &climb), PathBuf::from("lib/..etc.opus"));
+    }
+
+    /// Slipknot's `.5: The Gray Chapter` made the hidden folder `.5 The Gray Chapter (2014)` and files starting with
+    /// `.5`, which Navidrome's scanner and file browsers skip, so the album never showed up.
+    #[test]
+    fn leading_dot_names_are_not_hidden() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let album = |name: &str| Song {
+            name: "Song A".into(),
+            artists: vec!["Slipknot".into()],
+            album_artist: "Slipknot".into(),
+            album_name: name.into(),
+            year: 2014,
+            track_number: 1,
+            ..Song::default()
+        };
+        let out = |name: &str| {
+            template_path("{album-artist}/{album} ({year})/{album} - {track-number} - {title}", &album(name))
+        };
+        assert_eq!(
+            out(".5: The Gray Chapter"),
+            PathBuf::from("Slipknot/_.5 The Gray Chapter (2014)/_.5 The Gray Chapter - 01 - Song A.opus")
+        );
+        // Names that start with `..` are shown and scanned, and stay as they are.
+        assert_eq!(
+            out("...And Justice for All"),
+            PathBuf::from("Slipknot/...And Justice for All (2014)/...And Justice for All - 01 - Song A.opus")
+        );
     }
 
     /// A song without a Spotify id got its URL's 40-digit SHA1 as the temporary names' id, and a SoundCloud song its
