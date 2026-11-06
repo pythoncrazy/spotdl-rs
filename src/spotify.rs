@@ -227,22 +227,57 @@ fn track(uri: &str) -> R<Value> {
 fn artist(uri: &str) -> R<Vec<Song>> {
     let releases = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50)?.1;
     let mut releases: Vec<&Value> = releases.iter().map(|release| &release["releases"]["items"][0]).collect();
-    // Each song is kept once, from its first release in this order: albums, EPs, singles, then compilations;
-    // originals before reissues, and standard before deluxe editions. Remasters and outtake sets so do not take
-    // songs away from the original albums.
+    // Releases in this order: albums, EPs, singles, then compilations; originals before reissues. Albums and EPs
+    // are kept whole; singles and compilations add only the songs that no earlier release has.
     let kind =
         |release: &Value| ["ALBUM", "EP", "SINGLE", "COMPILATION"].iter().position(|kind| release["type"] == *kind);
     let date = |release: &Value| release["date"]["isoString"].as_str().unwrap_or_default().to_string();
     releases
         .sort_by_key(|release| (kind(release).unwrap_or(4), date(release), release["tracks"]["totalCount"].as_u64()));
     let mut seen = HashSet::new();
-    let albums: Vec<&str> =
-        releases.iter().filter_map(|release| release["uri"].as_str()).filter(|uri| seen.insert(*uri)).collect();
-    let tracks = albums.into_par_iter().map(album).collect::<R<Vec<_>>>()?;
-    let songs = build(tracks.into_iter().flatten().collect(), Song::default())?;
-    let mut seen = HashSet::new();
+    releases.retain(|release| release["uri"].as_str().is_some_and(|uri| seen.insert(uri.to_string())));
+    let uris: Vec<&str> = releases.iter().filter_map(|release| release["uri"].as_str()).collect();
+    let tracks = uris.into_par_iter().map(album).collect::<R<Vec<_>>>()?;
+    let albums = tracks.into_iter().map(|tracks| build(tracks, Song::default())).collect::<R<Vec<_>>>()?;
     let key = |song: &Song| (search::versionless(&song.name).to_lowercase(), song.artists.clone());
-    Ok(songs.into_iter().filter(|song| seen.insert(key(song))).collect())
+    // A bigger edition of the same album (same base title, or one that starts with it) that has at least 90% of a smaller edition's songs
+    // is kept whole, and the smaller edition is skipped; of two editions with the same songs, the first is
+    // kept. "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist. Titles
+    // are compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its
+    // "(2026 Mix)" songs replaces the 2009 remaster.
+    let titles: Vec<HashSet<String>> =
+        albums.iter().map(|songs| songs.iter().map(|song| search::edition_title(&song.name)).collect()).collect();
+    let title = |release: &Value| base_title(release["name"].as_str().unwrap_or_default()).to_lowercase();
+    // "OK Computer OKNOTOK 1997 2017", "KID A MNESIA" and "Wish You Were Here 50" are editions of the albums whose
+    // titles they start with.
+    let same_title = |a: &str, b: &str| {
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    let replaces = |j: usize, i: usize| {
+        let shared = titles[i].intersection(&titles[j]).count();
+        j != i
+            && same_title(&title(releases[j]), &title(releases[i]))
+            && (titles[j].len() > titles[i].len() || (titles[j].len() == titles[i].len() && j < i))
+            && shared * 10 >= titles[i].len() * 9
+    };
+    let n = releases.len();
+    let mut kept: Vec<usize> = (0..n).filter(|&i| !(0..n).any(|j| replaces(j, i))).collect();
+    // The bigger edition takes the place of the first edition it replaces, so that no release in between takes
+    // its songs.
+    kept.sort_by_key(|&j| (0..n).filter(|&i| i == j || replaces(j, i)).min());
+    // Albums and EPs keep every track, also songs that another album or EP has: the "She's A Riot" EP keeps its
+    // title track, which is also on "Learn To Exist". Singles and compilations add only new titles, not their
+    // edits of album songs.
+    let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
+    let mut songs = Vec::new();
+    for i in kept {
+        let whole = kind(releases[i]).is_some_and(|kind| kind < 2);
+        let new: Vec<&Song> = albums[i].iter().filter(|song| whole || !seen.contains(&key(song))).collect();
+        seen.extend(new.iter().map(|song| key(song)));
+        songs.extend(new.into_iter().cloned());
+    }
+    Ok(songs)
 }
 
 fn playlist(uri: &str) -> R<Vec<Song>> {
