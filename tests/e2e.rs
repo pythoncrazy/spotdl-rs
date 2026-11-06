@@ -112,12 +112,14 @@ fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
 #[test]
 fn url_finds_official_audio() {
     let dir = dir("url");
-    for track in [
-        ELEANOR,
-        "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH",
-        "https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4",
+    for (track, version) in [
+        (ELEANOR, ""),
+        ("https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH", ""),
+        ("https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4", ""),
         // "Lil' Homies - Album Version (Edited)": the suffix is a version note, not part of the title.
-        "https://open.spotify.com/track/1YTfq6avUGOxlJ1GluNIqj",
+        ("https://open.spotify.com/track/1YTfq6avUGOxlJ1GluNIqj", ""),
+        // "Free As A Bird (2025 Mix)": only the search by Deezer's ISRC finds this mix, not the 1995 one.
+        ("https://open.spotify.com/track/0Btrmt27yXVTrcXbx1mTxG", "(2025 mix)"),
     ] {
         let url = ok(spotdl(&dir, &["url", track]));
         let url = url.lines().next().unwrap();
@@ -126,7 +128,7 @@ fn url_finds_official_audio() {
         let video: Value = ureq::get(&oembed).call().unwrap().into_body().read_json().unwrap();
         let title = video["title"].as_str().unwrap().to_lowercase();
         let altered = ["karaoke", "cover", "live", "nightcore", "slowed", "sped up", "8d", "instrumental"];
-        assert!(!altered.iter().any(|word| title.contains(word)), "{track}: {title}");
+        assert!(!altered.iter().any(|word| title.contains(word)) && title.contains(version), "{track}: {title}");
     }
 }
 

@@ -1297,6 +1297,9 @@ fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
 fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if op == "save" {
         if on("preload") && s.download_url.is_none() {
+            // Spotify gives no ISRC; Deezer's is what lets the search find the release's own recording, as a
+            // download does. The save file keeps it, so a later download searches by it too.
+            enrich(s);
             s.download_url = search::find(s).ok().and_then(|urls| urls.into_iter().next());
         }
         s.lyrics = find_lyrics(s);
@@ -1307,6 +1310,8 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     if op == "url" {
         if s.download_url.is_none() {
+            // The same search as a download's: with Deezer's ISRC.
+            enrich(s);
             s.download_url = search::find(s)?.into_iter().next();
         }
         return Ok(path(s));
