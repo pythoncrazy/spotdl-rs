@@ -158,7 +158,7 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
         let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if path.is_dir() {
             audio_files(&path, files);
-        } else if AUDIO.contains(&extension.as_str()) {
+        } else if AUDIO.contains(&extension.as_str()) && !temp_file(&path) {
             files.push(path);
         }
     }
@@ -934,7 +934,7 @@ fn album_gain(dir: &Path) -> R<()> {
     for entry in fs::read_dir(dir)? {
         let file = entry?.path();
         let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !AUDIO.contains(&extension.as_str()) {
+        if !AUDIO.contains(&extension.as_str()) || temp_file(&file) {
             continue;
         }
         let audio = lofty::read_from_path(&file)?;
@@ -1021,8 +1021,9 @@ fn write_folder_art(file: &Path, s: &Song) -> R<()> {
     Ok(())
 }
 
-/// Downloads one video's audio to `out`, converting with FFmpeg unless it is already in the right format.
-fn fetch(url: &str, out: &Path, id: &str) -> R<()> {
+/// Downloads one video's audio next to `out`, converting with FFmpeg unless it is already in the right format;
+/// returns the temporary file, which becomes `out` only once it is tagged.
+fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
     let (format, bitrate) = (text("format").unwrap_or("opus"), text("bitrate").unwrap_or("auto"));
     let selector = match format {
         "m4a" => "bestaudio[ext=m4a]/bestaudio",
@@ -1069,25 +1070,46 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<()> {
             false => Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into()),
         }
     };
-    let result = convert().and_then(|()| Ok(fs::rename(&temp, out)?));
+    let result = convert();
     let _ = fs::remove_file(&got);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    result
+    result.map(|()| temp)
 }
 
-/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked.
-fn download(song: &Song, out: &Path) -> R<String> {
+/// Whether `file` is one of `fetch`'s temporary files (`<stem>.<id>.converted.<format>`), which an interrupted
+/// run can leave behind: it is no song of the library.
+fn temp_file(file: &Path) -> bool {
+    file.file_stem().map(Path::new).and_then(Path::extension).is_some_and(|extension| extension == "converted")
+}
+
+/// Removes the temporary files an interrupted download of `out` left: yt-dlp's `<stem>.<id>.<ext>` (and
+/// `.part`) and `fetch`'s `<stem>.<id>.converted.<format>`. Only names that start with `<stem>.<id>.` go.
+fn remove_temp_files(out: &Path, id: &str) {
+    let prefix = out.with_extension(format!("{id}."));
+    let (Some(dir), Some(prefix)) = (prefix.parent(), prefix.file_name()) else { return };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the
+/// downloaded (untagged) temporary file.
+fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     fs::create_dir_all(out.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     let id = match song.song_id.as_str() {
         "" => format!("{:x}", Sha1::digest(&song.url)),
         id => id.into(),
     };
+    remove_temp_files(out, &id);
     let mut failure = None;
     if let Some(url) = &song.download_url {
         match fetch(url, out, &id) {
-            Ok(()) => return Ok(url.clone()),
+            Ok(temp) => return Ok((url.clone(), temp)),
             Err(error) => failure = Some(error),
         }
     }
@@ -1100,7 +1122,7 @@ fn download(song: &Song, out: &Path) -> R<String> {
     };
     for url in candidates.into_iter().filter(|url| song.download_url.as_ref() != Some(url)) {
         match fetch(&url, out, &id) {
-            Ok(()) => return Ok(url),
+            Ok(temp) => return Ok((url, temp)),
             Err(error) => failure = Some(error),
         }
     }
@@ -1174,14 +1196,22 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         (lyrics.join().ok().flatten(), downloaded)
     });
     s.lyrics = lyrics;
-    if let Some(url) = downloaded.transpose()? {
-        s.download_url = Some(url);
-        if target != out && target.is_file() {
-            fs::remove_file(&target)?;
+    match downloaded.transpose()? {
+        // The audio is tagged before it gets its name: a file at `out` is a finished song, which later runs skip
+        // and archive, so a failed or interrupted tagging must not leave an untagged one there.
+        Some((url, temp)) => {
+            s.download_url = Some(url);
+            if let Err(error) = write_tags(&temp, s).and_then(|()| Ok(fs::rename(&temp, &out)?)) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            if target != out && target.is_file() {
+                fs::remove_file(&target)?;
+            }
+            target = out;
         }
-        target = out;
+        None => write_tags(&target, s)?,
     }
-    write_tags(&target, s)?;
     write_folder_art(&target, s)?;
     write_lrc(&target, s)?;
     if on("create_skip_file") {

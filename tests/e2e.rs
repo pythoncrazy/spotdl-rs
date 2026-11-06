@@ -211,6 +211,47 @@ fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
     assert_eq!(tagged.primary_tag().unwrap().album().as_deref(), Some("Alb (Remastered)"));
 }
 
+/// A song whose tags cannot be written leaves no file at its path, which a later run would skip and archive as
+/// done, and an interrupted download's temporary files go when the song is downloaded again. Needs no download:
+/// a fake yt-dlp gives first audio that cannot be tagged, then a silent song.
+#[test]
+fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
+    let dir = dir("untagged");
+    let song = json!([{"name": "A", "artists": ["Art"], "artist": "Art", "album_name": "Alb", "album_artist": "Art",
+        "duration": 10, "year": 2020, "date": "2020", "track_number": 1, "tracks_count": 1, "song_id": "A",
+        "url": "https://open.spotify.com/track/A", "download_url": VIDEO}]);
+    fs::write(dir.join("a.spotdl"), song.to_string()).unwrap();
+    let yt_dlp = dir.join("yt-dlp");
+    // The arguments end with `-o <template> <url>`.
+    let fake = |audio: &str| {
+        let script = format!("#!/bin/sh\nfor a; do o=$t; t=$a; done\n{audio}\n");
+        fs::write(&yt_dlp, script).unwrap();
+        Command::new("chmod").arg("+x").arg(&yt_dlp).status().unwrap();
+    };
+    let (file, archive) = (dir.join("Art - A.opus"), dir.join("archive.txt"));
+    let stale = [dir.join("Art - A.A.converted.opus"), dir.join("Art - A.A.webm.part")];
+    for stale in &stale {
+        fs::write(stale, "").unwrap();
+    }
+    let args = ["download", "a.spotdl", "--yt-dlp", yt_dlp.to_str().unwrap(), "--archive", "archive.txt"];
+    fake(r#"f=$(echo "$o" | sed 's/%(ext)s/opus/'); echo garbage > "$f"; echo "$f""#);
+    for _ in 0..2 {
+        fails_with(spotdl(&dir, &args), "1 failed");
+        assert!(!file.exists() && fs::read_to_string(&archive).unwrap_or_default().is_empty());
+    }
+    assert!(stale.iter().all(|stale| !stale.exists()));
+    let silence = "-f lavfi -i anullsrc=r=48000:cl=mono -t 10 -c:a libopus";
+    fake(&format!(
+        r#"f=$(echo "$o" | sed 's/%(ext)s/webm/'); ffmpeg -nostdin -loglevel error {silence} "$f"; echo "$f""#
+    ));
+    ok(spotdl(&dir, &args));
+    let tagged = lofty::read_from_path(&file).unwrap();
+    assert_eq!(tagged.primary_tag().unwrap().title().as_deref(), Some("A"));
+    assert_eq!(fs::read_to_string(&archive).unwrap().trim(), "https://open.spotify.com/track/A");
+    let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert!(left.iter().all(|name| !name.to_string_lossy().starts_with("Art - A.A.")), "{left:?}");
+}
+
 #[test]
 fn rejects_bad_options_and_unsafe_paths() {
     let dir = dir("errors");

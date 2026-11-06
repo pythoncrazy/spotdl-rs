@@ -51,6 +51,8 @@ Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` 
 
 Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover. Use `--m3u` to write one playlist file per list; it includes every song of the list, also those that another query already downloaded.
 
+A song gets its file name only after its tags, cover and ReplayGain are written, so a file at the output path is a finished song: a run that is stopped or fails while tagging leaves a `<name>.<track-id>.converted.<format>` file, which is not taken for a song and is deleted when the song is downloaded again.
+
 Use `--print-errors` to print all errors at the end. Use `--save-errors errors.txt` to save them, with the Spotify URL of each song. Set `--log-level` and `--log-format` to change log output.
 
 You can use `--redownload` with `meta` to save the local songs again in the selected format. `sync` moves the files of songs whose output path changed and deletes the files of songs that are no longer listed; a file that a listed song writes is kept, also when the song's Spotify URL changed (a re-released album gives its songs new IDs). A moved song keeps its lyrics and `.lrc` file, and its tags are written again for its new title, album or year; a folder left with nothing but `cover.jpg` or `artist.jpg` is removed. Use `--sync-remove-lrc` to also remove the lyric files of songs that are no longer listed. Use `--add-unavailable` to add songs without a download to the archive and playlists.
