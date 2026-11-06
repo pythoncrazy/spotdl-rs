@@ -269,6 +269,24 @@ fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
 }
 
 #[test]
+fn a_missing_yt_dlp_is_named_and_failed_songs_leave_no_folders() {
+    let dir = dir("missing-yt-dlp");
+    let song = json!([{"name": "A", "artists": ["Art"], "artist": "Art", "album_name": "Alb", "album_artist": "Art",
+        "duration": 10, "song_id": "A", "url": "https://open.spotify.com/track/A", "download_url": VIDEO}]);
+    fs::write(dir.join("a.spotdl"), song.to_string()).unwrap();
+    let args = [
+        "download",
+        "a.spotdl",
+        "--yt-dlp",
+        "/nonexistent/yt-dlp",
+        "--output",
+        "{artist}/{album}/{title}.{output-ext}",
+    ];
+    fails_with(spotdl(&dir, &args), "cannot run /nonexistent/yt-dlp: no such file");
+    assert!(!dir.join("Art").exists());
+}
+
+#[test]
 fn rejects_bad_options_and_unsafe_paths() {
     let dir = dir("errors");
     fails_with(spotdl(&dir, &["--not-an-option"]), "unknown option --not-an-option");

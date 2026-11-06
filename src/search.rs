@@ -2,7 +2,7 @@ use crate::{cached, download, http_json, list, log, now, number, on, spotify, te
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    process::Command,
+    process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
@@ -93,6 +93,12 @@ pub fn yt_dlp() -> Command {
     }
     command.args(text("yt_dlp_args").unwrap_or_default().split_whitespace());
     command
+}
+
+/// Runs `command`, naming the program when it cannot be started: the OS error alone ("No such file or directory")
+/// does not say that yt-dlp or FFmpeg is missing.
+pub fn run(command: &mut Command) -> Result<Output, String> {
+    command.output().map_err(|error| format!("cannot run {}: {error}", command.get_program().to_string_lossy()))
 }
 
 pub fn slug(s: &str, sep: &str) -> String {
@@ -371,8 +377,7 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
 /// yt-dlp's flat listing of a search (`ytsearch10:...`), video or playlist.
 fn ytdlp(target: &str) -> R<Vec<Hit>> {
     let stdout = youtube(|| {
-        let out =
-            yt_dlp().args(["--flat-playlist", "-J", "--no-warnings", target]).output().map_err(|e| e.to_string())?;
+        let out = run(yt_dlp().args(["--flat-playlist", "-J", "--no-warnings", target]))?;
         let error = || format!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr).trim());
         out.status.success().then(|| out.stdout.clone()).ok_or_else(error)
     })?;

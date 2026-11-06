@@ -1019,12 +1019,11 @@ const DEEZER_REFERENCE: f64 = RG_REFERENCE - 0.4;
 
 /// The EBU R128 integrated loudness (LUFS) and true peak (linear) of a file, measured by FFmpeg.
 fn loudness(file: &Path) -> Option<(f64, f64)> {
-    let output = Command::new(text("ffmpeg").unwrap_or("ffmpeg"))
-        .args(["-nostats", "-hide_banner", "-i"])
-        .arg(file)
-        .args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"])
-        .output()
-        .ok()?;
+    let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
+    ffmpeg.args(["-nostats", "-hide_banner", "-i"]).arg(file);
+    ffmpeg.args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"]);
+    // Without FFmpeg the gain silently fell back to Deezer's, or none.
+    let output = search::run(&mut ffmpeg).map_err(|error| log("WARNING", &format!("ReplayGain: {error}"))).ok()?;
     let log = String::from_utf8_lossy(&output.stderr);
     let summary = &log[log.rfind("Summary:")?..];
     let value = |label: &str, unit: &str| summary.split_once(label)?.1.split_once(unit)?.0.trim().parse::<f64>().ok();
@@ -1285,6 +1284,8 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         "opus" => "bestaudio[ext=webm]/bestaudio",
         _ => "bestaudio",
     };
+    // yt-dlp makes the template's folder when it writes the file, so a song with no match or no working download
+    // leaves no empty artist and album folders.
     let template = out.with_extension(format!("{id}.%(ext)s"));
     let (got, abr) = search::youtube(|| {
         let mut command = search::yt_dlp();
@@ -1294,7 +1295,7 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         if on("sponsor_block") {
             command.args(["--sponsorblock-remove", "all"]);
         }
-        let output = command.arg(url).output().map_err(|error| error.to_string())?;
+        let output = search::run(command.arg(url))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let got =
             stdout.lines().rev().filter_map(|line| line.split_once(' ')).find(|(_, path)| Path::new(path).is_file());
@@ -1323,7 +1324,7 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         if codec != "copy" {
             ffmpeg.args(rate_args(bitrate, format, abr));
         }
-        let output = ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp).output()?;
+        let output = search::run(ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp))?;
         match output.status.success() {
             true => Ok(()),
             false => Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into()),
@@ -1382,7 +1383,6 @@ fn temp_id(song: &Song) -> String {
 /// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the
 /// downloaded (untagged) temporary file.
 fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
-    fs::create_dir_all(out.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     let id = temp_id(song);
     remove_temp_files(out, &id);
     let mut failure = None;
