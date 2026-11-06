@@ -961,6 +961,13 @@ fn advisory_key(format: TagType) -> ItemKey {
     }
 }
 
+/// The compilation flag marks a Various Artists release, as Picard and iTunes set it, and is the same for every song
+/// of the album. Spotify calls an artist's own anthologies and best-ofs (the 2018 White Album, 2Pac's Greatest Hits)
+/// compilations too: flagged, they are filed under Various Artists by players. `RELEASETYPE` keeps Spotify's word.
+fn compilation(s: &Song) -> bool {
+    s.album_type == "compilation" && s.album_artist.eq_ignore_ascii_case("Various Artists")
+}
+
 fn write_tags(file: &Path, s: &Song) -> R<()> {
     let mut audio = lofty::read_from_path(file)?;
     let format = audio.primary_tag_type();
@@ -1004,7 +1011,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (ItemKey::Barcode, single(s.extra.upc.clone())),
         (ItemKey::ReplayGainTrackGain, single(gain)),
         (ItemKey::ReplayGainTrackPeak, single(peak)),
-        (ItemKey::FlagCompilation, single(if s.album_type == "compilation" { "1".into() } else { String::new() })),
+        (ItemKey::FlagCompilation, single(if compilation(s) { "1" } else { "" }.into())),
         (advisory_key(format), single(if s.explicit { "1" } else { "0" }.into())),
         (ItemKey::TrackArtists, if id3 { single(s.artists.join("\0")) } else { s.artists.clone() }),
         (ItemKey::Genre, s.genres.clone()),
@@ -1729,9 +1736,9 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args,
-        redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND,
-        LRCLIB_KEPT, REDOWNLOADS,
+        among, compilation, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider,
+        rate_args, redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED,
+        LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1743,6 +1750,18 @@ mod tests {
         "[00:05.86]After everything said, huh, man, man\n[00:12.00]After everything said, huh\n\
         [00:18.27]\"Crazy, bipolar, antisemite\"\n[00:23.04]And I'm still the king\n\
         [00:31.56]They thought headlines was my kryptonite\n[00:36.14]Still the king";
+
+    /// Spotify's compilations of one artist's songs were flagged as compilations, which players file under Various
+    /// Artists, out of the artist's discography.
+    #[test]
+    fn only_various_artists_compilations_are_flagged() {
+        let album =
+            |kind: &str, artist: &str| Song { album_type: kind.into(), album_artist: artist.into(), ..Song::default() };
+        assert!(compilation(&album("compilation", "Various Artists")));
+        assert!(compilation(&album("compilation", "various artists")));
+        assert!(!compilation(&album("compilation", "The Beatles")));
+        assert!(!compilation(&album("album", "Various Artists")));
+    }
 
     #[test]
     fn lyrics_of_one_song_agree_and_of_two_songs_do_not() {
