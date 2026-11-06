@@ -205,9 +205,14 @@ pub fn http_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body:
     Ok(serde_json::from_slice(&http(url, headers, body)?)?)
 }
 
-/// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all).
+/// The longest time a [`cached`] entry is read, but for those kept for good.
+const CACHE_DAYS: u64 = 7;
+
+/// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all, at most [`CACHE_DAYS`] or forever).
 pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
-    let path = HOME.join("cache").join(&format!("{:x}", Sha1::digest(key))[..16]);
+    // Entries kept for good go to their own folder, which [`prune_cache`] leaves alone: the names are hashes.
+    let dir = if days == u64::MAX { HOME.join("cache/keep") } else { HOME.join("cache") };
+    let path = dir.join(&format!("{:x}", Sha1::digest(key))[..16]);
     let days = if on("no_cache") { 0 } else { days };
     let age = fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|time| time.elapsed().ok());
     if age.is_some_and(|age| age.as_secs() / 86_400 < days) {
@@ -217,9 +222,21 @@ pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value
     }
     let value = fetch()?;
     if days > 0 {
-        let _ = fs::create_dir_all(HOME.join("cache")).and_then(|_| fs::write(&path, value.to_string()));
+        let _ = fs::create_dir_all(dir).and_then(|_| fs::write(&path, value.to_string()));
     }
     Ok(value)
+}
+
+/// Deletes the files in `dir` older than `days`. An expired entry is otherwise only replaced when its key is asked for
+/// again, so the cache (mostly YouTube Music replies of up to 300 KB) grew with every new query, without end.
+fn prune_cache(dir: &Path, days: u64) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let meta = entry.metadata().ok().filter(|meta| meta.is_file());
+        let age = meta.and_then(|meta| meta.modified().ok()?.elapsed().ok());
+        if age.is_some_and(|age| age.as_secs() / 86_400 >= days) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn url_encode(value: &str) -> String {
@@ -446,6 +463,7 @@ fn run() -> R<()> {
     }
     let meta_threads = number("meta_threads").max(1) as usize;
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
+    prune_cache(&HOME.join("cache"), CACHE_DAYS);
     if op == "meta" {
         return download::meta(&queries);
     }
@@ -511,12 +529,30 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff, http_paced, Pace};
+    use super::{backoff, http_paced, prune_cache, Pace};
     use std::{
+        fs,
         io::{Read, Write},
         net::TcpListener,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
+
+    #[test]
+    fn the_cache_drops_expired_entries_but_keeps_the_kept_ones() {
+        let dir = std::env::temp_dir().join(format!("spotdl-cache-{}", std::process::id()));
+        fs::create_dir_all(dir.join("keep")).unwrap();
+        let week_ago = SystemTime::now() - Duration::from_secs(7 * 86_400 + 60);
+        for (name, old) in [("old", true), ("new", false), ("keep/old", true)] {
+            let file = fs::File::create(dir.join(name)).unwrap();
+            if old {
+                file.set_modified(week_ago).unwrap();
+            }
+        }
+        prune_cache(&dir, 7);
+        let left = ["old", "new", "keep/old"].map(|name| dir.join(name).exists());
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(left, [false, true, true]);
+    }
 
     #[test]
     fn retry_pauses_are_capped() {

@@ -22,7 +22,7 @@ Songs are saved as Opus by default (`--format` also takes `m4a`, `mp3`, `flac`, 
 
 Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`. Use `--key=value` when a value starts with `--`, for example `--yt-dlp-args="--js-runtimes node"`.
 
-Use `--max-retries 3` to set the number of retries after a failed request. A retry waits as long as the server's `Retry-After` asks (at most 60 s), else 2, 4, 8, 16, then 32 s; when Spotify's API answers 429, all threads wait together. Use `--use-cache-file` to keep track data between runs. Use `--no-cache` to turn off local caches.
+Use `--max-retries 3` to set the number of retries after a failed request. A retry waits as long as the server's `Retry-After` asks (at most 60 s), else 2, 4, 8, 16, then 32 s; when Spotify's API answers 429, all threads wait together. Replies from Spotify, Deezer and YouTube Music are cached in `~/.spotdl/cache` for 7 days; each run deletes the older ones. Use `--use-cache-file` to keep track data between runs (in `~/.spotdl/cache/keep`, which is not cleaned). Use `--no-cache` to turn off local caches.
 
 Use `--meta-threads N` to set the number of metadata workers; `save` uses them for searches and lyrics. Lyrics are fetched while the audio downloads.
 
