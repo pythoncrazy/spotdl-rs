@@ -63,11 +63,19 @@ fn hashes() -> R<Value> {
     Ok(Value::Object(found.collect()))
 }
 
+/// Whether a session has every query's hash: a route chunk that failed to load leaves some out.
+fn complete(state: &Value) -> bool {
+    QUERIES.iter().all(|op| state["hashes"][op].is_string())
+}
+
 /// The anonymous web-player token and query hashes, kept in `~/.spotdl/anon.json` until they expire.
 fn session(rejected: Option<&str>) -> R<Arc<Value>> {
     let mut slot = SESSION.lock().map_err(|error| error.to_string())?;
     let path = HOME.join("anon.json");
-    let disk = || serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !on("no_cache")).map(Arc::new);
+    let disk = || {
+        let state = serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !on("no_cache"));
+        state.filter(complete).map(Arc::new)
+    };
     let fresh = |state: &Arc<Value>| {
         state["exp"].as_u64() > Some(crate::now() * 1000 + 60_000)
             && rejected.is_none_or(|token| state["token"] != token)
@@ -85,7 +93,8 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
     let token = token["accessToken"].as_str().map(|t| (t, &token["accessTokenExpirationTimestampMs"]));
     let (token, expires) = token.ok_or("Spotify token missing")?;
     let state = Arc::new(json!({"token": token, "exp": expires, "hashes": hashes()?}));
-    if !on("no_cache") {
+    // A partial set is kept for this run only, so the next run looks for the missing hashes again.
+    if !on("no_cache") && complete(&state) {
         fs::create_dir_all(&*HOME)?;
         fs::write(path, state.to_string())?;
     }
@@ -104,7 +113,11 @@ fn query(op: &str, variables: Value) -> R<Value> {
         for _ in 0..=number("max_retries") {
             let state = session(rejected.as_deref())?;
             let token = state["token"].as_str().unwrap_or_default();
-            let hash = state["hashes"][op].as_str().ok_or("missing query hash")?;
+            // A hash the bundles did not yield is asked of a new session, as for a rejected token.
+            let Some(hash) = state["hashes"][op].as_str() else {
+                (rejected, last) = (Some(token.into()), format!("{op}: missing query hash"));
+                continue;
+            };
             let extensions = json!({"persistedQuery": {"version": 1, "sha256Hash": hash}}).to_string();
             let (variables, extensions) = (url_encode(&variables.to_string()), url_encode(&extensions));
             let url = format!("https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}");
@@ -691,7 +704,8 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agrees, dates, deezer_error, disc_tracks, editions, enrich, fetch_once, ranked, release_date, song_key,
+        agrees, complete, dates, deezer_error, disc_tracks, editions, enrich, fetch_once, query, ranked, release_date,
+        song_key, SESSION,
     };
     use crate::Song;
     use serde_json::json;
@@ -770,6 +784,19 @@ mod tests {
         // Without per-disc counts, the album's.
         assert_eq!(disc_tracks(&json!({"tracksV2": {"totalCount": 17}}), 2), 17);
         assert_eq!(disc_tracks(&json!({}), 1), 1);
+    }
+
+    #[test]
+    fn a_session_without_a_querys_hash_is_built_again() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        // As if the search route chunk had failed to load: a live token, but no searchDesktop hash.
+        let partial = json!({"token": "partial", "exp": u64::MAX, "hashes": {"getTrack": "0".repeat(64)}});
+        assert!(!complete(&partial));
+        *SESSION.lock().unwrap() = Some(std::sync::Arc::new(partial));
+        let variables = json!({"searchTerm": "Bohemian Rhapsody", "offset": 0, "limit": 1, "numberOfTopResults": 1, "includeAudiobooks": false, "includeArtistHasConcertsField": false, "includePreReleases": false, "includeLocalConcertsField": false});
+        let reply = query("searchDesktop", variables).expect("a new session has the hash");
+        assert!(reply["data"]["searchV2"].is_object());
+        assert!(complete(SESSION.lock().unwrap().as_ref().unwrap()));
     }
 
     #[test]
