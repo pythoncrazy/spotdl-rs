@@ -718,8 +718,13 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     let mut audio = lofty::read_from_path(file)?;
     let format = audio.primary_tag_type();
     let id3 = format == TagType::Id3v2;
+    // spotdl's keys go into the file's own tag, so that the keys of other tools (MusicBrainz IDs, composers,
+    // sort names, album gains) stay.
+    let mut tag = audio.primary_tag().cloned().unwrap_or_else(|| Tag::new(format));
     let (gain, peak) = track_gain(file, s);
-    let mut tag = Tag::new(format);
+    // A measured gain (one with a peak) stays unless it is measured again: Deezer's gain is only an estimate.
+    let measured = tag.get_string(&ItemKey::ReplayGainTrackPeak).is_some_and(|peak| !peak.is_empty());
+    let gain = if peak.is_empty() && measured { String::new() } else { gain };
     tag.set_title(s.name.clone());
     tag.set_artist(s.artists.join(text("id3_separator").unwrap_or("/")));
     tag.set_album(s.album_name.clone());
@@ -727,7 +732,9 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     tag.set_track_total(s.tracks_count);
     tag.set_disk(s.disc_number);
     tag.set_disk_total(s.disc_count);
-    tag.set_comment(s.download_url.clone().unwrap_or_default());
+    if let Some(url) = &s.download_url {
+        tag.set_comment(url.clone());
+    }
     let bpm = match s.extra.bpm {
         0.0 => String::new(),
         bpm if id3 => bpm.round().to_string(),
@@ -755,24 +762,34 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (ItemKey::Unknown("RELEASETYPE".into()), single(s.album_type.clone())),
         (url_key(format), single(s.url.clone())),
     ];
-    for (key, value) in
-        items.into_iter().flat_map(|(key, values)| values.into_iter().map(move |value| (key.clone(), value)))
-    {
-        if value.is_empty() {
+    // Other tools may write unknown Vorbis keys in lower case.
+    let same_key = |a: &ItemKey, b: &ItemKey| match (a, b) {
+        (ItemKey::Unknown(a), ItemKey::Unknown(b)) => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    };
+    for (key, values) in items {
+        let values: Vec<String> = values.into_iter().filter(|value| !value.is_empty()).collect();
+        // A value spotdl does not have leaves the file's own, but the compilation flag is spotdl's to clear.
+        if values.is_empty() && key != ItemKey::FlagCompilation {
             continue;
         }
-        let url = matches!(key, ItemKey::AudioSourceUrl);
-        let item = TagItem::new(key.clone(), if url { ItemValue::Locator(value) } else { ItemValue::Text(value) });
-        if matches!(key, ItemKey::Unknown(_)) {
-            tag.insert_unchecked(item);
-        } else {
-            tag.push(item);
+        tag.retain(|item| !same_key(item.key(), &key));
+        for value in values {
+            let url = matches!(key, ItemKey::AudioSourceUrl);
+            let item = TagItem::new(key.clone(), if url { ItemValue::Locator(value) } else { ItemValue::Text(value) });
+            if matches!(key, ItemKey::Unknown(_)) {
+                tag.push_unchecked(item);
+            } else {
+                tag.push(item);
+            }
         }
     }
     let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(|url| http(url, &[], None).ok());
     if let Some(cover) = cover {
+        tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, cover));
     }
+    // Tags of other types (a stray ID3v1 tag) go.
     audio.clear();
     if file.extension().is_some_and(|extension| extension == "wav") {
         audio.insert_tag(lofty::iff::wav::RiffInfoList::from(tag.clone()).into());
@@ -1126,6 +1143,7 @@ fn meta_file(file: &Path) -> R<()> {
         artists,
         album_name: tag.album().unwrap_or_default().into(),
         year: tag.year().unwrap_or_default(),
+        track_number: tag.track().unwrap_or_default(),
         duration: audio.properties().duration().as_secs_f64(),
         lyrics: lyrics.clone(),
         ..Song::default()
@@ -1146,17 +1164,26 @@ fn meta_file(file: &Path) -> R<()> {
     let url = source_url(tag).filter(|url| url.contains("spotify"));
     let found = match &url {
         Some(url) => spotify::resolve(url)?.into_iter().next(),
-        // Without a Spotify URL the search result must be the same song, so that a song that is not on Spotify
-        // (an unreleased one) does not take the tags of a released song with the same title.
-        None => spotify::resolve(&format!("{} - {}", local.artist, local.name))
-            .ok()
-            .and_then(|songs| songs.into_iter().next())
-            .filter(|song| {
-                let same = |a: &str, b: &str| search::versionless(a).eq_ignore_ascii_case(search::versionless(b));
+        // Without a Spotify URL the match must be the same song on the same release, so that a song that is not
+        // on Spotify (an unreleased one) does not take the tags of a released song with the same title, and an
+        // album's song does not take those of a compilation or another edition. The track search finds a song's
+        // most popular release (Three Little Birds of Exodus is on Legend), so the album is searched too.
+        None => {
+            let same = |a: &str, b: &str| search::versionless(a).eq_ignore_ascii_case(search::versionless(b));
+            let fits = |song: &Song| {
                 same(&song.name, &local.name)
                     && song.artists.contains(&local.artist)
                     && (song.duration - local.duration).abs() < 4.0
-            }),
+                    && (local.album_name.is_empty() || same(&song.album_name, &local.album_name))
+                    && (local.track_number == 0 || song.track_number == local.track_number)
+            };
+            let track = spotify::resolve(&format!("{} - {}", local.artist, local.name)).ok();
+            track.and_then(|songs| songs.into_iter().next()).filter(fits).or_else(|| {
+                let album = format!("album:{} {}", local.artist, local.album_name);
+                let songs = (!local.album_name.is_empty()).then(|| spotify::resolve(&album).ok()).flatten()?;
+                songs.into_iter().find(fits)
+            })
+        }
     };
     let Some(mut song) = found.or_else(|| url.is_none().then(|| local.clone())) else { return Err("no match".into()) };
     let on_spotify = !song.song_id.is_empty();

@@ -276,6 +276,49 @@ fn meta_keeps_tags_of_songs_not_on_spotify_and_reads_only_genius_lyrics() {
     }
 }
 
+/// A 3-minute Exodus song as another tool tags it: Spotify's track search finds the song on Legend, a compilation.
+#[test]
+fn meta_tags_songs_without_a_spotify_url_from_their_own_album_and_keeps_other_tags() {
+    let dir = dir("meta-album");
+    let tagged = |album: &str| {
+        let file = dir.join(format!("{album}.opus"));
+        let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "180"];
+        let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+        assert!(status.success());
+        let mut tagged = lofty::read_from_path(&file).unwrap();
+        let mut tag = Tag::new(tagged.primary_tag_type());
+        tag.set_title("Three Little Birds".into());
+        tag.set_artist("Bob Marley & The Wailers".into());
+        tag.set_album(album.into());
+        tag.set_track(9);
+        tag.insert_text(ItemKey::MusicBrainzRecordingId, "abc-123".into());
+        tag.insert_text(ItemKey::Composer, "Bob Marley".into());
+        tag.insert_text(ItemKey::ReplayGainTrackGain, "-2.00 dB".into());
+        tag.insert_text(ItemKey::ReplayGainTrackPeak, "0.900000".into());
+        tagged.insert_tag(tag);
+        tagged.save_to_path(&file, WriteOptions::default()).unwrap();
+        file
+    };
+    let (exodus, rip) = (tagged("Exodus"), tagged("Live at Somewhere"));
+    for file in [&exodus, &rip] {
+        ok(spotdl(&dir, &["meta", file.to_str().unwrap()]));
+    }
+    let read = |file: &Path| lofty::read_from_path(file).unwrap().primary_tag().unwrap().clone();
+    let (exodus, rip) = (read(&exodus), read(&rip));
+    assert!(exodus.get_string(&ItemKey::Unknown("WOAS".into())).is_some_and(|url| url.contains("spotify")));
+    assert!(!exodus.pictures().is_empty());
+    // A song on no Spotify release of that title keeps its tags.
+    assert!(rip.get_string(&ItemKey::Unknown("WOAS".into())).is_none());
+    for (tag, album) in [(exodus, "Exodus"), (rip, "Live at Somewhere")] {
+        assert_eq!((tag.album().as_deref(), tag.track()), (Some(album), Some(9)));
+        assert_eq!(tag.get_string(&ItemKey::MusicBrainzRecordingId), Some("abc-123"));
+        assert_eq!(tag.get_string(&ItemKey::Composer), Some("Bob Marley"));
+        // The measured gain stays: Deezer's is only an estimate.
+        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackGain), Some("-2.00 dB"));
+        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackPeak), Some("0.900000"));
+    }
+}
+
 #[test]
 fn lyrics_aligner_times_lyrics_keeps_them_when_unsure_and_removes_lyrics_of_another_song() {
     let dir = dir("aligner");
