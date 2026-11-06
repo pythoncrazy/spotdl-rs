@@ -161,6 +161,17 @@ fn album_meta(uri: &str) -> R<Arc<Value>> {
     Ok(ALBUMS.lock().map_err(|error| error.to_string())?.entry(uri.into()).or_insert(Arc::new(album)).clone())
 }
 
+/// Spotify dates some albums by year or month only and pads its isoString with 1 January ("1994-01-01T00:00:00Z"
+/// for The Division Bell, out on 28 March 1994), so only the part its precision gives is the date.
+fn release_date(date: &Value) -> String {
+    let known = match date["precision"].as_str() {
+        Some("YEAR") => 4,
+        Some("MONTH") => 7,
+        _ => 10,
+    };
+    date["isoString"].as_str().and_then(|iso| iso.get(..known)).unwrap_or_default().into()
+}
+
 /// Songs from web-player tracks; `list` carries the playlist fields that every song shares.
 fn build(tracks: Vec<Value>, list: Song) -> R<Vec<Song>> {
     let album_uri = |track: &Value| track["albumOfTrack"]["uri"].as_str().unwrap_or_default().to_string();
@@ -176,7 +187,7 @@ fn build(tracks: Vec<Value>, list: Song) -> R<Vec<Song>> {
         let credits = [&track["firstArtist"]["items"], &track["otherArtists"]["items"], &track["artists"]["items"]];
         let artists = credits.into_iter().flat_map(|items| items.as_array().into_iter().flatten());
         let artists: Vec<String> = artists.filter_map(|a| a["profile"]["name"].as_str().map(String::from)).collect();
-        let date = album["date"]["isoString"].as_str().and_then(|date| date.get(..10)).unwrap_or_default().to_string();
+        let date = release_date(&album["date"]);
         let id = |value: &Value| value.as_str().unwrap_or_default().rsplit(':').next().unwrap_or_default().to_string();
         let duration = ["duration", "trackDuration"].iter().find_map(|key| track[key]["totalMilliseconds"].as_f64());
         let song_id = id(&track["uri"]);
@@ -474,6 +485,27 @@ fn deezer_album(song: &Song) -> R<Value> {
     })
 }
 
+/// The release date and original date from Spotify's date and Deezer's date of the album. Deezer pads dates it
+/// knows only by year with 1 January too (29 of 894 cached albums, over ten times the real share), so that is read as
+/// the year. Deezer's album is found by title, so it can be a reissue: its day is taken for a Spotify date of
+/// only a year or month when it is in that year or month. Dates are compared only as far as both go, so a year
+/// is not earlier than a day in it.
+fn dates(spotify: &str, deezer: &str) -> (String, String) {
+    let deezer = deezer.strip_suffix("-01-01").unwrap_or(deezer);
+    let date = if deezer.len() > spotify.len() && !spotify.is_empty() && deezer.starts_with(spotify) {
+        deezer
+    } else {
+        spotify
+    };
+    let shared = date.len().min(deezer.len());
+    let original = match deezer {
+        "" => "",
+        _ if date.is_empty() || deezer.get(..shared) < date.get(..shared) => deezer,
+        _ => date,
+    };
+    (date.into(), original.into())
+}
+
 /// Adds Deezer's genres, label, UPC, original date, ISRC, BPM and gain.
 pub fn enrich(song: &mut Song) {
     let cell = DEEZER_ALBUMS
@@ -487,12 +519,7 @@ pub fn enrich(song: &mut Song) {
             album["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
         song.extra.upc = album["upc"].as_str().unwrap_or_default().into();
         song.publisher = album["label"].as_str().map_or(song.publisher.clone(), String::from);
-        let released = album["release_date"].as_str().unwrap_or_default();
-        song.extra.original_date = match released {
-            "" => String::new(),
-            _ if song.date.is_empty() || released < song.date.as_str() => released.into(),
-            _ => song.date.clone(),
-        };
+        (song.date, song.extra.original_date) = dates(&song.date, album["release_date"].as_str().unwrap_or_default());
         // The album is found by title, so it can be another edition (clean, remaster, other order): only trust
         // the track at this position when it has the same length and explicit flag.
         if song.isrc.as_deref().is_none_or(str::is_empty) {
@@ -509,5 +536,33 @@ pub fn enrich(song: &mut Song) {
             song.extra.bpm = track["bpm"].as_f64().unwrap_or_default();
             song.extra.gain = track["gain"].as_f64().unwrap_or_default();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dates, release_date};
+    use serde_json::json;
+
+    #[test]
+    fn dates_keep_only_the_known_part_and_take_the_day_from_deezer() {
+        let date = |iso: &str, precision: &str| release_date(&json!({"isoString": iso, "precision": precision}));
+        assert_eq!(date("1994-01-01T00:00:00Z", "YEAR"), "1994");
+        assert_eq!(date("1998-04-01T00:00:00Z", "MONTH"), "1998-04");
+        assert_eq!(date("2000-01-01T00:00:00Z", "DAY"), "2000-01-01");
+        assert_eq!(date("2020-05-01T12:00:00Z", "MINUTE"), "2020-05-01");
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        // Deezer's day of the year, but not its 1 January padding or another year's reissue.
+        assert_eq!(dates("1998", "1998-04-20"), pair("1998-04-20", "1998-04-20"));
+        assert_eq!(dates("1998", "1998-01-01"), pair("1998", "1998"));
+        assert_eq!(dates("1994", "2011-09-26"), pair("1994", "1994"));
+        assert_eq!(dates("1998-04", "1998-03-30"), pair("1998-04", "1998-03-30"));
+        // A padded or year-only date is not earlier than a day in its year.
+        assert_eq!(dates("1994-03-28", "1994-01-01"), pair("1994-03-28", "1994-03-28"));
+        assert_eq!(dates("2000-01-01", "2000-01-01"), pair("2000-01-01", "2000-01-01"));
+        assert_eq!(dates("2011-09-26", "1993-01-01"), pair("2011-09-26", "1993"));
+        assert_eq!(dates("2011-09-26", "1994-03-28"), pair("2011-09-26", "1994-03-28"));
+        assert_eq!(dates("", "1994-03-28"), pair("", "1994-03-28"));
+        assert_eq!(dates("1994", ""), pair("1994", ""));
     }
 }
