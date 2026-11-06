@@ -15,8 +15,6 @@ const UA: (&str, &str) = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
 );
 const SECRETS: &str = "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json";
-/// Seconds by which two copies of one song can differ in length (a reissue, a remaster).
-const SAME_LENGTH: f64 = 5.0;
 const QUERIES: [&str; 6] =
     ["getTrack", "getAlbum", "fetchPlaylist", "queryArtistDiscographyAll", "searchDesktop", "queryArtistOverview"];
 
@@ -237,8 +235,8 @@ fn track(uri: &str) -> R<Value> {
 fn artist(uri: &str) -> R<Vec<Song>> {
     let releases = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50)?.1;
     let mut releases: Vec<&Value> = releases.iter().map(|release| &release["releases"]["items"][0]).collect();
-    // Releases in this order: albums, EPs, singles, then compilations; originals before reissues. A song is kept
-    // from its first release only, so remasters, reissues and singles add only the songs that are new.
+    // Releases in this order: albums, EPs, singles, then compilations; originals before reissues. Albums and EPs
+    // are kept whole; singles and compilations add only the songs that no earlier release has.
     let kind =
         |release: &Value| ["ALBUM", "EP", "SINGLE", "COMPILATION"].iter().position(|kind| release["type"] == *kind);
     let date = |release: &Value| release["date"]["isoString"].as_str().unwrap_or_default().to_string();
@@ -276,22 +274,15 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     // The bigger edition takes the place of the first edition it replaces, so that no release in between takes
     // its songs.
     kept.sort_by_key(|&j| (0..n).filter(|&i| i == j || replaces(j, i)).min());
-    // Inside one release every track stays (takes, mixes); across releases a song is kept once. On albums and
-    // EPs, songs with the same title and artists are the same song only when they are about as long: a reissue
-    // may be a few seconds longer, but an artist's "Intro" on one album is not the "Intro" on another. Singles
-    // and compilations add only new titles, not their edits of album songs.
-    let mut seen: HashMap<(String, Vec<String>), Vec<f64>> = HashMap::new();
+    // Albums and EPs keep every track, also songs that another album or EP has: the "She's A Riot" EP keeps its
+    // title track, which is also on "Learn To Exist". Singles and compilations add only new titles, not their
+    // edits of album songs.
+    let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
     let mut songs = Vec::new();
-    let same = |a: f64, b: f64| (a - b).abs() <= SAME_LENGTH;
     for i in kept {
-        let album = kind(releases[i]).is_some_and(|kind| kind < 2);
-        let known = |song: &&Song| {
-            seen.get(&key(song)).is_some_and(|lengths| !album || lengths.iter().any(|l| same(*l, song.duration)))
-        };
-        let new: Vec<&Song> = albums[i].iter().filter(|song| !known(song)).collect();
-        for song in &new {
-            seen.entry(key(song)).or_default().push(song.duration);
-        }
+        let whole = kind(releases[i]).is_some_and(|kind| kind < 2);
+        let new: Vec<&Song> = albums[i].iter().filter(|song| whole || !seen.contains(&key(song))).collect();
+        seen.extend(new.iter().map(|song| key(song)));
         songs.extend(new.into_iter().cloned());
     }
     Ok(songs)
