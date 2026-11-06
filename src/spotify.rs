@@ -503,13 +503,13 @@ fn agrees(lengths: &HashMap<String, f64>, tracks: &serde_json::Map<String, Value
     same.count() * 2 >= lengths.len().max(tracks.len())
 }
 
-/// Deezer's copy of the song's album: genres, UPC, label, release date and track ISRCs. Deezer's search misses
-/// some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)") or returns only the
-/// clean edition (GNX), so unless a search hit fits in every way the album is also looked for in the artist's
-/// discography. An album whose tracks are not the Spotify album's gives only its genres. When no album matches,
-/// the genres come from the album that has the song, or else from the artist's most common genre.
+/// Deezer's copy of the song's album: genres, UPC, label, release date and its tracks' titles and ISRCs. Deezer's
+/// search misses some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)") or
+/// returns only the clean edition (GNX), so unless a search hit fits in every way the album is also looked for in
+/// the artist's discography. An album whose tracks are not the Spotify album's gives only its genres. When no album
+/// matches, the genres come from the album that has the song, or else from the artist's most common genre.
 fn deezer_album(song: &Song) -> R<Value> {
-    cached(&format!("deezer5:{}", song.album_id), 7, || {
+    cached(&format!("deezer6:{}", song.album_id), 7, || {
         let same = |a: &str, b: &Value| {
             search::ratio(&search::slug(a, "-"), &search::slug(b.as_str().unwrap_or_default(), "-")) > 80.0
         };
@@ -549,8 +549,8 @@ fn deezer_album(song: &Song) -> R<Value> {
             let tracks = deezer(&format!("https://api.deezer.com/album/{id}/tracks?limit=500"))?;
             let tracks = tracks["data"].as_array().into_iter().flatten().enumerate().map(|(i, track)| {
                 let (disc, position) = (track["disk_number"].as_u64().unwrap_or(1), track["track_position"].as_u64());
-                let data =
-                    json!({"isrc": track["isrc"], "duration": track["duration"], "explicit": track["explicit_lyrics"]});
+                let (isrc, duration, explicit) = (&track["isrc"], &track["duration"], &track["explicit_lyrics"]);
+                let data = json!({"title": track["title"], "isrc": isrc, "duration": duration, "explicit": explicit});
                 (format!("{disc}:{}", position.unwrap_or(i as u64 + 1)), data)
             });
             let tracks: serde_json::Map<String, Value> = tracks.collect();
@@ -639,12 +639,28 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
         }
         (song.date, song.extra.original_date) = dates(&song.date, album["release_date"].as_str().unwrap_or_default());
         // The album is found by title, so it can be another edition (clean, remaster, other order): only trust
-        // the track at this position when it has the same length and explicit flag.
+        // the track at this position when it has the same length and explicit flag. Deezer may number the album
+        // otherwise (M83's two discs as one, a deluxe edition's bonus songs in between): then only the one track
+        // that also has the song's full title, version note included, since an instrumental, remix or live take
+        // is as long as the song and has its own ISRC.
         if song.isrc.as_deref().is_none_or(str::is_empty) {
+            let same = |track: &Value| {
+                track["duration"].as_f64().is_some_and(|length| (length - song.duration).abs() <= 3.0)
+                    && track["explicit"].as_bool().is_none_or(|explicit| explicit == song.explicit)
+            };
             let track = &album["tracks"][format!("{}:{}", release.disc_number, release.track_number)];
-            let same = track["duration"].as_f64().is_some_and(|length| (length - song.duration).abs() <= 3.0)
-                && track["explicit"].as_bool().is_none_or(|explicit| explicit == song.explicit);
-            song.isrc = track["isrc"].as_str().filter(|isrc| same && !isrc.is_empty()).map(String::from);
+            let track = if same(track) {
+                Some(track)
+            } else {
+                let title = search::slug(&release.name, "-");
+                let tracks = album["tracks"].as_object().into_iter().flat_map(|tracks| tracks.values());
+                let mut titled = tracks.filter(|track| {
+                    same(track) && track["title"].as_str().is_some_and(|name| search::slug(name, "-") == title)
+                });
+                titled.next().filter(|_| titled.next().is_none())
+            };
+            song.isrc =
+                track.and_then(|track| track["isrc"].as_str()).filter(|isrc| !isrc.is_empty()).map(String::from);
         }
     }
     if let Some(isrc) =
@@ -807,6 +823,42 @@ mod tests {
         song.extra.gain = -1.0;
         assert_eq!(enrich(&mut song), Ok(()));
         assert_eq!((song.isrc, song.genres.len()), (None, 0));
+    }
+
+    #[test]
+    fn an_isrc_off_its_position_comes_only_from_the_one_track_of_the_same_title_length_and_flag() {
+        // M83's two discs are one on Deezer, and a deluxe edition orders its songs otherwise.
+        let tracks = json!({
+            "1:2": {"title": "Overdue", "isrc": "VOCAL", "duration": 200.0, "explicit": false},
+            "1:3": {"title": "Overdue (Instrumental)", "isrc": "INSTRUMENTAL", "duration": 201.0, "explicit": false},
+            "1:4": {"title": "Twice", "isrc": "TWICE1", "duration": 180.0, "explicit": false},
+            "1:5": {"title": "Twice", "isrc": "TWICE2", "duration": 181.0, "explicit": false},
+            "1:22": {"title": "Outro", "isrc": "OUTRO", "duration": 247.0, "explicit": false},
+        });
+        let album = json!({"genres": ["Rock"], "tracks": tracks});
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Ok(album)));
+        super::DEEZER_ALBUMS.lock().unwrap().insert("test-isrc-by-title".into(), cell);
+        let isrc = |name: &str, disc: u32, track: u32, duration: f64, explicit: bool| {
+            let mut song = Song {
+                album_id: "test-isrc-by-title".into(),
+                name: name.into(),
+                disc_number: disc,
+                track_number: track,
+                duration,
+                explicit,
+                ..Song::default()
+            };
+            song.extra.gain = -1.0;
+            assert_eq!(enrich(&mut song), Ok(()));
+            song.isrc
+        };
+        assert_eq!(isrc("Outro", 2, 11, 247.03, false).as_deref(), Some("OUTRO"));
+        // Not the vocal take, as long, for the instrumental.
+        assert_eq!(isrc("Overdue - Instrumental", 2, 2, 200.5, false).as_deref(), Some("INSTRUMENTAL"));
+        // Nothing for a song of another length or flag, or for one of two tracks of its title.
+        assert_eq!(isrc("Outro", 2, 11, 251.0, false), None);
+        assert_eq!(isrc("Overdue", 2, 1, 200.0, true), None);
+        assert_eq!(isrc("Twice", 2, 4, 180.5, false), None);
     }
 
     #[test]
