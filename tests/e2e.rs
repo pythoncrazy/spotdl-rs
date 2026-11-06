@@ -152,6 +152,31 @@ fn sync_moves_and_removes_files() {
     assert!(!file(TAXMAN).exists() && !file(TAXMAN).with_extension("opus.skip").exists());
 }
 
+/// A song whose Spotify URL changed (a re-released album gives its songs new IDs) but whose file did not keeps
+/// its file: it is not deleted before a download that can fail. Needs no network: the songs come from files.
+#[test]
+fn sync_keeps_the_files_of_songs_whose_url_changed() {
+    let dir = dir("relink");
+    let songs = |id: &str| {
+        let song = |name: &str, n: u32| {
+            json!({"name": name, "artists": ["Art"], "artist": "Art", "album_name": "Alb", "album_artist": "Art",
+                "duration": 30, "year": 2020, "date": "2020", "track_number": n, "tracks_count": 2,
+                "url": format!("https://open.spotify.com/track/{name}{id}"),
+                "download_url": "https://music.youtube.com/watch?v=Uq0aeEYLkIE"})
+        };
+        json!([song("A", 1), song("B", 2)])
+    };
+    fs::write(dir.join("new.spotdl"), songs("2").to_string()).unwrap();
+    let state = dir.join("s.spotdl");
+    fs::write(&state, json!({"type": "sync", "query": ["new.spotdl"], "songs": songs("1")}).to_string()).unwrap();
+    for name in ["A", "B"] {
+        fs::write(dir.join(format!("Art - {name}.opus")), "").unwrap();
+    }
+    // A download would fail.
+    ok(spotdl(&dir, &["sync", state.to_str().unwrap(), "--yt-dlp", "false"]));
+    assert!(dir.join("Art - A.opus").exists() && dir.join("Art - B.opus").exists());
+}
+
 #[test]
 fn rejects_bad_options_and_unsafe_paths() {
     let dir = dir("errors");

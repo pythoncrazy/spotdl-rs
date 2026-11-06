@@ -1196,13 +1196,16 @@ pub fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
 /// Moves (or, for songs no longer listed, deletes) the files of songs whose output path changed.
 pub fn prune(old: &[Song], new: &[Song]) {
     let next: HashMap<&str, &Song> = new.iter().rev().map(|song| (song.url.as_str(), song)).collect();
+    // A file a listed song writes is that song's, also when its URL changed (Spotify gives re-released
+    // songs new IDs): it is kept for the song's job, not deleted before a download that can fail.
+    let kept: HashSet<PathBuf> = new.iter().map(path).collect();
     let files = |file: &Path| [file.to_path_buf(), skip_path(file), file.with_extension("lrc")];
     for song in old {
         let from = path(song);
-        let to = next.get(song.url.as_str()).map(|song| path(song));
-        if to.as_ref() == Some(&from) {
+        if kept.contains(&from) {
             continue;
         }
+        let to = next.get(song.url.as_str()).map(|song| path(song));
         let targets = to.filter(|to| !to.exists()).map(|to| files(&to));
         for (i, source) in files(&from).iter().enumerate().take(if on("sync_remove_lrc") { 3 } else { 2 }) {
             let result = match &targets {
