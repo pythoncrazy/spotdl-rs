@@ -438,6 +438,29 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
     None
 }
 
+/// Whether the artist `name` is one of `names` ("¥$" of "¥$, Kanye West & Ty Dolla $ign"): its slug is a run of
+/// whole words there, however they are spaced ("Lil Wayne", "LilWayne"). As a substring, "¥$" (slug "y") was in
+/// every name with a y, Genius Ukrainian Translations' too, and "Nas" in Jonas Brothers. A slug of a letter or two
+/// could still be another name's word ("Y"), so such a name must also be spelled the same there.
+fn among(name: &str, names: &str) -> bool {
+    let (slug, words) = (search::slug(name, ""), search::slug(names, " "));
+    let words: Vec<&str> = words.split(' ').collect();
+    let run = (0..words.len()).any(|start| {
+        let mut joined = String::new();
+        words[start..].iter().any(|word| {
+            joined.push_str(word);
+            joined == slug
+        })
+    });
+    !slug.is_empty() && run && (slug.len() >= 3 || names.to_lowercase().contains(&name.to_lowercase()))
+}
+
+/// Genius's own accounts ("Genius Ukrainian Translations (Український переклад)", "Genius Romanizations",
+/// "Genius Traducciones al Español") post translations of other artists' songs, never the songs' own lyrics.
+fn genius_account(primary: &str, artist: &str) -> bool {
+    primary.starts_with("Genius ") && !among(primary, artist)
+}
+
 /// The pages, or nothing when Genius could not be asked.
 fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     if GENIUS_BLOCKED.load(Relaxed) {
@@ -466,15 +489,17 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
             reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default()
         }
     };
-    let (artist, song_title) = (search::slug(artist, ""), plain_title(title));
+    let song_title = plain_title(title);
+    fn primary(hit: &Value) -> &str {
+        hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default()
+    }
     // The same artist and the same title: the artist's first hit can be another of the artist's songs. The
     // artist may be one of several on the page ("¥$, Kanye West & Ty Dolla $ign").
     let same = |hit: &&Value| {
-        let artists = search::slug(hit["result"]["artist_names"].as_str().unwrap_or_default(), "");
-        let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
+        let artists = hit["result"]["artist_names"].as_str().unwrap_or_default();
         let hit_title = plain_title(hit["result"]["title"].as_str().unwrap_or_default());
-        !artist.is_empty()
-            && (artists.contains(&artist) || (!primary.is_empty() && artist.contains(&primary)))
+        (among(artist, artists) || among(primary(hit), artist))
+            && !genius_account(primary(hit), artist)
             && !hit_title.is_empty()
             && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
     };
@@ -488,8 +513,10 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     fn hit_title(hit: &Value) -> &str {
         hit["result"]["title"].as_str().unwrap_or_default()
     }
-    let whole_title = search::clean_name(search::versionless(&song.name), &song.artists);
-    let whole = |hit: &Value| search::clean_name(hit_title(hit), &song.artists) == whole_title;
+    // Artists' names are taken out of titles, but not names of a letter or two: "¥$" would take out every "y".
+    let artists: Vec<String> = song.artists.iter().filter(|a| search::slug(a, "").len() >= 3).cloned().collect();
+    let whole_title = search::clean_name(search::versionless(&song.name), &artists);
+    let whole = |hit: &Value| search::clean_name(hit_title(hit), &artists) == whole_title;
     // A question or exclamation mark tells two titles apart where the words are the same ("In the Flesh?").
     let marks = |title: &str| -> String {
         let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
@@ -497,10 +524,7 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     };
     let song_marks = marks(search::versionless(&song.name));
     let titled = |hit: &Value| whole(hit) && marks(hit_title(hit)) == song_marks;
-    let own = |hit: &Value| {
-        let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
-        !primary.is_empty() && artist.contains(&primary)
-    };
+    let own = |hit: &Value| among(primary(hit), artist);
     let exact = |hit: &Value| plain_title(hit_title(hit)) == song_title;
     hits.sort_by_key(|hit| {
         (!titled(hit), !whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
@@ -1590,7 +1614,9 @@ pub fn meta(paths: &[String]) -> R<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lrclib_lyrics, provider, reference, same_lyrics, unlisted, Relaxed, Song, GENIUS_BLOCKED};
+    use super::{
+        among, genius_account, lrclib_lyrics, provider, reference, same_lyrics, unlisted, Relaxed, Song, GENIUS_BLOCKED,
+    };
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -1651,5 +1677,22 @@ mod tests {
         assert_eq!(provider("synced", &song), None);
         // The song's own plain lyrics still check synced lyrics.
         assert_eq!(reference(&song, Some(&BULLY_KING.into())), Some(Some(BULLY_KING.into())));
+    }
+
+    /// An artist is matched by whole words: "¥$" (slug "y") took Genius Ukrainian Translations' "CARNIVAL" as its
+    /// own, as that name has a y in it.
+    #[test]
+    fn genius_artists_are_matched_by_whole_names() {
+        assert!(among("¥$", "¥$, Kanye West & Ty Dolla $ign"));
+        assert!(!among("¥$", "Genius Ukrainian Translations (Український переклад)"));
+        assert!(!among("¥$", "Kanye West & Ty Dolla $ign"));
+        assert!(!among("¥$", "Y & Kanye West"));
+        assert!(!among("Nas", "Jonas Brothers"));
+        assert!(among("Lil Wayne", "Drake & LilWayne"));
+        assert!(among("Kanye West", "¥$, Kanye West & Ty Dolla $ign"));
+        assert!(!among("", "Kanye West"));
+        assert!(genius_account("Genius Ukrainian Translations (Український переклад)", "¥$"));
+        assert!(genius_account("Genius Traducciones al Español", "Bad Bunny"));
+        assert!(!genius_account("¥$", "¥$"));
     }
 }
