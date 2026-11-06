@@ -6,7 +6,7 @@ use sha1::Sha1;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    sync::{Arc, LazyLock, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -22,7 +22,9 @@ const QUERIES: [&str; 6] =
 
 static SESSION: Mutex<Option<Arc<Value>>> = Mutex::new(None);
 static ALBUMS: LazyLock<Mutex<HashMap<String, Arc<Value>>>> = LazyLock::new(Default::default);
-static DEEZER_ALBUMS: LazyLock<Mutex<HashMap<String, Arc<OnceLock<Value>>>>> = LazyLock::new(Default::default);
+/// Deezer's album of each Spotify album, or how many times it failed and why.
+type DeezerAlbum = Arc<Mutex<Result<Value, (u8, String)>>>;
+static DEEZER_ALBUMS: LazyLock<Mutex<HashMap<String, DeezerAlbum>>> = LazyLock::new(Default::default);
 /// Deezer allows 50 requests in 5 seconds.
 static DEEZER: Pace = Pace::new(110);
 
@@ -408,16 +410,36 @@ pub fn resolve(text: &str) -> R<Vec<Song>> {
     }
 }
 
+/// The error of a Deezer reply (sent with HTTP 200), and whether asking again can help: 4 is over the quota and 700
+/// "service busy". 800 "no data" is no error: the item is not on Deezer. Read as data, an error reply has no genres,
+/// tracks or search hits, so the album would be taken for one Deezer does not have.
+fn deezer_error(reply: &Value) -> Option<(bool, String)> {
+    let error = &reply["error"];
+    let code = error["code"].as_u64();
+    (!error.is_null() && code != Some(800)).then(|| (matches!(code, Some(4 | 700)), error.to_string()))
+}
+
 fn deezer(url: &str) -> R<Value> {
     for attempt in 0..6 {
         DEEZER.wait();
         let reply: Value = http_json(url, &[], None)?;
-        if reply["error"]["code"] != 4 {
-            return Ok(reply);
+        match deezer_error(&reply) {
+            None => return Ok(reply),
+            Some((false, error)) => return Err(format!("Deezer: {error} for {url}").into()),
+            Some((true, _)) => std::thread::sleep(Duration::from_secs(1 << attempt)),
         }
-        std::thread::sleep(Duration::from_secs(1 << attempt));
     }
-    Err("Deezer rate limit".into())
+    Err(format!("Deezer: still busy for {url}").into())
+}
+
+/// The value in `cell`, fetched by the first song of the album that asks. A failure is not kept, so that a later
+/// song asks again, but at most 3 times: a Deezer that is down is not asked once for every song.
+fn fetch_once(cell: &Mutex<Result<Value, (u8, String)>>, fetch: impl FnOnce() -> R<Value>) -> Result<Value, String> {
+    let mut cell = cell.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err((tries @ 0..3, _)) = *cell {
+        *cell = fetch().map_err(|error| (tries + 1, error.to_string()));
+    }
+    cell.clone().map_err(|(_, error)| error)
 }
 
 /// The title that a song has on every release: without a " - Remastered 2009" suffix, and slugged, because box sets
@@ -586,14 +608,20 @@ fn dates(spotify: &str, deezer: &str) -> (String, String) {
     (date.into(), original.into())
 }
 
-/// Adds Deezer's genres, label, UPC, original date, ISRC, BPM and gain.
-pub fn enrich(song: &mut Song) {
-    let cell = DEEZER_ALBUMS
-        .lock()
-        .ok()
-        .filter(|_| !song.album_id.is_empty())
-        .map(|mut map| map.entry(song.album_id.clone()).or_default().clone());
-    let album = cell.as_ref().map_or(&Value::Null, |cell| cell.get_or_init(|| deezer_album(song).unwrap_or_default()));
+/// Adds Deezer's genres, label, UPC, original date, ISRC, BPM and gain. An error is Deezer's failure (not a song
+/// that Deezer does not have): the song then has only what Spotify gives.
+pub fn enrich(song: &mut Song) -> Result<(), String> {
+    let album = if song.album_id.is_empty() {
+        Ok(Value::Null)
+    } else {
+        let mut albums = DEEZER_ALBUMS.lock().unwrap_or_else(PoisonError::into_inner);
+        let cell = albums.entry(song.album_id.clone()).or_insert_with(|| Arc::new(Mutex::new(Err((0, "".into())))));
+        let cell = cell.clone();
+        drop(albums);
+        fetch_once(&cell, || deezer_album(song))
+    };
+    let mut result = album.as_ref().map(drop).map_err(String::clone);
+    let album = album.unwrap_or_default();
     if !album.is_null() {
         song.genres =
             album["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
@@ -612,16 +640,20 @@ pub fn enrich(song: &mut Song) {
     if let Some(isrc) =
         song.isrc.clone().filter(|isrc| !isrc.is_empty() && song.extra.bpm == 0.0 && song.extra.gain == 0.0)
     {
-        if let Ok(track) = deezer(&format!("https://api.deezer.com/track/isrc:{}", url_encode(&isrc))) {
-            song.extra.bpm = track["bpm"].as_f64().unwrap_or_default();
-            song.extra.gain = track["gain"].as_f64().unwrap_or_default();
+        match deezer(&format!("https://api.deezer.com/track/isrc:{}", url_encode(&isrc))) {
+            Ok(track) => {
+                song.extra.bpm = track["bpm"].as_f64().unwrap_or_default();
+                song.extra.gain = track["gain"].as_f64().unwrap_or_default();
+            }
+            Err(error) => result = result.and(Err(error.to_string())),
         }
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{agrees, dates, editions, ranked, release_date, song_key};
+    use super::{agrees, dates, deezer_error, editions, fetch_once, ranked, release_date, song_key};
     use crate::Song;
     use serde_json::json;
 
@@ -688,6 +720,36 @@ mod tests {
         assert!(agrees(&lengths(&[("1:1", 203.5), ("1:2", 202.0)]), &tracks(&twelve[..2])));
         // A remix single, or another recording, has songs of other lengths.
         assert!(!agrees(&lengths(&[("1:1", 230.0), ("1:2", 202.0), ("1:3", 260.0)]), &tracks(&twelve[..3])));
+    }
+
+    #[test]
+    fn deezer_error_replies_are_failures_except_no_data() {
+        let reply = |code: u64| json!({"error": {"type": "Exception", "message": "x", "code": code}});
+        assert_eq!(deezer_error(&json!({"data": []})), None);
+        // An item or ISRC that Deezer does not have.
+        assert_eq!(deezer_error(&reply(800)), None);
+        // Over the quota and "service busy" are asked again.
+        assert!(deezer_error(&reply(4)).is_some_and(|(retry, _)| retry));
+        assert!(deezer_error(&reply(700)).is_some_and(|(retry, _)| retry));
+        assert!(deezer_error(&reply(600)).is_some_and(|(retry, _)| !retry));
+    }
+
+    #[test]
+    fn a_failed_deezer_album_is_fetched_again_by_a_later_song_but_not_for_every_song() {
+        let cell = std::sync::Mutex::new(Err((0, String::new())));
+        let calls = std::cell::Cell::new(0);
+        let fail = || {
+            calls.set(calls.get() + 1);
+            Err("timed out".into())
+        };
+        assert_eq!(fetch_once(&cell, fail), Err("timed out".into()));
+        assert_eq!(fetch_once(&cell, || Ok(json!({"genres": ["Pop"]}))), Ok(json!({"genres": ["Pop"]})));
+        assert_eq!(fetch_once(&cell, fail), Ok(json!({"genres": ["Pop"]})));
+        let cell = std::sync::Mutex::new(Err((0, String::new())));
+        for _ in 0..5 {
+            assert!(fetch_once(&cell, fail).is_err());
+        }
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

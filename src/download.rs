@@ -1149,7 +1149,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     let early = text("output").is_some_and(|output| ENRICHED.iter().any(|field| output.contains(field)));
     if early {
-        spotify::enrich(s);
+        enrich(s);
     }
     let out = path(s);
     let scan = || {
@@ -1180,7 +1180,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         return Ok(target);
     }
     if !early {
-        spotify::enrich(s);
+        enrich(s);
     }
     // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
     if moved && s.lyrics.is_none() {
@@ -1219,6 +1219,15 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     archive(&s.url)?;
     Ok(target)
+}
+
+/// Adds Deezer's metadata, warning when Deezer failed: the song is then tagged without genres, ISRC or barcode.
+fn enrich(s: &mut Song) -> bool {
+    let result = spotify::enrich(s);
+    if let Err(error) = &result {
+        log("WARNING", &format!("{} - {}: no Deezer genres, ISRC or barcode: {error}", s.artists.join(", "), s.name));
+    }
+    result.is_ok()
 }
 
 pub fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
@@ -1382,8 +1391,12 @@ fn meta_file(file: &Path) -> R<()> {
     let Some(mut song) = found.or_else(|| url.is_none().then(|| local.clone())) else { return Err("no match".into()) };
     let on_spotify = !song.song_id.is_empty();
     song.download_url = song.download_url.or(source);
-    if on_spotify {
-        spotify::enrich(&mut song);
+    if on_spotify && !enrich(&mut song) {
+        // Without Deezer the date is Spotify's, which can be only a year or month: the file's Deezer day stays.
+        let date = tag.get_string(&ItemKey::RecordingDate);
+        if let Some(date) = date.filter(|date| date.len() > song.date.len() && date.starts_with(&song.date)) {
+            song.date = date.into();
+        }
     }
     // `force` fetches the lyrics again, for example to get synced lyrics that were not available before; so does
     // `--overwrite metadata` for a song whose lyrics were not found before.
