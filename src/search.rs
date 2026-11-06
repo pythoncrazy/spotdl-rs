@@ -190,6 +190,32 @@ pub fn clean_name(name: &str, artists: &[String]) -> String {
     name.trim_matches('-').into()
 }
 
+/// The numbered markers of a title: "Side 2, Pt. 2: Skins" has ("side", 2) and ("pt", 2), "Part II" has ("pt", 2).
+fn markers(name: &str) -> Vec<(&'static str, usize)> {
+    const ROMAN: [&str; 10] = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"];
+    let slugged = slug(name, "-");
+    let words: Vec<&str> = slugged.split('-').collect();
+    let marker = |pair: &[&str]| {
+        let marker = match pair[0] {
+            "side" => "side",
+            "pt" | "part" => "pt",
+            "take" => "take",
+            "vol" | "volume" => "vol",
+            "no" | "number" => "no",
+            _ => return None,
+        };
+        let number = pair[1].parse().ok().or_else(|| ROMAN.iter().position(|r| *r == pair[1]).map(|i| i + 1))?;
+        Some((marker, number))
+    };
+    words.windows(2).filter_map(marker).collect()
+}
+
+/// The title after a prefix of only numbered markers: "Skins" for "Side 2, Pt. 2: Skins", as official uploads name it.
+fn unnumbered(name: &str) -> Option<&str> {
+    let (head, tail) = name.split_once(": ")?;
+    (markers(head).len() * 2 == slug(head, "-").split('-').count()).then_some(tail)
+}
+
 /// How well a result matches the song, 0 for a reject; official audio and the right edit rank first.
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
@@ -197,8 +223,22 @@ fn score(s: &Song, h: &Hit) -> f64 {
     let versionless_name = versionless(&s.name);
     let versionless = slug(versionless_name, "-");
     let (stripped, bare) = (clean_name(&hit.name, &s.artists), clean_name(versionless_name, &s.artists));
-    let pairs =
-        [(&sname, &rname), (&sname, &stripped), (&versionless, &rname), (&versionless, &stripped), (&bare, &stripped)];
+    let tail = clean_name(unnumbered(versionless_name).unwrap_or(versionless_name), &s.artists);
+    let pairs = [
+        (&sname, &rname),
+        (&sname, &stripped),
+        (&versionless, &rname),
+        (&versionless, &stripped),
+        (&bare, &stripped),
+        (&tail, &stripped),
+    ];
+    // "Side 2, Pt. 2: Skins" and "Side 4, Pt. 3: Surfacing" share most of their letters, so the ratio passed
+    // another part: a marker that both titles number must have the same first number ("Take 2 With Solo From
+    // Take 1" is take 2).
+    let (song_markers, hit_markers) = (markers(&s.name), markers(&hit.name));
+    let first = |markers: &[(&str, usize)], kind| markers.iter().find(|m| m.0 == kind).map(|m| m.1);
+    let misnumbered =
+        song_markers.iter().any(|m| first(&hit_markers, m.0).is_some_and(|n| Some(n) != first(&song_markers, m.0)));
     let name = pairs.iter().map(|(a, b)| ratio(a, b)).fold(0.0, f64::max);
     let gap = (s.duration - hit.duration).abs();
     // The ISRC search finds the label's track under another credit ("Tupac" for "2Pac", the Beatle without the BBC
@@ -251,8 +291,13 @@ fn score(s: &Song, h: &Hit) -> f64 {
         || parts.map(|part| ratio(&title, &slug(part, "-"))).any(|r| r > 60.0);
     let time = (-0.1 * gap).exp() * 100.0;
     let avg = (artists + name) / 2.0;
-    let skip =
-        rejected || !titled || name <= 60.0 || (artists < 70.0 && !isrc) || time < 25.0 || (time < 50.0 && avg < 75.0);
+    let skip = rejected
+        || !titled
+        || misnumbered
+        || name <= 60.0
+        || (artists < 70.0 && !isrc)
+        || time < 25.0
+        || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     // The same recording is on singles, deluxe editions and compilations, so a matching album only breaks ties;
     // penalizing other albums (as Python spotDL does) made album-less uploads beat the label's own audio.
@@ -509,5 +554,26 @@ mod tests {
         let lower = track(&note("Lower 5E", "10th September"), &["Rodney Burke", "Paul McCartney"], "On Air", 23.3);
         assert!(score(&lower, &hit("Lower 5E", "10th September", &["Paul McCartney"], 24.0)) > 0.0);
         assert_eq!(score(&lower, &hit("And Here We Are Again", "23rd July", &["Rodney Burke"], 16.0)), 0.0);
+    }
+
+    #[test]
+    fn numbered_parts() {
+        // An upload of "Side 4, Pt. 3: Surfacing" passed the name ratio for "Side 2, Pt. 2: Skins" and was downloaded,
+        // while Pink Floyd's own video, titled only "Skins", failed it.
+        let skins = track("Side 2, Pt. 2: Skins", &["Pink Floyd"], "The Endless River", 157.8);
+        let video = |name: &str, artist: &str, duration, kind| {
+            let song = track(name, &[artist], "", duration);
+            Hit { song, verified: false, isrc: false, kind, explicit: false }
+        };
+        let surfacing = video("Pink Floyd   Side 4, Pt  3 Surfacing", "Gabriele Cordovani", 167.0, Kind::Other);
+        assert_eq!(score(&skins, &surfacing), 0.0);
+        assert!(score(&skins, &video("Skins", "PINK FLOYD", 158.0, Kind::Omv)) > 80.0);
+        assert!(score(&skins, &video("Pink Floyd - Side 2, Part II: Skins", "Fan", 158.0, Kind::Other)) > 0.0);
+        let wall = track("Another Brick in the Wall, Pt. 2", &["Pink Floyd"], "The Wall", 238.0);
+        assert!(score(&wall, &result("Another Brick in the Wall (Part 2)", &["Pink Floyd"], "", 238.0, false)) > 0.0);
+        assert_eq!(score(&wall, &result("Another Brick in the Wall (Part 3)", &["Pink Floyd"], "", 238.0, false)), 0.0);
+        let love = track("Can't Buy Me Love - Take 2 With Solo From Take 1", &["The Beatles"], "Anthology 1", 151.0);
+        assert!(score(&love, &result("Can't Buy Me Love (Take 2)", &["The Beatles"], "", 151.0, false)) > 0.0);
+        assert_eq!(score(&love, &result("Can't Buy Me Love (Take 1)", &["The Beatles"], "", 151.0, false)), 0.0);
     }
 }
