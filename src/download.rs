@@ -391,6 +391,17 @@ fn synced_first(found: Vec<String>, agrees: impl Fn(&String) -> bool) -> Option<
     at.or_else(|| found.iter().position(&agrees)).map(|at| found[at].clone())
 }
 
+/// Whether the `synced` provider takes LRCLIB's `lyrics`: they agree with the Genius lyrics `checks`, or without
+/// those, they are synced (timed to a recording as long as the song) or LRCLIB's word that the song has none (`""`).
+/// Plain lyrics are anyone's text filed under any title: all 7 LRCLIB versions of Lee Fields's "Funky Screw", which
+/// has no Genius page, have the plain words of a Japanese comic song.
+fn lrclib_agrees(lyrics: &str, checks: Option<&String>) -> bool {
+    match checks {
+        Some(by) => !lyrics.is_empty() && same_lyrics(lyrics, by),
+        None => lyrics.is_empty() || is_synced(lyrics),
+    }
+}
+
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
 /// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"), or nothing when
 /// Genius could not be asked.
@@ -667,8 +678,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
                 return Some(String::new());
             }
             let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
-            let agrees =
-                |lyrics: &String| checks.as_ref().is_none_or(|by| !lyrics.is_empty() && same_lyrics(lyrics, by));
+            let agrees = |lyrics: &String| lrclib_agrees(lyrics, checks.as_ref());
             return synced_first(lrclib(song, true), agrees).map(|lyrics| lyrics.trim().to_string());
         }
         // A page without words is the song's answer that it has none, or else another song's.
@@ -1842,8 +1852,8 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_lyrics,
-        lrclib_search, lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference,
+        among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_agrees,
+        lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference,
         release_type_key, same_lyrics, synced_first, temp_id, template_path, unlisted, write_tags, Relaxed, Song,
         AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
@@ -1988,6 +1998,22 @@ mod tests {
         assert_eq!(synced_first(found.clone(), |_| true).as_deref(), Some("[00:12.00] Lucid dreams"));
         // Plain lyrics are taken when no synced ones agree.
         assert_eq!(synced_first(found, |lyrics| !is_synced(lyrics)).as_deref(), Some("Lucid dreams"));
+    }
+
+    /// Without Genius lyrics to check them by, LRCLIB's plain lyrics are not taken (Lee Fields's "Funky Screw" got a
+    /// Japanese comic song's), but its synced lyrics and its word that the song is an instrumental are.
+    #[test]
+    fn unchecked_lrclib_lyrics_must_be_synced() {
+        let song = Song { name: "Funky Screw".into(), duration: 211.0, ..Song::default() };
+        let plain = serde_json::json!({"duration": 210.6, "syncedLyrics": "", "plainLyrics": "半チャーハン 一升半"});
+        let unchecked = |found| synced_first(found, |lyrics: &String| lrclib_agrees(lyrics, None));
+        assert_eq!(unchecked(lrclib_lyrics(&song, std::slice::from_ref(&plain))), None);
+        let synced = serde_json::json!({"duration": 211.0, "syncedLyrics": "[00:12.00] Screw"});
+        assert_eq!(unchecked(lrclib_lyrics(&song, &[plain, synced])).as_deref(), Some("[00:12.00] Screw"));
+        assert_eq!(unchecked(vec![String::new()]).as_deref(), Some(""));
+        // Genius's lyrics still check plain ones.
+        assert!(lrclib_agrees(BULLY_KING, Some(&BULLY_KING.to_string())));
+        assert!(!lrclib_agrees("", Some(&BULLY_KING.to_string())));
     }
 
     /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while:
