@@ -1146,16 +1146,20 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         _ => "bestaudio",
     };
     let template = out.with_extension(format!("{id}.%(ext)s"));
-    let got = search::youtube(|| {
+    let (got, abr) = search::youtube(|| {
         let mut command = search::yt_dlp();
         command.args(["-f", selector, "--no-playlist", "--no-warnings", "--force-overwrites", "-q"]);
-        command.args(["--print", "after_move:filepath", "-o"]).arg(&template);
+        // The source's bitrate (`NA` when unknown) is what `--bitrate auto` encodes at.
+        command.args(["--print", "after_move:%(abr)s %(filepath)s", "-o"]).arg(&template);
         if on("sponsor_block") {
             command.args(["--sponsorblock-remove", "all"]);
         }
         let output = command.arg(url).output().map_err(|error| error.to_string())?;
-        let got = String::from_utf8_lossy(&output.stdout).lines().rev().map(PathBuf::from).find(|path| path.is_file());
-        got.ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let got =
+            stdout.lines().rev().filter_map(|line| line.split_once(' ')).find(|(_, path)| Path::new(path).is_file());
+        got.map(|(abr, path)| (PathBuf::from(path), abr.parse::<f64>().ok()))
+            .ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()))
     })?;
     let extension = got.extension().unwrap_or_default().to_string_lossy().to_string();
     let keep = matches!(bitrate, "auto" | "disable");
@@ -1176,8 +1180,8 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
         ffmpeg.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got);
         ffmpeg.args(["-vn", "-map_metadata", "-1", "-c:a", codec]);
-        if !keep {
-            ffmpeg.args(["-b:a", bitrate]);
+        if codec != "copy" {
+            ffmpeg.args(rate_args(bitrate, format, abr));
         }
         let output = ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp).output()?;
         match output.status.success() {
@@ -1191,6 +1195,19 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         let _ = fs::remove_file(&temp);
     }
     result.map(|()| temp)
+}
+
+/// FFmpeg's arguments for `--bitrate`, as in Python spotDL: `auto` encodes at the source's bitrate (128k when
+/// yt-dlp does not know it), digits are a VBR quality (`-q:a`, LAME's V0 to V9), anything else a bitrate, and
+/// `disable` leaves the encoder's default. FLAC and WAV are lossless, so a bitrate means nothing to them.
+fn rate_args(bitrate: &str, format: &str, abr: Option<f64>) -> Vec<String> {
+    match bitrate {
+        "disable" => vec![],
+        "auto" if matches!(format, "flac" | "wav") => vec![],
+        "auto" => vec!["-b:a".into(), format!("{}k", abr.filter(|abr| *abr >= 1.0).map_or(128, |abr| abr as u32))],
+        _ if !bitrate.is_empty() && bitrate.bytes().all(|b| b.is_ascii_digit()) => vec!["-q:a".into(), bitrate.into()],
+        _ => vec!["-b:a".into(), bitrate.into()],
+    }
 }
 
 /// Whether `file` is one of `fetch`'s temporary files (`<stem>.<id>.converted.<format>`), which an interrupted
@@ -1685,8 +1702,8 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, genius_account, lrclib_lyrics, out_path, path, provider, redownload_jobs, reference, same_lyrics,
-        template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
+        among, genius_account, lrclib_lyrics, out_path, path, provider, rate_args, redownload_jobs, reference,
+        same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1713,6 +1730,18 @@ mod tests {
         let talk = "[00:01.30]\"Drive My Car,\" take one\n[00:12.63]Can you take it a little bit slower this time?\n\
             [00:17.37]One, two, three, four\n[01:02.16]Two\n[01:13.77]That's the coming in part\n[01:15.61]One, two";
         assert!(same_lyrics(count_in, talk));
+    }
+
+    /// `--bitrate auto` was taken as `disable` (FFmpeg's 128k for MP3), and `--bitrate 0` went to `-b:a 0`, which
+    /// FFmpeg also takes as 128k CBR instead of LAME's V0.
+    #[test]
+    fn bitrates_are_passed_as_python_spotdl_does() {
+        assert_eq!(rate_args("auto", "mp3", Some(160.155)), ["-b:a", "160k"]);
+        assert_eq!(rate_args("auto", "ogg", None), ["-b:a", "128k"]);
+        assert!(rate_args("auto", "flac", Some(160.0)).is_empty());
+        assert!(rate_args("disable", "mp3", Some(160.0)).is_empty());
+        assert_eq!(rate_args("0", "mp3", Some(160.0)), ["-q:a", "0"]);
+        assert_eq!(rate_args("256k", "mp3", Some(160.0)), ["-b:a", "256k"]);
     }
 
     /// LRCLIB's word that a song is an instrumental is an answer (`""`), but only when every version as long as the

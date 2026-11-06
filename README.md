@@ -18,6 +18,8 @@ Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an act
 
 In `--output`, `{disc-track-number}` is the track number (`07`), with the disc in front on albums that have more than one disc (`2-07`). Only the parts of `--output` that have a `{field}` are made path-safe (and changed by `--restrict`); folders written without a field, such as `../Music` or `My Music: 50% Off`, are used as written.
 
+Songs are saved as Opus by default (`--format` also takes `m4a`, `mp3`, `flac`, `ogg` and `wav`); YouTube's audio is copied without converting when it is in that format. `--bitrate` sets how converted songs are encoded, as in Python spotDL: `disable` (the default) uses the encoder's default, `auto` the source's bitrate (128k when yt-dlp does not know it; none for FLAC and WAV), digits a VBR quality (`--bitrate 0` is LAME's V0 for MP3; Opus has none), and anything else a bitrate (`256k`). A value other than `disable` and `auto` converts every song, also one already in the format.
+
 Use `--config file.json` to load a config file. Use `--generate-config` to write the default file to `~/.spotdl/config.json`. Use `--key=value` when a value starts with `--`, for example `--yt-dlp-args="--js-runtimes node"`.
 
 Use `--max-retries 3` to set the number of retries after a failed request. Use `--use-cache-file` to keep track data between runs. Use `--no-cache` to turn off local caches.
