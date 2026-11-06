@@ -260,36 +260,56 @@ fn lrclib_search(url: &str) -> Option<Vec<Value>> {
 }
 
 /// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones; `""` when
-/// LRCLIB says that the song is an instrumental.
-fn lrclib(song: &Song) -> Vec<String> {
+/// LRCLIB says that the song is an instrumental. `keep`: the `.lrc` writer will search again (see [`lrclib_tracks`]).
+fn lrclib(song: &Song, keep: bool) -> Vec<String> {
     // LRCLIB files a song under one of its artists ("KING" of ¥$ is under Kanye West).
     let mut artists = vec![&song.artist];
     artists.extend(song.artists.iter().filter(|artist| **artist != song.artist));
     artists
         .into_iter()
         .filter(|artist| !artist.is_empty())
-        .map(|artist| lrclib_by(song, artist))
+        .map(|artist| lrclib_by(song, artist, keep))
         .find(|found| !found.is_empty())
         .unwrap_or_default()
 }
 
-fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
+fn lrclib_by(song: &Song, artist: &str, keep: bool) -> Vec<String> {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         url_encode(artist),
         url_encode(lyrics_title(song))
     );
-    // The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often busy, so it is asked once
-    // and the second search takes the results (they are then not kept: a library has many songs).
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Value>>>> = std::sync::LazyLock::new(Default::default);
-    let found = FOUND.lock().unwrap_or_else(PoisonError::into_inner).remove(&url);
-    let tracks = found.or_else(|| {
-        let tracks = lrclib_search(&url)?;
-        FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(url.clone(), tracks.clone());
-        Some(tracks)
-    });
-    let Some(tracks) = tracks else { return vec![] };
+    let Some(tracks) = lrclib_tracks(&url, keep, lrclib_search) else { return vec![] };
     lrclib_lyrics(song, &tracks)
+}
+
+/// LRCLIB's search results kept for the `.lrc` writer, by URL, oldest first.
+type Kept = std::collections::VecDeque<(String, Vec<Value>)>;
+static LRCLIB_FOUND: std::sync::LazyLock<Mutex<Kept>> = std::sync::LazyLock::new(Default::default);
+/// A search reply can be over 100 KB; this is room for the songs in progress, not for a library.
+const LRCLIB_KEPT: usize = 256;
+
+/// `search`'s results for a URL. The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often
+/// busy, so it is asked once: the provider keeps its results (`keep`) and the writer takes them. The writer keeps
+/// nothing, since nothing searches after it, and results the writer does not take (no `.lrc` to write) are dropped
+/// when newer ones come: once kept by everyone, they filled gigabytes over a library.
+fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Option<Vec<Value>> {
+    let taken = {
+        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        found.iter().position(|(key, _)| key == url).and_then(|at| found.remove(at)).map(|(_, tracks)| tracks)
+    };
+    if taken.is_some() {
+        return taken;
+    }
+    let tracks = search(url)?;
+    if keep {
+        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        if found.len() >= LRCLIB_KEPT {
+            found.pop_front();
+        }
+        found.push_back((url.to_string(), tracks.clone()));
+    }
+    Some(tracks)
 }
 
 /// [`lrclib_by`]'s lyrics of LRCLIB's search results. When every version as long as the song is marked
@@ -576,7 +596,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
             let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
             let agrees =
                 |lyrics: &String| checks.as_ref().is_none_or(|by| !lyrics.is_empty() && same_lyrics(lyrics, by));
-            return lrclib(song).into_iter().find(agrees).map(|lyrics| lyrics.trim().to_string());
+            return lrclib(song, true).into_iter().find(agrees).map(|lyrics| lyrics.trim().to_string());
         }
         // A page without words is the song's answer that it has none, or else another song's.
         "genius" => {
@@ -799,7 +819,7 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
         // The old `.lrc` goes before LRCLIB, which is often busy.
         let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
         let old = fs::read_to_string(&sidecar).ok().filter(|lyrics| is_synced(lyrics));
-        let found = std::iter::once_with(|| lrclib(&recording)).flatten().filter(|lyrics| is_synced(lyrics));
+        let found = std::iter::once_with(|| lrclib(&recording, false)).flatten().filter(|lyrics| is_synced(lyrics));
         if let Some(lrc) = own_synced.into_iter().chain(old).chain(found).find(agrees) {
             fs::write(&sidecar, lrc)?;
         } else if replace && fs::read_to_string(&sidecar).is_ok_and(|old| !agrees(&old)) {
@@ -821,7 +841,7 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let sources: [Box<dyn FnOnce() -> Vec<String> + '_>; 5] = [
         Box::new(|| old.into_iter().collect()),
         Box::new(|| own_synced),
-        Box::new(|| lrclib(&recording).into_iter().filter(|lyrics| !lyrics.is_empty()).collect()),
+        Box::new(|| lrclib(&recording, false).into_iter().filter(|lyrics| !lyrics.is_empty()).collect()),
         Box::new(|| own_plain),
         Box::new(|| {
             let artists = song.artists.iter().chain([&song.artist]);
@@ -1704,8 +1724,9 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, genius_account, lrclib_lyrics, lrclib_search, out_path, path, provider, rate_args, redownload_jobs,
-        reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
+        among, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args,
+        redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND,
+        LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1757,6 +1778,28 @@ mod tests {
         let mixed = [track(582.0, true, ""), track(580.0, false, "Some words")];
         assert_eq!(lrclib_lyrics(&song, &mixed), vec!["Some words".to_string()]);
         assert!(lrclib_lyrics(&song, &[track(300.0, true, "")]).is_empty());
+    }
+
+    /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while:
+    /// every search's results, kept until the run ended, filled gigabytes over a library.
+    #[test]
+    fn lrclib_results_are_not_kept_for_the_whole_run() {
+        let reply = |_: &str| Some(vec![serde_json::json!({"duration": 200.0, "plainLyrics": "Words"})]);
+        let none = |_: &str| None;
+        let kept = |url: &str| LRCLIB_FOUND.lock().unwrap().iter().any(|(key, _)| key == url);
+        // The writer's search, the only one when Genius answered, keeps nothing.
+        assert!(lrclib_tracks("test:writer", false, reply).is_some());
+        assert!(!kept("test:writer"));
+        // The provider's search is kept, and the writer takes it.
+        assert!(lrclib_tracks("test:provider", true, reply).is_some());
+        assert!(lrclib_tracks("test:provider", false, none).is_some());
+        assert!(!kept("test:provider"));
+        // Results nobody takes make room for newer ones.
+        for n in 0..=LRCLIB_KEPT {
+            lrclib_tracks(&format!("test:untaken {n}"), true, reply);
+        }
+        assert!(LRCLIB_FOUND.lock().unwrap().len() <= LRCLIB_KEPT);
+        assert!(!kept("test:untaken 0") && kept(&format!("test:untaken {LRCLIB_KEPT}")));
     }
 
     /// Genius's "You might also like", glued into lyrics by earlier scrapes, is not lyrics.
