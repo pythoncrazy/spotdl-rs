@@ -57,7 +57,7 @@ Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` 
 
 Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover. Either way, Deezer's genres, UPC and ISRC still come from each track's own album. Use `--m3u` to write one playlist file per list; it includes every song of the list, also those that another query already downloaded.
 
-A song gets its file name only after its tags, cover and ReplayGain are written, so a file at the output path is a finished song: a run that is stopped or fails while tagging leaves a `<name>.<track-id>.converted.<format>` file, which is not taken for a song and is deleted when the song is downloaded again.
+A song gets its file name only after its tags, cover and ReplayGain are written, so a file at the output path is a finished song: a run that is stopped or fails while tagging leaves a `<name>.<id>.converted.<format>` file (`<id>` is the Spotify or YouTube id, or a 16-digit hash of the URL for a song without one or with a longer one, so the name fits the 255-byte limit), which is not taken for a song and is deleted when the song is downloaded again.
 
 Use `--print-errors` to print all errors at the end. Use `--save-errors errors.txt` to save them, with the Spotify URL of each song. Set `--log-level` and `--log-format` to change log output.
 

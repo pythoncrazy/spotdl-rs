@@ -1324,14 +1324,21 @@ fn remove_temp_files(out: &Path, id: &str) {
     }
 }
 
+/// The id in `fetch`'s temporary names (`<stem>.<id>.converted.<format>`). The stem may fill 200 bytes, so a
+/// Spotify id (22 bytes) or YouTube id (11) is kept, while a missing or longer id (SoundCloud slugs have no fixed
+/// length) is hashed to 16 hex digits: the names then stay under the 255-byte file name limit.
+fn temp_id(song: &Song) -> String {
+    match song.song_id.as_str() {
+        id if !id.is_empty() && id.len() <= 22 => id.into(),
+        _ => format!("{:x}", Sha1::digest(&song.url))[..16].into(),
+    }
+}
+
 /// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the
 /// downloaded (untagged) temporary file.
 fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     fs::create_dir_all(out.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-    let id = match song.song_id.as_str() {
-        "" => format!("{:x}", Sha1::digest(&song.url)),
-        id => id.into(),
-    };
+    let id = temp_id(song);
     remove_temp_files(out, &id);
     let mut failure = None;
     if let Some(url) = &song.download_url {
@@ -1804,8 +1811,8 @@ mod tests {
     use super::{
         among, art, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_lyrics, lrclib_search,
         lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics,
-        synced_first, template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT,
-        REDOWNLOADS,
+        synced_first, temp_id, template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND,
+        LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -2088,5 +2095,33 @@ mod tests {
         // A filled part is still made safe: a value cannot climb out of the folder.
         let climb = Song { name: "../etc".into(), artists: vec!["Art".into()], ..Song::default() };
         assert_eq!(template_path("lib/{title}", &climb), PathBuf::from("lib/..etc.opus"));
+    }
+
+    /// A song without a Spotify id got its URL's 40-digit SHA1 as the temporary names' id, and a SoundCloud song its
+    /// slug: with a 200-byte stem the names went over 255 bytes and FFmpeg failed with "File name too long".
+    #[test]
+    fn temp_names_fit_the_file_name_limit() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let song = |id: &str, url: &str| Song {
+            song_id: id.into(),
+            url: url.into(),
+            name: "Live At The BBC ".repeat(20),
+            artists: vec!["Art".into()],
+            ..Song::default()
+        };
+        let slug = "a-very-long-soundcloud-track-slug-that-goes-on-and-on-and-on-and-on-and-on-forever";
+        for song in [
+            song("", "https://open.spotify.com/track/none"),
+            song(slug, &format!("https://soundcloud.com/art/{slug}")),
+            song("4uLU6hMCjMI75M1A2tKUQC", "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"),
+        ] {
+            let out = path(&song);
+            let id = temp_id(&song);
+            for name in [format!("{id}.converted.flac"), format!("{id}.webm.part")] {
+                assert!(out.with_extension(name).file_name().unwrap().len() <= 255);
+            }
+        }
+        // Short ids stay as they were, so earlier runs' temporary files are still found and removed.
+        assert_eq!(temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")), "4uLU6hMCjMI75M1A2tKUQC");
     }
 }
