@@ -174,6 +174,16 @@ fn release_date(date: &Value) -> String {
     date["isoString"].as_str().and_then(|iso| iso.get(..known)).unwrap_or_default().into()
 }
 
+/// The number of tracks on the song's disc, as TRACKTOTAL and ID3's TRCK "n/total" count them: track numbers
+/// start again on each disc, so disc 2 of a 12+5 album is "1 of 5", not "1 of 17". The album's total is the
+/// fallback when Spotify lists no discs.
+fn disc_tracks(album: &Value, disc: u64) -> u32 {
+    let discs = album["discs"]["items"].as_array().into_iter().flatten();
+    let on_disc =
+        discs.into_iter().find(|item| item["number"] == disc).and_then(|item| item["tracks"]["totalCount"].as_u64());
+    on_disc.or(album["tracksV2"]["totalCount"].as_u64()).unwrap_or(1) as u32
+}
+
 /// Songs from web-player tracks; `list` carries the playlist fields that every song shares.
 fn build(tracks: Vec<Value>, list: Song) -> R<Vec<Song>> {
     let album_uri = |track: &Value| track["albumOfTrack"]["uri"].as_str().unwrap_or_default().to_string();
@@ -206,7 +216,7 @@ fn build(tracks: Vec<Value>, list: Song) -> R<Vec<Song>> {
             year: date.get(..4).and_then(|year| year.parse().ok()).unwrap_or_default(),
             date,
             track_number: track["trackNumber"].as_u64().unwrap_or(1) as u32,
-            tracks_count: album["tracksV2"]["totalCount"].as_u64().unwrap_or(1) as u32,
+            tracks_count: disc_tracks(album, track["discNumber"].as_u64().unwrap_or(1)),
             url: format!("https://open.spotify.com/track/{song_id}"),
             song_id,
             explicit: track["contentRating"]["label"] == "EXPLICIT",
@@ -680,7 +690,9 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agrees, dates, deezer_error, editions, enrich, fetch_once, ranked, release_date, song_key};
+    use super::{
+        agrees, dates, deezer_error, disc_tracks, editions, enrich, fetch_once, ranked, release_date, song_key,
+    };
     use crate::Song;
     use serde_json::json;
 
@@ -747,6 +759,17 @@ mod tests {
         assert!(agrees(&lengths(&[("1:1", 203.5), ("1:2", 202.0)]), &tracks(&twelve[..2])));
         // A remix single, or another recording, has songs of other lengths.
         assert!(!agrees(&lengths(&[("1:1", 230.0), ("1:2", 202.0), ("1:3", 260.0)]), &tracks(&twelve[..3])));
+    }
+
+    #[test]
+    fn the_track_total_is_the_number_of_tracks_on_the_songs_disc() {
+        // getAlbum's discs for good kid, m.A.A.d city (Deluxe): 12 songs, then 5 bonus songs.
+        let discs = json!({"items": [{"number": 1, "tracks": {"totalCount": 12}}, {"number": 2, "tracks": {"totalCount": 5}}], "totalCount": 2});
+        let album = json!({"discs": discs, "tracksV2": {"totalCount": 17}});
+        assert_eq!((disc_tracks(&album, 1), disc_tracks(&album, 2)), (12, 5));
+        // Without per-disc counts, the album's.
+        assert_eq!(disc_tracks(&json!({"tracksV2": {"totalCount": 17}}), 2), 17);
+        assert_eq!(disc_tracks(&json!({}), 1), 1);
     }
 
     #[test]

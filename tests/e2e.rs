@@ -9,6 +9,7 @@ use lofty::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -98,6 +99,12 @@ fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
     // A deluxe edition that has the standard edition's songs replaces it and is kept whole.
     assert_eq!(album("good kid, m.A.A.d city (Deluxe)"), 17);
     assert_eq!(album("good kid, m.A.A.d city"), 0);
+    // Its track totals count each disc's tracks, as its track numbers do: 12 songs, then 5 bonus songs.
+    let totals: HashSet<(u64, u64)> = (songs.as_array().unwrap().iter())
+        .filter(|song| song["album_name"] == "good kid, m.A.A.d city (Deluxe)")
+        .map(|song| (song["disc_number"].as_u64().unwrap(), song["tracks_count"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(totals, HashSet::from([(1, 12), (2, 5)]));
 
     // The anniversary edition is kept whole, with its "Intro": an "Intro" on another album is another song.
     let file = dir.join("cole.spotdl");
