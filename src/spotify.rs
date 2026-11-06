@@ -261,34 +261,8 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     let tracks = uris.into_par_iter().map(album).collect::<R<Vec<_>>>()?;
     let albums = tracks.into_iter().map(|tracks| build(tracks, Song::default())).collect::<R<Vec<_>>>()?;
     let key = |song: &Song| (song_key(&song.name), song.artists.clone());
-    // A bigger edition of the same album (same base title, or one that starts with it) that has at least 90% of a smaller edition's songs
-    // is kept whole, and the smaller edition is skipped; of two editions with the same songs, the explicit one
-    // (the clean edit's "- Album Version (Edited)" titles are the same songs), then the first, is kept.
-    // "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist. Titles
-    // are compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its
-    // "(2026 Mix)" songs replaces the 2009 remaster.
-    let titles: Vec<HashSet<String>> =
-        albums.iter().map(|songs| songs.iter().map(|song| search::edition_title(&song.name)).collect()).collect();
-    let explicit: Vec<usize> = albums.iter().map(|songs| songs.iter().filter(|song| song.explicit).count()).collect();
-    let title = |release: &Value| base_title(release["name"].as_str().unwrap_or_default()).to_lowercase();
-    // "OK Computer OKNOTOK 1997 2017", "KID A MNESIA" and "Wish You Were Here 50" are editions of the albums whose
-    // titles they start with.
-    let same_title = |a: &str, b: &str| {
-        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-        long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-    };
-    let replaces = |j: usize, i: usize| {
-        let shared = titles[i].intersection(&titles[j]).count();
-        j != i
-            && same_title(&title(releases[j]), &title(releases[i]))
-            && (titles[j].len(), explicit[j], i) > (titles[i].len(), explicit[i], j)
-            && shared * 10 >= titles[i].len() * 9
-    };
-    let n = releases.len();
-    let mut kept: Vec<usize> = (0..n).filter(|&i| !(0..n).any(|j| replaces(j, i))).collect();
-    // The bigger edition takes the place of the first edition it replaces, so that no release in between takes
-    // its songs.
-    kept.sort_by_key(|&j| (0..n).filter(|&i| i == j || replaces(j, i)).min());
+    let names: Vec<&str> = releases.iter().map(|release| release["name"].as_str().unwrap_or_default()).collect();
+    let kept = editions(&names, &albums);
     // Inside one release every track stays (takes, mixes); across releases a song is kept once. On albums and
     // EPs, songs with the same title and artists are the same song only when they are about as long: a reissue
     // may be a few seconds longer, but an artist's "Intro" on one album is not the "Intro" on another. Singles
@@ -308,6 +282,44 @@ fn artist(uri: &str) -> R<Vec<Song>> {
         songs.extend(new.into_iter().cloned());
     }
     Ok(songs)
+}
+
+/// The releases to keep, in the order their songs are taken. A bigger edition of the same album (same base title,
+/// or one that starts with it) that has at least 90% of a smaller edition's songs is kept whole, and the smaller
+/// edition is skipped. "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist.
+/// Titles are compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its
+/// "(2026 Mix)" songs replaces the 2009 remaster.
+fn editions(names: &[&str], albums: &[Vec<Song>]) -> Vec<usize> {
+    let titles: Vec<HashSet<String>> =
+        albums.iter().map(|songs| songs.iter().map(|song| search::edition_title(&song.name)).collect()).collect();
+    let explicit: Vec<usize> = albums.iter().map(|songs| songs.iter().filter(|song| song.explicit).count()).collect();
+    let title = |i: usize| base_title(names[i]).to_lowercase();
+    // "OK Computer OKNOTOK 1997 2017", "KID A MNESIA" and "Wish You Were Here 50" are editions of the albums whose
+    // titles they start with.
+    let same_title = |a: &str, b: &str| {
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    // A clean edition never replaces one with explicit songs. Of two editions with the same songs, the explicit
+    // one, then the one titled only with the album's title, then the first, is kept: "Animals (2018 Remix)",
+    // which Spotify dates two days before "Animals", is not the album.
+    let rank = |k: usize| (explicit[k] > 0, titles[k].len(), explicit[k], names[k] == base_title(names[k]));
+    let replaces = |j: usize, i: usize| {
+        let shared = titles[i].intersection(&titles[j]).count();
+        // The clean edit's censored titles ("****** Wit The Wrong Nigga") and clean-only remixes leave it sharing
+        // only most of its songs with the explicit edition, which still replaces it.
+        let edit = explicit[j] > 0 && explicit[i] == 0;
+        j != i
+            && same_title(&title(j), &title(i))
+            && (rank(j), i) > (rank(i), j)
+            && if edit { shared * 2 > titles[i].len() } else { shared * 10 >= titles[i].len() * 9 }
+    };
+    let n = names.len();
+    let mut kept: Vec<usize> = (0..n).filter(|&i| !(0..n).any(|j| replaces(j, i))).collect();
+    // The bigger edition takes the place of the first edition it replaces, so that no release in between takes
+    // its songs.
+    kept.sort_by_key(|&j| (0..n).filter(|&i| i == j || replaces(j, i)).min());
+    kept
 }
 
 fn playlist(uri: &str) -> R<Vec<Song>> {
@@ -609,7 +621,8 @@ pub fn enrich(song: &mut Song) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agrees, dates, ranked, release_date, song_key};
+    use super::{agrees, dates, editions, ranked, release_date, song_key};
+    use crate::Song;
     use serde_json::json;
 
     #[test]
@@ -697,5 +710,37 @@ mod tests {
         assert_eq!(dates("2011-09-26", "1994-03-28"), pair("2011-09-26", "1994-03-28"));
         assert_eq!(dates("", "1994-03-28"), pair("", "1994-03-28"));
         assert_eq!(dates("1994", ""), pair("1994", ""));
+    }
+
+    #[test]
+    fn remix_and_clean_editions_do_not_add_the_album_again() {
+        let songs = |names: &[&str], explicit: bool| -> Vec<Song> {
+            names.iter().map(|name| Song { name: name.to_string(), explicit, ..Song::default() }).collect()
+        };
+        // Spotify dates the remix edition first; the album titled only "Animals" is kept.
+        let remix =
+            songs(&["Pigs on the Wing 1 - 2018 Remix", "Dogs - 2018 Remix", "Pigs on the Wing 2 - 2018 Remix"], false);
+        let original = songs(&["Pigs on the Wing 1", "Dogs", "Pigs on the Wing 2"], false);
+        assert_eq!(editions(&["Animals (2018 Remix)", "Animals"], &[remix, original]), [1]);
+        let remix = songs(&["Signs of Life - Remix 2019", "A New Machine Part 1 - Remix 2019"], false);
+        let original = songs(&["Signs of Life", "A New Machine, Pt. 1"], false);
+        let names = ["A Momentary Lapse of Reason (2019 Remix)", "A Momentary Lapse of Reason"];
+        assert_eq!(editions(&names, &[remix, original]), [1]);
+        // The clean edition, bigger here and sharing only 3 of its 5 titles, never replaces the explicit one; the
+        // explicit one replaces it.
+        let clean = [
+            "Ballad Of A Dead Soulja - Album Version (Edited)",
+            "****** Wit The Wrong Nigga - Album Version (Edited)",
+            "Let Em Have It - Remix",
+            "Until The End Of Time - Album Version (Edit)",
+            "M.O.B. - Album Version (Edited)",
+        ];
+        let explicit = ["Ballad Of A Dead Soulja", "Fuckin Wit The Wrong Nigga", "Until The End Of Time", "M.O.B."];
+        let both = [songs(&clean, false), songs(&explicit, true)];
+        assert_eq!(editions(&["Until The End Of Time"; 2], &both), [1]);
+        // A remix with a name stays another song.
+        let remixes = songs(&["Dogs - Skrillex Remix", "Sheep - Skrillex Remix"], false);
+        let original = songs(&["Dogs", "Sheep"], false);
+        assert_eq!(editions(&["Animals", "Animals (Remixes)"], &[original, remixes]), [0, 1]);
     }
 }

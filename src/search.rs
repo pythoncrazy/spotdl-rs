@@ -155,9 +155,19 @@ pub fn versionless(name: &str) -> &str {
 /// The slugged title without version notes, featured artists or a " - Remix" suffix, to compare the editions of
 /// an album: "Getting Better - Remix", "Getting Better - 2017 Mix" and "Getting Better - Remastered 2009" are all
 /// "getting-better", and "Norwegian Wood (This Bird Has Flown) [2026 Mix]" is "norwegian-wood-this-bird-has-flown".
+/// Remix editions date their remix: "Dogs - 2018 Remix" and "Sorrow - Remix 2019" are "dogs" and "sorrow". They also
+/// write "Pt." as "Part": "A New Machine Part 1 - Remix 2019" is "A New Machine, Pt. 1".
 pub fn edition_title(name: &str) -> String {
     let name = clean_name(versionless(name), &[]);
-    name.strip_suffix("-remix").unwrap_or(&name).into()
+    let mut words: Vec<&str> = name.split('-').map(|word| if word == "part" { "pt" } else { word }).collect();
+    let year = |word: &str| word.len() == 4 && word.bytes().all(|b| b.is_ascii_digit());
+    let note = match words[..] {
+        [.., date, "remix"] | [.., "remix", date] if year(date) => 2,
+        [.., "remix"] => 1,
+        _ => 0,
+    };
+    words.truncate(words.len() - note);
+    words.join("-")
 }
 
 /// The slugged title without featured artists, soundtrack notes and version groups.
@@ -411,6 +421,12 @@ mod tests {
         assert_eq!(versionless("Lil' Homies - Album Version (Edited)"), "Lil' Homies");
         assert_eq!(versionless("Breathin - LP Version"), "Breathin");
         assert_eq!(edition_title("M.O.B. - Album Version (Edited)"), edition_title("M.O.B."));
+        // Remix editions date their remix and write "Pt." as "Part"; a remix with a name is another song.
+        assert_eq!(edition_title("Pigs on the Wing 1 - 2018 Remix"), "pigs-on-the-wing-1");
+        assert_eq!(edition_title("A New Machine Part 1 - Remix 2019"), edition_title("A New Machine, Pt. 1"));
+        assert_eq!(edition_title("Pigs (Three Different Ones) - 2018 Remix"), "pigs-three-different-ones");
+        assert_eq!(edition_title("Until The End Of Time - RP Remix"), "until-the-end-of-time-rp");
+        assert_eq!(edition_title("Song 2 - Remix"), "song-2");
         // The clean track was scored 0 against its own exact clean audio.
         let homies = song("Lil' Homies - Album Version (Edited)", "Until The End Of Time", 224.0, false);
         assert!(score(&homies, &atv("Lil' Homies", 224.0, false)) > 90.0);
