@@ -2,6 +2,8 @@
 
 Use this program to get audio for Spotify songs, albums, playlists, and artists. It finds each song on YouTube Music, prefers the label's official audio and the same clean or explicit edit, and tags the file with Spotify and Deezer metadata and lyrics.
 
+A YouTube Music track with the song's ISRC is taken when it has the song's title and length (within 3 s), whatever its artists and album: YouTube Music credits 2Pac's live album to "Tupac" and files Tyler Ward's "The Scientist" under a "tribute" album. Other results need the song's artists, but YouTube Music may leave out the first one that Spotify lists (a BBC presenter, a band member): a result as long as the song (within 3 s) is accepted when its first artist is another of the song's artists, or when it has the song's title on the song's album. A title with a note ("Lower 5E - Live At The BBC For ...") must match without the note, so a shared note does not make another song match.
+
 The program needs `yt-dlp` and FFmpeg in `PATH` (or set `--yt-dlp` and `--ffmpeg`). For reliable YouTube downloads, also have Deno, Node.js, or Bun in `PATH`.
 
 ```sh

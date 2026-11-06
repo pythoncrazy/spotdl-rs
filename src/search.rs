@@ -117,10 +117,11 @@ pub fn ratio(a: &str, b: &str) -> f64 {
     }
 }
 
-/// Words and joined word pairs of the title, artists and album.
-fn words(song: &Song) -> HashSet<String> {
+/// Words and joined word pairs of the title, artists and (with `album`) album.
+fn words(song: &Song, album: bool) -> HashSet<String> {
     let mut words = HashSet::new();
-    for value in [&song.name, &song.album_name].into_iter().chain(&song.artists) {
+    let album = album.then_some(&song.album_name);
+    for value in [&song.name].into_iter().chain(album).chain(&song.artists) {
         let slugged = slug(value, "-");
         let tokens: Vec<&str> = slugged.split('-').filter(|word| !word.is_empty()).collect();
         words.extend(tokens.iter().map(|word| word.to_string()));
@@ -193,12 +194,21 @@ pub fn clean_name(name: &str, artists: &[String]) -> String {
 fn score(s: &Song, h: &Hit) -> f64 {
     let hit = &h.song;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
-    let (result_words, allowed_words) = (words(hit), words(s));
+    let versionless_name = versionless(&s.name);
+    let versionless = slug(versionless_name, "-");
+    let (stripped, bare) = (clean_name(&hit.name, &s.artists), clean_name(versionless_name, &s.artists));
+    let pairs =
+        [(&sname, &rname), (&sname, &stripped), (&versionless, &rname), (&versionless, &stripped), (&bare, &stripped)];
+    let name = pairs.iter().map(|(a, b)| ratio(a, b)).fold(0.0, f64::max);
+    let gap = (s.duration - hit.duration).abs();
+    // The ISRC search finds the label's track under another credit ("Tupac" for "2Pac", the Beatle without the BBC
+    // presenter Spotify lists first) and on another album ("Best of British (tribute to Coldplay)" for Tyler Ward's
+    // "The Scientist"), but also unrelated songs: such a hit needs the same title and length, not the artists.
+    let isrc = h.isrc && name > 85.0 && gap <= 3.0;
+    let (result_words, allowed_words) = (words(hit, !isrc), words(s, true));
     let rejected = result_words.iter().any(|word| altered(word) && !allowed_words.contains(word));
     let penalized =
         PENALIZED.split(' ').filter(|w| result_words.contains(*w) && !allowed_words.contains(*w)).count() as f64;
-    let versionless_name = versionless(&s.name);
-    let versionless = slug(versionless_name, "-");
     let combined_artists = slug(&hit.artists.join(" "), "-");
     // One name as whole words of the other ("ADIAM" / "Adiam Dymott"); short names could match anything.
     let same_artist = |a: &str, b: &str| {
@@ -213,18 +223,36 @@ fn score(s: &Song, h: &Hit) -> f64 {
     };
     let count = s.artists.len().max(1) as f64;
     let artists = 100.0 * s.artists.iter().filter(|a| found(a)).count() as f64 / count;
-    let main =
-        hit.artists.iter().chain([&hit.name, &combined_artists]).map(|r| ratio(&slug(&s.artist, "-"), &slug(r, "-")));
-    let main = main.fold(0.0, f64::max);
-    let artists = if found(&s.artist) { artists.max(main).max(160.0 / count).min(100.0) } else { main.min(artists) };
-    let (stripped, bare) = (clean_name(&hit.name, &s.artists), clean_name(versionless_name, &s.artists));
-    let pairs =
-        [(&sname, &rname), (&sname, &stripped), (&versionless, &rname), (&versionless, &stripped), (&bare, &stripped)];
-    let name = pairs.iter().map(|(a, b)| ratio(a, b)).fold(0.0, f64::max);
-    let time = (-0.1 * (s.duration - hit.duration).abs()).exp() * 100.0;
+    let main = |a: &str| {
+        let a = slug(a, "-");
+        hit.artists.iter().chain([&hit.name, &combined_artists]).map(|r| ratio(&a, &slug(r, "-"))).fold(0.0, f64::max)
+    };
     let album = !hit.album_name.is_empty() && ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) > 80.0;
+    // Spotify may list a presenter or band member first ("Lee Peters", "Oliver Leimbach") where YouTube Music credits
+    // only the act, and YouTube Music may credit an alias ("Tupac" for "2Pac"): a hit as long as the song is theirs
+    // when its lead artist is another of Spotify's artists (scored below a full credit, which then wins), or when it
+    // has the song's title on the song's album.
+    let lead = gap <= 3.0 && s.artists.iter().any(|a| same_artist(&slug(a, "-"), &slug(&hit.artist, "-")));
+    let artists = if found(&s.artist) {
+        artists.max(main(&s.artist)).max(160.0 / count).min(100.0)
+    } else if gap <= 3.0 && album && name > 85.0 {
+        100.0
+    } else if lead {
+        s.artists.iter().map(|a| main(a)).fold(0.0, f64::max).min(85.0)
+    } else {
+        main(&s.artist).min(artists)
+    };
+    // A long shared note (" - Live At The BBC For "Pop Go The Beatles" / 23rd July, 1963") lifted the name ratio of
+    // another song ("And Here We Are Again" for "Lower 5E"): the title before such a note must be in the result's.
+    let title = slug(s.name.split(" - ").next().unwrap_or_default(), "-");
+    let parts = hit.name.split(" - ").flat_map(|part| part.split(['(', ')', '[', ']']));
+    let titled = !versionless_name.contains(" - ")
+        || format!("-{rname}-").contains(&format!("-{title}-"))
+        || parts.map(|part| ratio(&title, &slug(part, "-"))).any(|r| r > 60.0);
+    let time = (-0.1 * gap).exp() * 100.0;
     let avg = (artists + name) / 2.0;
-    let skip = rejected || name <= 60.0 || artists < 70.0 || time < 25.0 || (time < 50.0 && avg < 75.0);
+    let skip =
+        rejected || !titled || name <= 60.0 || (artists < 70.0 && !isrc) || time < 25.0 || (time < 50.0 && avg < 75.0);
     let avg = if !h.isrc && avg <= 85.0 { (avg + time) / 2.0 } else { avg };
     // The same recording is on singles, deluxe editions and compilations, so a matching album only breaks ties;
     // penalizing other albums (as Python spotDL does) made album-less uploads beat the label's own audio.
@@ -232,7 +260,7 @@ fn score(s: &Song, h: &Hit) -> f64 {
     // Clean and explicit edits are separate tracks with the same title; YouTube Music badges them.
     let edit = if h.verified && h.explicit != s.explicit { -10.0 } else { 0.0 };
     // Without this, a perfect name and artist match would tie an original master with its remaster.
-    let closeness = -(0.5 * (s.duration - hit.duration).abs()).min(5.0);
+    let closeness = -(0.5 * gap).min(5.0);
     let kind = match h.kind {
         Kind::Atv => 0.0,
         Kind::Omv => -5.0,
@@ -435,5 +463,51 @@ mod tests {
         let (clean, explicit) =
             (atv("Happy Home II", 235.0, false), atv("Happy Home II (feat. Yusef Sharid)", 235.0, true));
         assert!(score(&happy, &clean) > score(&happy, &explicit));
+    }
+
+    fn track(name: &str, artists: &[&str], album: &str, duration: f64) -> Song {
+        let artists: Vec<String> = artists.iter().map(|artist| artist.to_string()).collect();
+        Song {
+            name: name.into(),
+            artist: artists[0].clone(),
+            artists,
+            album_name: album.into(),
+            duration,
+            ..Song::default()
+        }
+    }
+
+    fn result(name: &str, artists: &[&str], album: &str, duration: f64, isrc: bool) -> Hit {
+        Hit { song: track(name, artists, album, duration), verified: true, isrc, kind: Kind::Atv, explicit: false }
+    }
+
+    #[test]
+    fn official_tracks_with_other_credits() {
+        // YouTube Music credits 2Pac's live album to "Tupac": its ISRC hit and its track on the song's album count,
+        // but unrelated ISRC hits and a Tupac track on another album do not.
+        let ridah = track("Ambitionz Az A Ridah - Live", &["2Pac", "Outlawz"], "Live at the House Of Blues", 133.5);
+        let tupac = |album, isrc| result("Ambitionz Az A Ridah (Live) (feat. Outlawz)", &["Tupac"], album, 134.0, isrc);
+        assert!(score(&ridah, &tupac("Tupac: Live At The House Of Blues", true)) > 0.0);
+        assert!(score(&ridah, &tupac("Live at the House Of Blues", false)) > 0.0);
+        assert_eq!(score(&ridah, &tupac("Greatest Hits", false)), 0.0);
+        assert_eq!(score(&ridah, &result("Khat", &["Navjot Ahuja"], "Khat", 134.0, true)), 0.0);
+        // The ISRC hit of Tyler Ward's cover is on a "tribute" album; a text hit on such an album is still a cover.
+        let scientist = track("The Scientist", &["Tyler Ward", "Lindsey Stirling", "Kina Grannis"], "Covers", 276.6);
+        let british =
+            |isrc| result("The Scientist", &["Tyler Ward"], "Best of British (tribute to Coldplay)", 277.0, isrc);
+        assert!(score(&scientist, &british(true)) > 0.0);
+        assert_eq!(score(&scientist, &british(false)), 0.0);
+        // Spotify lists the BBC presenter first, YouTube Music only the Beatle.
+        let note = |title: &str, date| format!("{title} - Live At The BBC For \"Pop Go The Beatles\" / {date}, 1963");
+        let hit = |title: &str, date, artists, duration| {
+            let name = format!("{title} (Live At The BBC For \"Pop Go The Beatles\" / {date}, 1963)");
+            result(&name, artists, "On Air: Live at the BBC, Vol.2", duration, false)
+        };
+        let paul = track(&note("Hey Paul….", "25th June"), &["Lee Peters", "Paul McCartney"], "On Air", 21.1);
+        assert!(score(&paul, &hit("Hey Paul….", "25th June", &["Paul McCartney"], 22.0)) > 0.0);
+        // The long shared note must not carry another song by the presenter.
+        let lower = track(&note("Lower 5E", "10th September"), &["Rodney Burke", "Paul McCartney"], "On Air", 23.3);
+        assert!(score(&lower, &hit("Lower 5E", "10th September", &["Paul McCartney"], 24.0)) > 0.0);
+        assert_eq!(score(&lower, &hit("And Here We Are Again", "23rd July", &["Rodney Burke"], 16.0)), 0.0);
     }
 }
