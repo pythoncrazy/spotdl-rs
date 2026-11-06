@@ -961,6 +961,16 @@ fn advisory_key(format: TagType) -> ItemKey {
     }
 }
 
+/// The key of the release type (album, single, EP, compilation): lofty drops a plain `RELEASETYPE` from MP4 files,
+/// which keep only atom names, so there it is Picard's freeform atom, which TagLib (and so Navidrome) reads as
+/// `RELEASETYPE`.
+fn release_type_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::Mp4Ilst => ItemKey::Unknown("----:com.apple.iTunes:MusicBrainz Album Type".into()),
+        _ => ItemKey::Unknown("RELEASETYPE".into()),
+    }
+}
+
 /// The compilation flag marks a Various Artists release, as Picard and iTunes set it, and is the same for every song
 /// of the album. Spotify calls an artist's own anthologies and best-ofs (the 2018 White Album, 2Pac's Greatest Hits)
 /// compilations too: flagged, they are filed under Various Artists by players. `RELEASETYPE` keeps Spotify's word.
@@ -1015,7 +1025,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (advisory_key(format), single(if s.explicit { "1" } else { "0" }.into())),
         (ItemKey::TrackArtists, if id3 { single(s.artists.join("\0")) } else { s.artists.clone() }),
         (ItemKey::Genre, s.genres.clone()),
-        (ItemKey::Unknown("RELEASETYPE".into()), single(s.album_type.clone())),
+        (release_type_key(format), single(s.album_type.clone())),
         (url_key(format), single(s.url.clone())),
     ];
     // Other tools may write unknown Vorbis keys in lower case.
@@ -1748,8 +1758,8 @@ pub fn meta(paths: &[String]) -> R<()> {
 mod tests {
     use super::{
         among, art, compilation, folder_images, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path,
-        path, provider, rate_args, redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song,
-        GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, template_path, unlisted,
+        write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1784,6 +1794,29 @@ mod tests {
         let cover = (file.parent().unwrap().join("cover.jpg"), Some("url".to_string()));
         assert_eq!(folder_images(&file, &song(Some("url"))), [cover, artist.clone()]);
         assert_eq!(folder_images(&file, &song(None)), [artist]);
+    }
+
+    /// The release type was written as a plain `RELEASETYPE` key, which lofty silently drops from M4A files.
+    #[test]
+    fn release_type_is_written_to_every_format() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let dir = std::env::temp_dir().join(format!("spotdl-release-type-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = Song { name: "Song".into(), album_type: "single".into(), ..Song::default() };
+        for (extension, codec) in [("m4a", "aac"), ("opus", "libopus")] {
+            let file = dir.join(format!("t.{extension}"));
+            let made = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "1", "-c:a", codec])
+                .arg(&file)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            write_tags(&file, &song).unwrap();
+            let audio = lofty::read_from_path(&file).unwrap();
+            let tag = lofty::file::TaggedFileExt::primary_tag(&audio).unwrap();
+            assert_eq!(tag.get_string(&release_type_key(tag.tag_type())), Some("single"), "{extension}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Spotify's compilations of one artist's songs were flagged as compilations, which players file under Various
