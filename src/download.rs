@@ -101,15 +101,25 @@ pub fn fill(template: &str, s: &Song) -> String {
     })
 }
 
-/// The output file: each template part filled, made path-safe and cut to `max_filename_length` (and 200 bytes).
+/// The output file for the `--output` template.
 pub fn path(s: &Song) -> PathBuf {
-    let template = match text("output").unwrap_or_default() {
+    template_path(text("output").unwrap_or_default(), s)
+}
+
+/// The output file: each template part with a `{field}` filled, made path-safe and cut to `max_filename_length` (and
+/// 200 bytes). Parts without a field are the user's own folders (`..`, `My Music: 50% Off`) and stay as written, so
+/// files land where `--output` says and `--scan-for-songs`, which looks there, finds them.
+fn template_path(output: &str, s: &Song) -> PathBuf {
+    let template = match output {
         "" => "{artists} - {title}".into(),
         output if output.contains('{') => output.to_string(),
         dir => format!("{dir}/{{artists}} - {{title}}"),
     };
     let max = crate::number("max_filename_length");
     let part = |part: &str| {
+        if !part.contains('{') {
+            return part.to_string();
+        }
         let value = fill(part, s);
         let value = match text("restrict") {
             Some("strict") => search::slug(&value, "_"),
@@ -1676,7 +1686,7 @@ pub fn meta(paths: &[String]) -> R<()> {
 mod tests {
     use super::{
         among, genius_account, lrclib_lyrics, out_path, path, provider, redownload_jobs, reference, same_lyrics,
-        unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
+        template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1782,5 +1792,24 @@ mod tests {
         assert_eq!(out_path(&jobs[1], "redownload"), (path(&jobs[1]), None));
         // Only `meta --redownload` writes to the local file; a download goes by the output template.
         assert_eq!(out_path(&jobs[0], "download").0, PathBuf::from("Artist - One.opus"));
+    }
+
+    /// The folders written in `--output` were filled like song values: `../lib` became `_/lib` and `My Music: 50% Off`
+    /// became `My Music 50 Off`, so songs went elsewhere than `--scan-for-songs` looked.
+    #[test]
+    fn output_folders_stay_as_written() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let song = Song { name: "Song: A".into(), artists: vec!["Art".into()], ..Song::default() };
+        let out = |template: &str| template_path(template, &song);
+        assert_eq!(out("../lib/{artists} - {title}.{output-ext}"), PathBuf::from("../lib/Art - Song A.opus"));
+        assert_eq!(out("./x/{title}"), PathBuf::from("./x/Song A.opus"));
+        assert_eq!(out("../Music"), PathBuf::from("../Music/Art - Song A.opus"));
+        assert_eq!(
+            out("/srv/My Music: 50% Off/{artists}/{title}"),
+            PathBuf::from("/srv/My Music: 50% Off/Art/Song A.opus")
+        );
+        // A filled part is still made safe: a value cannot climb out of the folder.
+        let climb = Song { name: "../etc".into(), artists: vec!["Art".into()], ..Song::default() };
+        assert_eq!(template_path("lib/{title}", &climb), PathBuf::from("lib/..etc.opus"));
     }
 }
