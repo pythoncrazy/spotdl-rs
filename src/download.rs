@@ -1163,12 +1163,20 @@ pub fn album_gains(files: &[PathBuf]) {
     if !on("replaygain") {
         return;
     }
-    let dirs: HashSet<&Path> = files.iter().filter_map(|file| file.parent()).collect();
-    dirs.into_par_iter().for_each(|dir| {
+    album_dirs(files).into_par_iter().for_each(|dir| {
         if let Err(error) = album_gain(dir) {
             log("ERROR", &format!("{}: album gain: {error}", dir.display()));
         }
     });
+}
+
+/// The folders of `files`. A bare file name's parent is "", which `read_dir` cannot open, so it counts as ".".
+fn album_dirs(files: &[PathBuf]) -> HashSet<&Path> {
+    files
+        .iter()
+        .filter_map(|file| file.parent())
+        .map(|dir| if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+        .collect()
 }
 
 fn album_gain(dir: &Path) -> R<()> {
@@ -1854,10 +1862,10 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_agrees,
-        lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference,
-        release_type_key, same_lyrics, synced_first, temp_id, template_path, track_gain, unlisted, write_tags, Relaxed,
-        Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced,
+        lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args,
+        redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id, template_path, track_gain,
+        unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1887,6 +1895,16 @@ mod tests {
         let mut song = Song::default();
         song.extra.gain = -11.3;
         assert_eq!(track_gain(&PathBuf::from("no-such-file.opus"), &song), ("-7.10 dB".into(), String::new()));
+    }
+
+    /// With the default template a song is a bare file name, whose parent "" `read_dir` cannot open, so
+    /// `--replaygain` logged ": album gain: No such file or directory" and wrote no album gain.
+    #[test]
+    fn album_gain_reads_the_current_folder_for_bare_file_names() {
+        let files = [PathBuf::from("a.opus"), PathBuf::from("./b.opus"), PathBuf::from("x/c.opus")];
+        let dirs = album_dirs(&files);
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(std::path::Path::new(".")) && dirs.contains(std::path::Path::new("x")));
     }
 
     /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
