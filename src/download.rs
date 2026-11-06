@@ -325,18 +325,32 @@ fn released_on(song: &Song, page: &Page) -> bool {
     }
 }
 
+/// The pages Genius gave for each song and artist. The lyrics provider and the `.lrc` writer both ask; Genius is
+/// paced, so a song's pages are fetched once. A failed request is not kept: the next ask tries again.
+static GENIUS_FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Page>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn genius_key(song: &Song, artist: &str, max: usize) -> String {
+    format!("{artist}\n{}\n{}\n{max}", song.name, song.year)
+}
+
 /// [`genius`]'s pages.
 fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<Page> {
-    // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Page>>>> = std::sync::LazyLock::new(Default::default);
-    let key = format!("{artist}\n{}\n{}\n{max}", song.name, song.year);
-    if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+    let key = genius_key(song, artist, max);
+    if let Some(pages) = GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return pages.clone();
     }
-    // A failed request is not kept: the next ask tries again.
     let Some(pages) = genius_pages(song, artist, max) else { return vec![] };
-    FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
+    GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
     pages
+}
+
+/// Whether the lyrics providers asked Genius, the lyrics authority, for the song and it answered: only then is
+/// "no lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which must not stop
+/// later runs from looking again.
+fn genius_answered(song: &Song) -> bool {
+    list("lyrics_providers").any(|name| name == "genius" || name == "synced")
+        && GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&genius_key(song, &song.artist, 1))
 }
 
 /// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
@@ -664,6 +678,28 @@ fn url_key(format: TagType) -> ItemKey {
     }
 }
 
+/// The key that says the lyrics providers found no lyrics for the song, so that `meta` does not look for them on
+/// every run. It is not the lyrics key, which music servers would show as lyrics.
+fn no_lyrics_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::Mp4Ilst => ItemKey::Unknown("----:spotdl:NOLYRICS".into()),
+        _ => ItemKey::Unknown("SPOTDL_NOLYRICS".into()),
+    }
+}
+
+/// Writes only the lyrics into the tags, or without them, the key that says that none were found.
+fn write_lyrics(file: &Path, lyrics: Option<String>) -> R<()> {
+    let mut audio = lofty::read_from_path(file)?;
+    let tag = audio.primary_tag_mut().ok_or("no tags")?;
+    let marker = no_lyrics_key(tag.tag_type());
+    tag.retain(|item| item.key() != &marker);
+    match lyrics {
+        Some(lyrics) => drop(tag.insert_text(ItemKey::Lyrics, lyrics)),
+        None => tag.push_unchecked(TagItem::new(marker, ItemValue::Text("1".into()))),
+    }
+    Ok(audio.save_to_path(file, WriteOptions::default())?)
+}
+
 /// The Spotify URL of a tagged file, also from the `WWWAUDIOFILE` keys that earlier spotdl-rs versions wrote.
 fn source_url(tag: &Tag) -> Option<String> {
     let names = ["WOAS", "----:spotdl:WOAS", "WWWAUDIOFILE", "----:com.apple.iTunes:WWWAUDIOFILE"];
@@ -725,6 +761,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     // A measured gain (one with a peak) stays unless it is measured again: Deezer's gain is only an estimate.
     let measured = tag.get_string(&ItemKey::ReplayGainTrackPeak).is_some_and(|peak| !peak.is_empty());
     let gain = if peak.is_empty() && measured { String::new() } else { gain };
+    let has_lyrics = s.lyrics.as_deref().is_some_and(|lyrics| !lyrics.is_empty());
     tag.set_title(s.name.clone());
     tag.set_artist(s.artists.join(text("id3_separator").unwrap_or("/")));
     tag.set_album(s.album_name.clone());
@@ -751,6 +788,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (ItemKey::Label, single(s.publisher.clone())),
         (ItemKey::CopyrightMessage, single(s.copyright_text.clone().unwrap_or_default())),
         (ItemKey::Lyrics, single(s.lyrics.clone().unwrap_or_default())),
+        (no_lyrics_key(format), single(if !has_lyrics && genius_answered(s) { "1" } else { "" }.into())),
         (if id3 { ItemKey::IntegerBpm } else { ItemKey::Bpm }, single(bpm)),
         (ItemKey::Barcode, single(s.extra.upc.clone())),
         (ItemKey::ReplayGainTrackGain, single(gain)),
@@ -769,8 +807,10 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     };
     for (key, values) in items {
         let values: Vec<String> = values.into_iter().filter(|value| !value.is_empty()).collect();
-        // A value spotdl does not have leaves the file's own, but the compilation flag is spotdl's to clear.
-        if values.is_empty() && key != ItemKey::FlagCompilation {
+        // A value spotdl does not have leaves the file's own, but the compilation flag is spotdl's to clear, and
+        // lyrics clear the key that says none were found.
+        let cleared = key == ItemKey::FlagCompilation || (has_lyrics && key == no_lyrics_key(format));
+        if values.is_empty() && !cleared {
             continue;
         }
         tag.retain(|item| !same_key(item.key(), &key));
@@ -1117,18 +1157,20 @@ fn meta_file(file: &Path) -> R<()> {
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
     // A Spotify song written before the explicit flag reached Vorbis comments has its tags written again.
     let from_spotify = source_url(tag).is_some_and(|url| url.contains("spotify"));
-    let complete = has(ItemKey::TrackTitle)
+    let tagged = has(ItemKey::TrackTitle)
         && has(ItemKey::TrackArtist)
         && has(ItemKey::TrackArtists)
-        && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics))
         && (on("skip_album_art") || !tag.pictures().is_empty())
         && (!from_spotify || has(advisory_key(tag.tag_type())));
+    // A song whose lyrics were looked for and not found (an instrumental) is not looked for again on each run.
+    let no_lyrics = has(no_lyrics_key(tag.tag_type()));
+    let complete = tagged && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics) || no_lyrics);
     // Deezer's gain has no peak: `--replaygain` measures songs without one.
     let measure = on("replaygain") && !has(ItemKey::ReplayGainTrackPeak);
     let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
     let wanted = Song { album_artist, artist_id: "-".into(), ..Song::default() };
     let missing_art = !folder_images(file, &wanted).is_empty();
-    let lyrics = tag.get_string(&ItemKey::Lyrics).map(String::from);
+    let lyrics = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
     // The comment is the URL the audio was downloaded from; tags written again keep it.
     let source = tag.comment().filter(|comment| comment.starts_with("http")).map(String::from);
     let (force, redownload) = (on("force_update_metadata"), on("redownload"));
@@ -1154,7 +1196,7 @@ fn meta_file(file: &Path) -> R<()> {
         if measure {
             write_track_gain(file)?;
         }
-        if !on("generate_lrc") || file.with_extension("lrc").exists() {
+        if !on("generate_lrc") || file.with_extension("lrc").exists() || (lyrics.is_none() && no_lyrics) {
             return Ok(());
         }
         if lyrics.as_deref().is_some_and(is_synced) {
@@ -1191,9 +1233,14 @@ fn meta_file(file: &Path) -> R<()> {
     if on_spotify {
         spotify::enrich(&mut song);
     }
-    // `force` fetches the lyrics again, for example to get synced lyrics that were not available before.
-    song.lyrics =
-        if force { find_lyrics(&song).or(lyrics.clone()) } else { lyrics.clone().or_else(|| find_lyrics(&song)) };
+    // `force` fetches the lyrics again, for example to get synced lyrics that were not available before; so does
+    // `--overwrite metadata` for a song whose lyrics were not found before.
+    let look = !no_lyrics || replace;
+    song.lyrics = if force {
+        find_lyrics(&song).or(lyrics.clone())
+    } else {
+        lyrics.clone().or_else(|| look.then(|| find_lyrics(&song)).flatten())
+    };
     // Lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under BULLY's) are replaced by the
     // song's Genius lyrics.
     if replace && !force {
@@ -1209,34 +1256,31 @@ fn meta_file(file: &Path) -> R<()> {
     if on_spotify {
         write_folder_art(file, &song)?;
     }
-    // A song whose tags are not written again (complete, or not on Spotify) is measured on its own.
-    if measure && (!on_spotify || (complete && !force)) {
+    // A song whose tags are not written again (tagged, or not on Spotify) is measured on its own.
+    if measure && (!on_spotify || (tagged && !force)) {
         write_track_gain(file)?;
     }
     if on_spotify {
-        if !complete || force {
+        // Missing lyrics alone do not write the tags again: only the lyrics, or the key that none were found.
+        if !tagged || force {
             write_tags(file, &song)?;
-        } else if song.lyrics != lyrics {
-            let mut audio = lofty::read_from_path(file)?;
-            audio
-                .primary_tag_mut()
-                .ok_or("no tags")?
-                .insert_text(ItemKey::Lyrics, song.lyrics.clone().unwrap_or_default());
-            audio.save_to_path(file, WriteOptions::default())?;
+        } else if song.lyrics != lyrics || (!complete && genius_answered(&song)) {
+            write_lyrics(file, song.lyrics.clone())?;
         }
         write_lrc(file, &song)?;
     } else {
         // A song that is not on Spotify keeps its own tags. Without other lyrics, the words of its old `.lrc` file
         // are timed again. New lyrics go into the tags unless the aligner finds that they are another song's.
         let new = song.lyrics.clone().filter(|_| song.lyrics != lyrics);
+        let none_found = song.lyrics.is_none() && !no_lyrics && genius_answered(&song);
         if song.lyrics.is_none() {
             song.lyrics = fs::read_to_string(file.with_extension("lrc")).ok().map(|lrc| plain_lyrics(&lrc));
         }
         let fits = write_lrc(file, &song)?;
         if let Some(new) = new.filter(|_| fits) {
-            let mut audio = lofty::read_from_path(file)?;
-            audio.primary_tag_mut().ok_or("no tags")?.insert_text(ItemKey::Lyrics, new);
-            audio.save_to_path(file, WriteOptions::default())?;
+            write_lyrics(file, Some(new))?;
+        } else if none_found {
+            write_lyrics(file, None)?;
         }
     }
     if redownload && on_spotify {

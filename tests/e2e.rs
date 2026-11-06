@@ -3,8 +3,9 @@
 //! `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the yt-dlp binary).
 use lofty::{
     config::WriteOptions,
+    picture::{MimeType, Picture, PictureType},
     prelude::*,
-    tag::{ItemKey, Tag},
+    tag::{ItemKey, ItemValue, Tag, TagItem},
 };
 use serde_json::{json, Value};
 use std::{
@@ -17,6 +18,7 @@ const DONDA: &str = "https://open.spotify.com/album/5CnpZV3q5BcESefcB3WJmz";
 const VIDEO: &str = "https://music.youtube.com/watch?v=Uq0aeEYLkIE";
 const ELEANOR: &str = "https://open.spotify.com/track/4KRgqwb4kvBuTz1utbYxfb";
 const TAXMAN: &str = "https://open.spotify.com/track/1ob06Ol8FMIPQgjpg7bMyk";
+const FORTUNE_DAYS: &str = "https://open.spotify.com/track/5VWVVSABdgccboSdrKGiZH";
 
 fn dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spotdl-e2e-{name}-{}", std::process::id()));
@@ -317,6 +319,41 @@ fn meta_tags_songs_without_a_spotify_url_from_their_own_album_and_keeps_other_ta
         assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackGain), Some("-2.00 dB"));
         assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackPeak), Some("0.900000"));
     }
+}
+
+/// An instrumental, tagged by spotdl but without lyrics. Its title is not Spotify's, so that tags written again show.
+#[test]
+fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyrics_that_were_not_found() {
+    let dir = dir("meta-instrumental");
+    let song = |name: &str, looked: bool| {
+        let file = dir.join(format!("{name}.opus"));
+        let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "10"];
+        let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+        assert!(status.success());
+        let mut tagged = lofty::read_from_path(&file).unwrap();
+        let mut tag = Tag::new(tagged.primary_tag_type());
+        tag.set_title("Fortune Days (local)".into());
+        tag.set_artist("The Glitch Mob".into());
+        tag.insert_text(ItemKey::TrackArtists, "The Glitch Mob".into());
+        let keys = [("WOAS", FORTUNE_DAYS), ("ITUNESADVISORY", "0")];
+        for (key, value) in keys.into_iter().chain(looked.then_some(("SPOTDL_NOLYRICS", "1"))) {
+            tag.push_unchecked(TagItem::new(ItemKey::Unknown(key.into()), ItemValue::Text(value.into())));
+        }
+        tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, vec![0xff, 0xd8]));
+        tagged.insert_tag(tag);
+        tagged.save_to_path(&file, WriteOptions::default()).unwrap();
+        file
+    };
+    let (looked, new) = (song("looked", true), song("new", false));
+    // Lyrics that were looked for and not found are not looked for again, and nothing is written.
+    let before = fs::read(&looked).unwrap();
+    meta(&dir, &looked, &[]);
+    assert!(fs::read(&looked).unwrap() == before, "the tags were written again");
+    // Missing lyrics alone write only the lyrics (or, when Genius answers without any, the key that says so).
+    meta(&dir, &new, &[]);
+    let tag = lofty::read_from_path(&new).unwrap().primary_tag().unwrap().clone();
+    assert_eq!(tag.title().as_deref(), Some("Fortune Days (local)"));
+    assert_eq!(tag.pictures()[0].data(), [0xff, 0xd8]);
 }
 
 #[test]
