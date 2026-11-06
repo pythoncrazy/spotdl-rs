@@ -232,29 +232,31 @@ fn plain_title(title: &str) -> String {
 
 /// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy, so that a busy moment does not
 /// replace synced lyrics with plain ones, all threads wait and then try again: long after 429 (too many requests
-/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests).
+/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests). Only this loop
+/// retries: [`http`]'s own retries would ask again within seconds, unpaced and during a hold, and keep the limit on.
 fn lrclib_search(url: &str) -> Option<Vec<Value>> {
-    let mut body = None;
     for attempt in 0..12 {
         LRCLIB.wait();
-        match http(url, &[], None) {
-            Ok(bytes) => {
-                body = String::from_utf8(bytes).ok();
-                break;
-            }
+        match http_retrying(url, &[], None, 0) {
+            Ok(bytes) => return serde_json::from_slice(&bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
                 LRCLIB.hold(std::time::Duration::from_secs(15 << attempt.min(3)));
             }
             Err(error) if error.to_string().contains("HTTP 503") => {
                 LRCLIB.hold(std::time::Duration::from_secs(2 + 2 * attempt.min(10)));
             }
+            // A timeout, a lost connection or another server error passes; a refused request does not.
+            Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
+                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
+            }
             Err(error) => {
                 log("WARNING", &format!("LRCLIB: {error}"));
-                break;
+                return None;
             }
         }
     }
-    body.and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
+    log("WARNING", &format!("LRCLIB: still too many requests for {url}"));
+    None
 }
 
 /// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones; `""` when
@@ -1702,8 +1704,8 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, genius_account, lrclib_lyrics, out_path, path, provider, rate_args, redownload_jobs, reference,
-        same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
+        among, genius_account, lrclib_lyrics, lrclib_search, out_path, path, provider, rate_args, redownload_jobs,
+        reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1778,6 +1780,39 @@ mod tests {
         assert_eq!(provider("synced", &song), None);
         // The song's own plain lyrics still check synced lyrics.
         assert_eq!(reference(&song, Some(&BULLY_KING.into())), Some(Some(BULLY_KING.into())));
+    }
+
+    /// LRCLIB is asked again only through the paced loop: `http`'s own retries came 2, 4 and 8 seconds after a
+    /// 503 or 429, from each thread, ignoring the hold that told every thread to wait.
+    #[test]
+    fn lrclib_retries_wait_for_the_shared_hold() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/search", server.local_addr().unwrap());
+        let (sent, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (n, stream) in server.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                sent.send(Instant::now()).unwrap();
+                let (status, body) = if n == 0 { ("503 Service Unavailable", "") } else { ("200 OK", "[]") };
+                let reply =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let search = std::thread::spawn(move || lrclib_search(&url));
+        let first = asked.recv().unwrap();
+        // Another thread was told to slow down.
+        super::LRCLIB.hold(Duration::from_secs(5));
+        assert_eq!(search.join().unwrap(), Some(Vec::new()));
+        assert!(asked.recv().unwrap() - first >= Duration::from_secs(4));
     }
 
     /// An artist is matched by whole words: "¥$" (slug "y") took Genius Ukrainian Translations' "CARNIVAL" as its
