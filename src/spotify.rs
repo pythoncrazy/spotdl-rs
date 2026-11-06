@@ -611,14 +611,20 @@ fn dates(spotify: &str, deezer: &str) -> (String, String) {
 /// Adds Deezer's genres, label (when Spotify has none), UPC, original date, ISRC, BPM and gain. An error is Deezer's failure (not a song
 /// that Deezer does not have): the song then has only what Spotify gives.
 pub fn enrich(song: &mut Song) -> Result<(), String> {
-    let album = if song.album_id.is_empty() {
+    let release = song.extra.release.as_deref().cloned().unwrap_or_else(|| song.clone());
+    // A save file written with a playlist option has only the playlist's album fields: a search by them finds
+    // no album (and would be cached as the real album's), and the track at the playlist position is another song.
+    let listed = release.list_name.as_ref() == Some(&release.album_name)
+        && release.list_position == Some(release.track_number as usize)
+        && release.disc_number == 1;
+    let album = if release.album_id.is_empty() || listed {
         Ok(Value::Null)
     } else {
         let mut albums = DEEZER_ALBUMS.lock().unwrap_or_else(PoisonError::into_inner);
         let cell = albums.entry(song.album_id.clone()).or_insert_with(|| Arc::new(Mutex::new(Err((0, "".into())))));
         let cell = cell.clone();
         drop(albums);
-        fetch_once(&cell, || deezer_album(song))
+        fetch_once(&cell, || deezer_album(&release))
     };
     let mut result = album.as_ref().map(drop).map_err(String::clone);
     let album = album.unwrap_or_default();
@@ -635,7 +641,7 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
         // The album is found by title, so it can be another edition (clean, remaster, other order): only trust
         // the track at this position when it has the same length and explicit flag.
         if song.isrc.as_deref().is_none_or(str::is_empty) {
-            let track = &album["tracks"][format!("{}:{}", song.disc_number, song.track_number)];
+            let track = &album["tracks"][format!("{}:{}", release.disc_number, release.track_number)];
             let same = track["duration"].as_f64().is_some_and(|length| (length - song.duration).abs() <= 3.0)
                 && track["explicit"].as_bool().is_none_or(|explicit| explicit == song.explicit);
             song.isrc = track["isrc"].as_str().filter(|isrc| same && !isrc.is_empty()).map(String::from);
@@ -768,6 +774,39 @@ mod tests {
         };
         assert_eq!(tag("test-label-spotify", "Universal Music Group"), "Universal Music Group");
         assert_eq!(tag("test-label-missing", ""), "Chandos");
+    }
+
+    #[test]
+    fn a_playlist_numbered_song_reads_deezer_by_its_own_album_position() {
+        let tracks = json!({
+            "1:2": {"isrc": "PLAYLIST2", "duration": 200.0, "explicit": false},
+            "2:7": {"isrc": "ALBUM27", "duration": 201.0, "explicit": false},
+        });
+        let album = json!({"genres": ["Rock"], "tracks": tracks});
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Ok(album)));
+        super::DEEZER_ALBUMS.lock().unwrap().insert("test-playlist-numbering".into(), cell);
+        let real = Song {
+            album_id: "test-playlist-numbering".into(),
+            album_name: "Album".into(),
+            disc_number: 2,
+            track_number: 7,
+            duration: 200.0,
+            list_name: Some("Mix".into()),
+            list_position: Some(2),
+            ..Song::default()
+        };
+        // As `--playlist-numbering` leaves it; a gain keeps the ISRC from being looked up online.
+        let listed = Song { album_name: "Mix".into(), disc_number: 1, track_number: 2, ..real.clone() };
+        let mut song = listed.clone();
+        song.extra.release = Some(Box::new(real));
+        song.extra.gain = -1.0;
+        assert_eq!(enrich(&mut song), Ok(()));
+        assert_eq!((song.isrc.as_deref(), song.genres), (Some("ALBUM27"), vec!["Rock".to_string()]));
+        // Read from a save file, the real album fields are gone: nothing is read rather than another song's ISRC.
+        let mut song = listed;
+        song.extra.gain = -1.0;
+        assert_eq!(enrich(&mut song), Ok(()));
+        assert_eq!((song.isrc, song.genres.len()), (None, 0));
     }
 
     #[test]

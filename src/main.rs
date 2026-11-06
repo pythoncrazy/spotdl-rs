@@ -80,6 +80,9 @@ pub struct Extra {
     pub upc: String,
     pub bpm: f64,
     pub gain: f64,
+    /// The song as it was before `--playlist-numbering` or `--playlist-retain-track-cover` gave it the playlist's
+    /// album, album artist, disc and track: Deezer's album is found, cached and read by the real ones.
+    pub release: Option<Box<Song>>,
 }
 
 static CONFIG: OnceLock<Value> = OnceLock::new();
@@ -287,6 +290,7 @@ fn settings(args: &[String]) -> R<(String, Vec<String>)> {
 fn arrange(mut songs: Vec<Song>) -> Vec<Song> {
     let (numbering, retain) = (on("playlist_numbering"), on("playlist_retain_track_cover"));
     for song in songs.iter_mut().filter(|song| (numbering || retain) && song.list_name.is_some()) {
+        song.extra.release = Some(Box::new(song.clone()));
         song.album_name = song.list_name.clone().unwrap_or_default();
         song.track_number = song.list_position.map_or(song.track_number, |position| position as u32);
         song.tracks_count = song.list_length.map_or(song.tracks_count, |length| length as u32);

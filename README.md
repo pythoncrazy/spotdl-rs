@@ -51,7 +51,7 @@ It keeps each transcript in `$ALIGN_CACHE` (default `~/.cache/align-lyrics`), by
 
 Use `--scan-for-songs` to find songs in the output folder. Use `--fetch-albums` to add all songs from each album. Use `--ytm-data` to use the title and artist from a YouTube Music page.
 
-Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover. Use `--m3u` to write one playlist file per list; it includes every song of the list, also those that another query already downloaded.
+Use `--playlist-numbering` to use the playlist name as the album name and the playlist owner as the album artist. Use `--playlist-retain-track-cover` to keep each track's album cover. Either way, Deezer's genres, UPC and ISRC still come from each track's own album. Use `--m3u` to write one playlist file per list; it includes every song of the list, also those that another query already downloaded.
 
 A song gets its file name only after its tags, cover and ReplayGain are written, so a file at the output path is a finished song: a run that is stopped or fails while tagging leaves a `<name>.<track-id>.converted.<format>` file, which is not taken for a song and is deleted when the song is downloaded again.
 
