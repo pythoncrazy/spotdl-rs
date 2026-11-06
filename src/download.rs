@@ -27,6 +27,8 @@ static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 /// The files `sync` moved to a new path, whose tags are written again.
 static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
+/// The files `meta --redownload` downloads again, by song URL.
+static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
 static GENIUS: Pace = Pace::new(500);
 static ALIGNING: Mutex<usize> = Mutex::new(0);
@@ -1232,6 +1234,16 @@ fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     Err(failure.unwrap_or_else(|| "no match".into()))
 }
 
+/// The file `op` writes a song to: `meta --redownload` replaces a local song's own file (its name with the
+/// selected format's extension), not a file at the output template's path, which would leave the old file as a
+/// duplicate.
+fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
+    match REDOWNLOADS.get().filter(|_| op == "redownload").and_then(|files| files.get(&s.url)) {
+        Some(file) => (file.with_extension(text("format").unwrap_or("opus")), Some(file)),
+        None => (path(s), None),
+    }
+}
+
 /// Saves, prints or downloads one song; `redownload` is a download that replaces the file.
 fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if op == "save" {
@@ -1254,7 +1266,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if early {
         enrich(s);
     }
-    let out = path(s);
+    let (out, local) = out_path(s, op);
     let scan = || {
         let root = output_root();
         let mut files = Vec::new();
@@ -1266,7 +1278,12 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     };
     let scanned = on("scan_for_songs").then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
     let detected = list("detect_formats").map(|format| out.with_extension(format)).find(|path| path.is_file());
-    let mut target = scanned.or_else(|| out.is_file().then(|| out.clone())).or(detected).unwrap_or_else(|| out.clone());
+    let mut target = local
+        .cloned()
+        .or(scanned)
+        .or_else(|| out.is_file().then(|| out.clone()))
+        .or(detected)
+        .unwrap_or_else(|| out.clone());
     let archived = text("archive").is_some_and(|file| {
         let read = || fs::read_to_string(file).unwrap_or_default().lines().map(String::from).collect();
         ARCHIVED.get_or_init(read).contains(&s.url)
@@ -1310,6 +1327,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
             }
             if target != out && target.is_file() {
                 fs::remove_file(&target)?;
+                let _ = fs::remove_file(skip_path(&target));
             }
             target = out;
         }
@@ -1414,8 +1432,9 @@ fn remove_empty(file: &Path) {
     }
 }
 
-/// Fills in missing tags, lyrics and `.lrc` files of local songs, and with `redownload` downloads them again.
-fn meta_file(file: &Path) -> R<()> {
+/// Fills in missing tags, lyrics and `.lrc` files of a local song, and returns it when `redownload` is to download
+/// it again.
+fn meta_file(file: &Path) -> R<Option<Song>> {
     let audio = lofty::read_from_path(file)?;
     let tag = audio.primary_tag().ok_or("no tags")?;
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
@@ -1462,10 +1481,10 @@ fn meta_file(file: &Path) -> R<()> {
             write_track_gain(file)?;
         }
         if !on("generate_lrc") || file.with_extension("lrc").exists() || (lyrics.is_none() && no_lyrics) {
-            return Ok(());
+            return Ok(None);
         }
         if lyrics.as_deref().is_some_and(is_synced) {
-            return write_lrc(file, &local).map(drop);
+            return write_lrc(file, &local).map(|_| None);
         }
     }
     let url = source_url(tag).filter(|url| url.contains("spotify"));
@@ -1569,14 +1588,23 @@ fn meta_file(file: &Path) -> R<()> {
             write_lyrics(file, None)?;
         }
     }
-    if redownload && on_spotify {
-        let album = format!("https://open.spotify.com/album/{}", song.album_id);
-        let songs = if on("fetch_albums") { spotify::resolve(&album)? } else { vec![song] };
-        for song in songs {
-            process(song, "redownload").1?;
+    Ok((redownload && on_spotify).then_some(song))
+}
+
+/// One download per output file, local songs first: a song is downloaded once, also when it is on the album of
+/// several files (`--fetch-albums`), and the threads do not write the same file. A pinned video is kept.
+fn redownload_jobs(songs: Vec<Song>) -> Vec<Song> {
+    let (mut jobs, mut slots) = (Vec::<Song>::new(), HashMap::new());
+    for song in songs {
+        let slot = *slots.entry(out_path(&song, "redownload").0).or_insert_with(|| {
+            jobs.push(song.clone());
+            jobs.len() - 1
+        });
+        if jobs[slot].download_url.is_none() {
+            jobs[slot].download_url = song.download_url;
         }
     }
-    Ok(())
+    jobs
 }
 
 pub fn meta(paths: &[String]) -> R<()> {
@@ -1589,34 +1617,68 @@ pub fn meta(paths: &[String]) -> R<()> {
     }
     // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites and the aligner.
     let pool = rayon::ThreadPoolBuilder::new().num_threads(number("threads").max(1) as usize).build()?;
-    let failed = pool.install(|| {
+    let results: Vec<R<Option<Song>>> = pool.install(|| {
         files
             .par_iter()
             .with_max_len(1)
-            .filter(|file| {
+            .map(|file| {
                 let result = meta_file(file);
                 println!(
                     "{}: {}",
                     file.display(),
-                    result.as_ref().map_or_else(|error| error.to_string(), |()| "updated".into())
+                    result.as_ref().map_or_else(|error| error.to_string(), |_| "updated".into())
                 );
-                result.is_err()
+                result
             })
-            .count()
+            .collect()
     });
-    album_gains(&files);
+    let (count, failed) = (files.len(), results.iter().filter(|result| result.is_err()).count());
+    // The songs are downloaded again after all files are done, as a download, so that each is downloaded once.
+    let local: Vec<(PathBuf, Song)> =
+        files.iter().zip(results).filter_map(|(file, result)| Some((file.clone(), result.ok()??))).collect();
+    let _ = REDOWNLOADS.set(local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect());
+    let mut songs: Vec<Song> = local.into_iter().map(|(_, song)| song).collect();
+    let mut lost = 0;
+    if on("fetch_albums") {
+        let mut albums: Vec<String> = songs
+            .iter()
+            .filter(|song| !song.album_id.is_empty())
+            .map(|song| format!("https://open.spotify.com/album/{}", song.album_id))
+            .collect();
+        albums.sort();
+        albums.dedup();
+        let resolved: Vec<_> =
+            pool.install(|| albums.par_iter().map(|album| (album, spotify::resolve(album))).collect());
+        for (album, result) in resolved {
+            match result {
+                Ok(more) => songs.extend(more),
+                Err(error) => {
+                    log("ERROR", &format!("{album}: {error}"));
+                    lost += 1;
+                }
+            }
+        }
+    }
+    let jobs = redownload_jobs(songs);
+    let done: Vec<R<PathBuf>> =
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, "redownload").1).collect());
+    lost += done.iter().filter(|result| result.is_err()).count();
+    album_gains(&files.into_iter().chain(done.into_iter().flatten()).collect::<Vec<_>>());
     report_unchecked();
-    match failed {
-        0 => Ok(()),
-        count => Err(format!("{count} of {} files failed", files.len()).into()),
+    match (failed, lost) {
+        (0, 0) => Ok(()),
+        (failed, 0) => Err(format!("{failed} of {count} files failed").into()),
+        (failed, lost) => Err(format!("{failed} of {count} files and {lost} downloads failed").into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        among, genius_account, lrclib_lyrics, provider, reference, same_lyrics, unlisted, Relaxed, Song, GENIUS_BLOCKED,
+        among, genius_account, lrclib_lyrics, out_path, path, provider, redownload_jobs, reference, same_lyrics,
+        unlisted, Relaxed, Song, GENIUS_BLOCKED, REDOWNLOADS,
     };
+    use std::path::PathBuf;
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -1694,5 +1756,31 @@ mod tests {
         assert!(genius_account("Genius Ukrainian Translations (Український переклад)", "¥$"));
         assert!(genius_account("Genius Traducciones al Español", "Bad Bunny"));
         assert!(!genius_account("¥$", "¥$"));
+    }
+
+    /// `meta --redownload --fetch-albums` downloaded an album once for each of its files, from several threads into
+    /// the same file, and saved songs at the output template's path, leaving the local `.mp3` beside the new `.opus`.
+    #[test]
+    fn redownloads_replace_local_files_and_download_each_song_once() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let file = PathBuf::from("/music/Artist/Album (2020)/Artist - Album (2020) - 01 - One.mp3");
+        let _ = REDOWNLOADS.set([("https://open.spotify.com/track/1".into(), file.clone())].into());
+        let song = |id: &str, name: &str| Song {
+            url: format!("https://open.spotify.com/track/{id}"),
+            name: name.into(),
+            artists: vec!["Artist".into()],
+            ..Song::default()
+        };
+        let local = Song { download_url: Some("https://music.youtube.com/watch?v=pinned".into()), ..song("1", "One") };
+        // The local song, then the album's songs of each of two files of the album.
+        let album = [song("1", "One"), song("2", "Two")];
+        let songs = [vec![local], album.to_vec(), album.to_vec()].concat();
+        let jobs = redownload_jobs(songs);
+        assert_eq!(jobs.iter().map(|song| song.name.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
+        assert_eq!(jobs[0].download_url.as_deref(), Some("https://music.youtube.com/watch?v=pinned"));
+        assert_eq!(out_path(&jobs[0], "redownload"), (file.with_extension("opus"), Some(&file)));
+        assert_eq!(out_path(&jobs[1], "redownload"), (path(&jobs[1]), None));
+        // Only `meta --redownload` writes to the local file; a download goes by the output template.
+        assert_eq!(out_path(&jobs[0], "download").0, PathBuf::from("Artist - One.opus"));
     }
 }
