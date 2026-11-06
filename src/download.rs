@@ -1152,18 +1152,19 @@ fn art(url: &str) -> Option<Vec<u8>> {
 
 /// The images that `--folder-art` puts next to the songs, which music servers (Navidrome, Jellyfin) show:
 /// `cover.jpg` in the song's folder, and the album artist's Spotify picture as `artist.jpg` in the artist's
-/// folder.
+/// folder, whose URL (`None`) is looked up only when it is wanted. An album without a cover gets no `cover.jpg`:
+/// the artist's picture there would be shown as the album's cover, and never replaced.
 fn folder_images(file: &Path, s: &Song) -> Vec<(PathBuf, Option<String>)> {
-    if !on("folder_art") {
-        return vec![];
-    }
-    let cover = file.parent().map(|dir| (dir.join("cover.jpg"), s.cover_url.clone()));
+    let cover = file.parent().zip(s.cover_url.clone()).map(|(dir, url)| (dir.join("cover.jpg"), Some(url)));
     let artist =
         artist_folder(file, s).filter(|_| !s.artist_id.is_empty()).map(|folder| (folder.join("artist.jpg"), None));
     cover.into_iter().chain(artist).filter(|(image, _)| !image.exists()).collect()
 }
 
 fn write_folder_art(file: &Path, s: &Song) -> R<()> {
+    if !on("folder_art") {
+        return Ok(());
+    }
     for (image, url) in folder_images(file, s) {
         let url = url.or_else(|| spotify::artist_image(&s.artist_id));
         let Some(bytes) = url.and_then(|url| art(&url)) else { continue };
@@ -1522,8 +1523,8 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     // Deezer's gain has no peak: `--replaygain` measures songs without one.
     let measure = on("replaygain") && !has(ItemKey::ReplayGainTrackPeak);
     let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
-    let wanted = Song { album_artist, artist_id: "-".into(), ..Song::default() };
-    let missing_art = !folder_images(file, &wanted).is_empty();
+    let wanted = Song { album_artist, artist_id: "-".into(), cover_url: Some(String::new()), ..Song::default() };
+    let missing_art = on("folder_art") && !folder_images(file, &wanted).is_empty();
     let stored = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
     let lyrics = stored.as_deref().map(unlisted).filter(|lyrics| !lyrics.is_empty());
     // The comment is the URL the audio was downloaded from; tags written again keep it.
@@ -1746,9 +1747,9 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, compilation, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider,
-        rate_args, redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED,
-        LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        among, art, compilation, folder_images, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path,
+        path, provider, rate_args, redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song,
+        GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1767,6 +1768,22 @@ mod tests {
         let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
         let cover = art("https://i.scdn.co/image/ab67616d0000b273b694e89ba937dd2631ff584c").unwrap();
         assert_eq!(lofty::picture::PictureInformation::from_jpeg(&cover).unwrap().width, 1500);
+    }
+
+    /// An album without a cover URL got its artist's picture as `cover.jpg`, which servers show as its cover.
+    #[test]
+    fn albums_without_a_cover_get_no_cover_image() {
+        let file = std::env::temp_dir().join("spotdl-no-such-folder/Artist/Album/Artist - Song.opus");
+        let song = |cover: Option<&str>| Song {
+            album_artist: "Artist".into(),
+            artist_id: "id".into(),
+            cover_url: cover.map(String::from),
+            ..Song::default()
+        };
+        let artist = (file.parent().unwrap().parent().unwrap().join("artist.jpg"), None);
+        let cover = (file.parent().unwrap().join("cover.jpg"), Some("url".to_string()));
+        assert_eq!(folder_images(&file, &song(Some("url"))), [cover, artist.clone()]);
+        assert_eq!(folder_images(&file, &song(None)), [artist]);
     }
 
     /// Spotify's compilations of one artist's songs were flagged as compilations, which players file under Various
