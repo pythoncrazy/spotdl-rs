@@ -260,7 +260,7 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     let uris: Vec<&str> = releases.iter().filter_map(|release| release["uri"].as_str()).collect();
     let tracks = uris.into_par_iter().map(album).collect::<R<Vec<_>>>()?;
     let albums = tracks.into_iter().map(|tracks| build(tracks, Song::default())).collect::<R<Vec<_>>>()?;
-    let key = |song: &Song| (search::versionless(&song.name).to_lowercase(), song.artists.clone());
+    let key = |song: &Song| (song_key(&song.name), song.artists.clone());
     // A bigger edition of the same album (same base title, or one that starts with it) that has at least 90% of a smaller edition's songs
     // is kept whole, and the smaller edition is skipped; of two editions with the same songs, the explicit one
     // (the clean edit's "- Album Version (Edited)" titles are the same songs), then the first, is kept.
@@ -406,6 +406,13 @@ fn deezer(url: &str) -> R<Value> {
         std::thread::sleep(Duration::from_secs(1 << attempt));
     }
     Err("Deezer rate limit".into())
+}
+
+/// The title that a song has on every release: without a " - Remastered 2009" suffix, and slugged, because box sets
+/// and compilations write "Nowhere Man (First Version - Take 2)" as "Nowhere Man - First Version - Take 2". The
+/// take, demo and mix words stay: "Take 2" and "Take 5" are other recordings.
+fn song_key(name: &str) -> String {
+    search::slug(search::versionless(name), "-")
 }
 
 /// The title before a " (Deluxe Edition)", " [Remastered]" or " - Single" note.
@@ -602,8 +609,25 @@ pub fn enrich(song: &mut Song) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agrees, dates, ranked, release_date};
+    use super::{agrees, dates, ranked, release_date, song_key};
     use serde_json::json;
+
+    #[test]
+    fn a_song_has_one_key_however_a_release_punctuates_its_title() {
+        let same = |a, b| assert_eq!(song_key(a), song_key(b), "{a} / {b}");
+        // Anthology 3 and the Anthology Collection: the same recordings.
+        same(
+            "Happiness Is A Warm Gun (Esher Demo With False Start - Remastered)",
+            "Happiness Is A Warm Gun - Esher Demo With False Start - Remastered",
+        );
+        same("Nowhere Man (First Version - Take 2)", "Nowhere Man - First Version - Take 2");
+        same("I Will (Take 1)", "I Will - Take 1");
+        same("Day Tripper (Songwriting Work Tape)", "Day Tripper [Songwriting Work Tape]");
+        same("Something - Remastered 2009", "Something");
+        // Other takes are other songs.
+        assert_ne!(song_key("I Will (Take 1)"), song_key("I Will (Take 2)"));
+        assert_ne!(song_key("Nowhere Man (First Version - Take 2)"), song_key("Nowhere Man - Take 5"));
+    }
 
     #[test]
     fn deezer_albums_rank_by_title_kind_count_and_explicit_flag_and_must_have_the_same_tracks() {
