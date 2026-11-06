@@ -591,8 +591,9 @@ fn deezer_album(song: &Song) -> R<Value> {
 /// knows only by year with 1 January too (29 of 894 cached albums, over ten times the real share), so that is read as
 /// the year. Deezer's album is found by title, so it can be a reissue: its day is taken for a Spotify date of
 /// only a year or month when it is in that year or month. Dates are compared only as far as both go, so a year
-/// is not earlier than a day in it.
+/// is not earlier than a day in it. Deezer dates albums it has no date for 1900-01-01 (or 0000-00-00): no date.
 fn dates(spotify: &str, deezer: &str) -> (String, String) {
+    let deezer = if deezer.get(..4).is_some_and(|year| year > "1900") { deezer } else { "" };
     let deezer = deezer.strip_suffix("-01-01").unwrap_or(deezer);
     let date = if deezer.len() > spotify.len() && !spotify.is_empty() && deezer.starts_with(spotify) {
         deezer
@@ -881,6 +882,9 @@ mod tests {
         assert_eq!(dates("2011-09-26", "1994-03-28"), pair("2011-09-26", "1994-03-28"));
         assert_eq!(dates("", "1994-03-28"), pair("", "1994-03-28"));
         assert_eq!(dates("1994", ""), pair("1994", ""));
+        // Deezer's placeholder for an album without a date (She Wants Revenge's Valleyheart) is no date.
+        assert_eq!(dates("2011-05-23", "1900-01-01"), pair("2011-05-23", ""));
+        assert_eq!(dates("2011", "0000-00-00"), pair("2011", ""));
     }
 
     #[test]
