@@ -608,7 +608,7 @@ fn dates(spotify: &str, deezer: &str) -> (String, String) {
     (date.into(), original.into())
 }
 
-/// Adds Deezer's genres, label, UPC, original date, ISRC, BPM and gain. An error is Deezer's failure (not a song
+/// Adds Deezer's genres, label (when Spotify has none), UPC, original date, ISRC, BPM and gain. An error is Deezer's failure (not a song
 /// that Deezer does not have): the song then has only what Spotify gives.
 pub fn enrich(song: &mut Song) -> Result<(), String> {
     let album = if song.album_id.is_empty() {
@@ -626,7 +626,11 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
         song.genres =
             album["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
         song.extra.upc = album["upc"].as_str().unwrap_or_default().into();
-        song.publisher = album["label"].as_str().map_or(song.publisher.clone(), String::from);
+        // Spotify's label is the downloaded release's; Deezer names labels its own way ("Young" for "Young
+        // Turks") and its album can be another edition, so its label only fills a gap.
+        if song.publisher.is_empty() {
+            song.publisher = album["label"].as_str().unwrap_or_default().into();
+        }
         (song.date, song.extra.original_date) = dates(&song.date, album["release_date"].as_str().unwrap_or_default());
         // The album is found by title, so it can be another edition (clean, remaster, other order): only trust
         // the track at this position when it has the same length and explicit flag.
@@ -653,7 +657,7 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agrees, dates, deezer_error, editions, fetch_once, ranked, release_date, song_key};
+    use super::{agrees, dates, deezer_error, editions, enrich, fetch_once, ranked, release_date, song_key};
     use crate::Song;
     use serde_json::json;
 
@@ -750,6 +754,20 @@ mod tests {
             assert!(fetch_once(&cell, fail).is_err());
         }
         assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn deezer_label_only_fills_in_a_missing_spotify_label() {
+        let tag = |album_id: &str, label: &str| {
+            let album = json!({"genres": ["Opera"], "label": "Chandos"});
+            let cell = std::sync::Arc::new(std::sync::Mutex::new(Ok(album)));
+            super::DEEZER_ALBUMS.lock().unwrap().insert(album_id.into(), cell);
+            let mut song = Song { album_id: album_id.into(), publisher: label.into(), ..Song::default() };
+            assert_eq!(enrich(&mut song), Ok(()));
+            song.publisher
+        };
+        assert_eq!(tag("test-label-spotify", "Universal Music Group"), "Universal Music Group");
+        assert_eq!(tag("test-label-missing", ""), "Chandos");
     }
 
     #[test]
