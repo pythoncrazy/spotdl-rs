@@ -394,6 +394,14 @@ fn ytdlp(target: &str) -> R<Vec<Hit>> {
     Ok(entries.iter().filter_map(parse).collect())
 }
 
+/// The ISRC search's hits that are the song, ranked above every text hit. YouTube Music fills an ISRC search it has
+/// no match for with unrelated songs ("Purple Reign" for "Swimming Pools (Drank)"), so they are scored even when
+/// `--dont-filter-results` turns scoring off for text hits; they must also be the same length and edit.
+fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)> + '_ {
+    let same = |h: &Hit| (h.song.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
+    hits.into_iter().filter(same).map(|h| (score(song, &h) + 1000.0, h.song.url)).filter(|c| c.0 > 1000.0)
+}
+
 /// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
 pub fn find(song: &Song) -> R<Vec<String>> {
     let query = download::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
@@ -414,12 +422,8 @@ pub fn find(song: &Song) -> R<Vec<String>> {
             _ => note(ytdlp(&format!("scsearch10:{query}"))),
         };
         if provider == "youtube-music" {
-            // The ISRC search skips the text match, so it must also be the same length and edit.
             let isrc = song.isrc.as_deref().map_or_else(|| Ok(Vec::new()), |isrc| ytm(isrc, true, true));
-            let same = |h: &Hit| (h.song.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
-            found.extend(
-                note(isrc).into_iter().filter(same).map(|h| (rank(&h) + 1000.0, h.song.url)).filter(|c| c.0 > 1000.0),
-            );
+            found.extend(isrc_picks(song, note(isrc)));
             if !verified && hits.iter().map(rank).fold(0.0, f64::max) < 80.0 {
                 hits.extend(note(ytm(&query, false, false)));
             }
@@ -469,7 +473,7 @@ pub fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edition_title, score, versionless, Hit, Kind, Song};
+    use super::{edition_title, isrc_picks, score, versionless, Hit, Kind, Song};
 
     fn song(name: &str, album: &str, duration: f64, explicit: bool) -> Song {
         let artists = vec!["2Pac".to_string()];
@@ -536,6 +540,10 @@ mod tests {
         assert!(score(&ridah, &tupac("Live at the House Of Blues", false)) > 0.0);
         assert_eq!(score(&ridah, &tupac("Greatest Hits", false)), 0.0);
         assert_eq!(score(&ridah, &result("Khat", &["Navjot Ahuja"], "Khat", 134.0, true)), 0.0);
+        // ISRC filler of the same length and edit is not picked, whether or not text hits are filtered.
+        let filler = result("Khat", &["Navjot Ahuja"], "Khat", 134.0, true);
+        let picks = |hit: Hit| isrc_picks(&ridah, vec![hit]).count();
+        assert_eq!((picks(filler), picks(tupac("Tupac: Live At The House Of Blues", true))), (0, 1));
         // The ISRC hit of Tyler Ward's cover is on a "tribute" album; a text hit on such an album is still a cover.
         let scientist = track("The Scientist", &["Tyler Ward", "Lindsey Stirling", "Kina Grannis"], "Covers", 276.6);
         let british =
