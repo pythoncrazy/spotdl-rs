@@ -196,7 +196,44 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
             out.extend(text.chars().filter(|c| !matches!(c, '\n' | '\r')));
         }
     }
-    Some(out.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
+    Some(entities(&out))
+}
+
+/// `text` with HTML entities decoded in one pass, so an escaped entity ("&amp;lt;") stays text ("&lt;"). Genius
+/// escapes `<`, `>`, `&`, `"` and `'`; azlyrics also uses `&#39;`-style numbers and `&nbsp;`.
+fn entities(text: &str) -> String {
+    let (mut out, mut rest) = (String::with_capacity(text.len()), text);
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let entity = rest.split_once(';').filter(|(name, _)| name.len() <= 8).and_then(|(name, after)| {
+            let char = match name {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                // A plain space: a no-break space in a tag looks the same but breaks word matching and search.
+                "nbsp" => ' ',
+                _ => {
+                    let number = name.strip_prefix('#')?;
+                    let code = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => number.parse().ok()?,
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((char, after))
+        });
+        if let Some((char, after)) = entity {
+            out.push(char);
+            rest = after;
+        } else {
+            out.push('&');
+        }
+    }
+    out + rest
 }
 
 /// Genius lyrics: the text of each `data-lyrics-container` div. The page puts song lists ("You might also
@@ -1765,9 +1802,10 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, compilation, folder_images, genius_account, is_synced, lrclib_lyrics, lrclib_search, lrclib_tracks,
-        out_path, path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first,
-        template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        among, art, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_lyrics, lrclib_search,
+        lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics,
+        synced_first, template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT,
+        REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1779,6 +1817,15 @@ mod tests {
         "[00:05.86]After everything said, huh, man, man\n[00:12.00]After everything said, huh\n\
         [00:18.27]\"Crazy, bipolar, antisemite\"\n[00:23.04]And I'm still the king\n\
         [00:31.56]They thought headlines was my kryptonite\n[00:36.14]Still the king";
+
+    /// Only `&#x27;`, `&quot;` and `&amp;` were decoded, so a Genius "<3" or "->" stayed "&lt;3" or "-&gt;".
+    #[test]
+    fn lyrics_decode_every_html_entity_once() {
+        let page = "<div data-lyrics-container=\"true\">I &lt;3 you<br/>Don&#x27;t go -&gt; &quot;there&quot; \
+            &amp; back<br/>&amp;lt;em&amp;gt; &#39;Til&nbsp;dawn&#x2019; &copy; &#xZZ; R&B</div>";
+        let lyrics = "I <3 you\nDon't go -> \"there\" & back\n&lt;em&gt; 'Til dawn\u{2019} &copy; &#xZZ; R&B";
+        assert_eq!(genius_lyrics(page).unwrap(), lyrics);
+    }
 
     /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
     #[test]
