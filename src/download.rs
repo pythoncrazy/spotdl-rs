@@ -1013,6 +1013,9 @@ fn source_url(tag: &Tag) -> Option<String> {
 
 /// The ReplayGain 2.0 reference loudness, in LUFS.
 const RG_REFERENCE: f64 = -18.0;
+/// Deezer's gain reads about 0.4 dB below the EBU R128 loudness FFmpeg measures for the same audio (deemix writes
+/// -(gain + 18.4) too), so gains from it at -18 played 0.4 dB louder than measured ones.
+const DEEZER_REFERENCE: f64 = RG_REFERENCE - 0.4;
 
 /// The EBU R128 integrated loudness (LUFS) and true peak (linear) of a file, measured by FFmpeg.
 fn loudness(file: &Path) -> Option<(f64, f64)> {
@@ -1034,8 +1037,7 @@ fn loudness(file: &Path) -> Option<(f64, f64)> {
 fn track_gain(file: &Path, s: &Song) -> (String, String) {
     match on("replaygain").then(|| loudness(file)).flatten() {
         Some((lufs, peak)) => (format!("{:.2} dB", RG_REFERENCE - lufs), format!("{peak:.6}")),
-        // Deezer's gain is the track's loudness against 0 dB.
-        None if s.extra.gain != 0.0 => (format!("{:.2} dB", RG_REFERENCE - s.extra.gain), String::new()),
+        None if s.extra.gain != 0.0 => (format!("{:.2} dB", DEEZER_REFERENCE - s.extra.gain), String::new()),
         None => (String::new(), String::new()),
     }
 }
@@ -1854,8 +1856,8 @@ mod tests {
     use super::{
         among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced, lrclib_agrees,
         lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args, redownload_jobs, reference,
-        release_type_key, same_lyrics, synced_first, temp_id, template_path, unlisted, write_tags, Relaxed, Song,
-        AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        release_type_key, same_lyrics, synced_first, temp_id, template_path, track_gain, unlisted, write_tags, Relaxed,
+        Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1875,6 +1877,16 @@ mod tests {
             &amp; back<br/>&amp;lt;em&amp;gt; &#39;Til&nbsp;dawn&#x2019; &copy; &#xZZ; R&B</div>";
         let lyrics = "I <3 you\nDon't go -> \"there\" & back\n&lt;em&gt; 'Til dawn\u{2019} &copy; &#xZZ; R&B";
         assert_eq!(genius_lyrics(page).unwrap(), lyrics);
+    }
+
+    /// Deezer's gain was taken against -18 LUFS, but it reads 0.4 dB below the loudness FFmpeg measures: Get Lucky
+    /// (Deezer's -11.3) measures -7.10 dB, not -6.70, so unmeasured songs played 0.4 dB louder than measured ones.
+    #[test]
+    fn deezer_gain_is_converted_like_a_measured_one() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let mut song = Song::default();
+        song.extra.gain = -11.3;
+        assert_eq!(track_gain(&PathBuf::from("no-such-file.opus"), &song), ("-7.10 dB".into(), String::new()));
     }
 
     /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
