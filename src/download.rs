@@ -676,10 +676,49 @@ fn source_url(tag: &Tag) -> Option<String> {
     urls.filter_map(|item| item.value().text().or(item.value().locator())).find(|url| !url.is_empty()).map(String::from)
 }
 
+/// The ReplayGain 2.0 reference loudness, in LUFS.
+const RG_REFERENCE: f64 = -18.0;
+
+/// The EBU R128 integrated loudness (LUFS) and true peak (linear) of a file, measured by FFmpeg.
+fn loudness(file: &Path) -> Option<(f64, f64)> {
+    let output = Command::new(text("ffmpeg").unwrap_or("ffmpeg"))
+        .args(["-nostats", "-hide_banner", "-i"])
+        .arg(file)
+        .args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    let log = String::from_utf8_lossy(&output.stderr);
+    let summary = &log[log.rfind("Summary:")?..];
+    let value = |label: &str, unit: &str| summary.split_once(label)?.1.split_once(unit)?.0.trim().parse::<f64>().ok();
+    // A silent track's peak is "-inf".
+    let peak = value("Peak:", "dBFS").unwrap_or(-70.0);
+    Some((value("I:", "LUFS")?, 10f64.powf(peak / 20.0)))
+}
+
+/// The track gain and peak tags: measured with `--replaygain`, else from Deezer's gain (no peak).
+fn track_gain(file: &Path, s: &Song) -> (String, String) {
+    match on("replaygain").then(|| loudness(file)).flatten() {
+        Some((lufs, peak)) => (format!("{:.2} dB", RG_REFERENCE - lufs), format!("{peak:.6}")),
+        // Deezer's gain is the track's loudness against 0 dB.
+        None if s.extra.gain != 0.0 => (format!("{:.2} dB", RG_REFERENCE - s.extra.gain), String::new()),
+        None => (String::new(), String::new()),
+    }
+}
+
+/// The key of the explicit flag: lofty writes `ITUNESADVISORY` for ID3 and `rtng` for MP4, but drops it from
+/// Vorbis comments (Opus, FLAC, Ogg), where music servers read `ITUNESADVISORY` too.
+fn advisory_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::VorbisComments => ItemKey::Unknown("ITUNESADVISORY".into()),
+        _ => ItemKey::ParentalAdvisory,
+    }
+}
+
 fn write_tags(file: &Path, s: &Song) -> R<()> {
     let mut audio = lofty::read_from_path(file)?;
     let format = audio.primary_tag_type();
     let id3 = format == TagType::Id3v2;
+    let (gain, peak) = track_gain(file, s);
     let mut tag = Tag::new(format);
     tag.set_title(s.name.clone());
     tag.set_artist(s.artists.join(text("id3_separator").unwrap_or("/")));
@@ -707,13 +746,10 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (ItemKey::Lyrics, single(s.lyrics.clone().unwrap_or_default())),
         (if id3 { ItemKey::IntegerBpm } else { ItemKey::Bpm }, single(bpm)),
         (ItemKey::Barcode, single(s.extra.upc.clone())),
-        // Deezer's gain is the track's loudness against 0 dB; ReplayGain targets -18 dB.
-        (
-            ItemKey::ReplayGainTrackGain,
-            single(if s.extra.gain != 0.0 { format!("{:.2} dB", -18.0 - s.extra.gain) } else { String::new() }),
-        ),
+        (ItemKey::ReplayGainTrackGain, single(gain)),
+        (ItemKey::ReplayGainTrackPeak, single(peak)),
         (ItemKey::FlagCompilation, single(if s.album_type == "compilation" { "1".into() } else { String::new() })),
-        (ItemKey::ParentalAdvisory, single(if s.explicit { "1" } else { "0" }.into())),
+        (advisory_key(format), single(if s.explicit { "1" } else { "0" }.into())),
         (ItemKey::TrackArtists, if id3 { single(s.artists.join("\0")) } else { s.artists.clone() }),
         (ItemKey::Genre, s.genres.clone()),
         (ItemKey::Unknown("RELEASETYPE".into()), single(s.album_type.clone())),
@@ -743,6 +779,115 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     }
     audio.insert_tag(tag);
     Ok(audio.save_to_path(file, WriteOptions::default())?)
+}
+
+/// With `--replaygain`, the album gain and peak of each album in the folders of `files`, from the track gains and
+/// peaks of all of the folder's songs of that album: the album's loudness is the songs' loudness averaged as
+/// energy over their lengths, and its peak the highest song peak. An album with a song that has no measured gain
+/// is left as it is.
+pub fn album_gains(files: &[PathBuf]) {
+    if !on("replaygain") {
+        return;
+    }
+    let dirs: HashSet<&Path> = files.iter().filter_map(|file| file.parent()).collect();
+    dirs.into_par_iter().for_each(|dir| {
+        if let Err(error) = album_gain(dir) {
+            log("ERROR", &format!("{}: album gain: {error}", dir.display()));
+        }
+    });
+}
+
+fn album_gain(dir: &Path) -> R<()> {
+    type Track = (PathBuf, Option<(f64, f64)>, f64);
+    let mut albums: HashMap<String, Vec<Track>> = HashMap::new();
+    for entry in fs::read_dir(dir)? {
+        let file = entry?.path();
+        let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !AUDIO.contains(&extension.as_str()) {
+            continue;
+        }
+        let audio = lofty::read_from_path(&file)?;
+        let Some(tag) = audio.primary_tag() else { continue };
+        let number = |key: ItemKey| tag.get_string(&key)?.split_whitespace().next()?.parse::<f64>().ok();
+        let loud = number(ItemKey::ReplayGainTrackGain).zip(number(ItemKey::ReplayGainTrackPeak));
+        let length = audio.properties().duration().as_secs_f64();
+        albums.entry(tag.album().unwrap_or_default().into()).or_default().push((file, loud, length));
+    }
+    for tracks in albums.values() {
+        let Some(measured) =
+            tracks.iter().map(|(_, loud, length)| loud.map(|loud| (loud, *length))).collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let total: f64 = measured.iter().map(|(_, length)| length).sum();
+        if total <= 0.0 {
+            continue;
+        }
+        let energy: f64 =
+            measured.iter().map(|((gain, _), length)| length * 10f64.powf((RG_REFERENCE - gain) / 10.0)).sum();
+        let gain = format!("{:.2} dB", RG_REFERENCE - 10.0 * (energy / total).log10());
+        let peak = format!("{:.6}", measured.iter().map(|((_, peak), _)| *peak).fold(0.0, f64::max));
+        for (file, _, _) in tracks {
+            let mut audio = lofty::read_from_path(file)?;
+            let tag = audio.primary_tag_mut().ok_or("no tags")?;
+            if tag.get_string(&ItemKey::ReplayGainAlbumGain) == Some(gain.as_str())
+                && tag.get_string(&ItemKey::ReplayGainAlbumPeak) == Some(peak.as_str())
+            {
+                continue;
+            }
+            tag.insert_text(ItemKey::ReplayGainAlbumGain, gain.clone());
+            tag.insert_text(ItemKey::ReplayGainAlbumPeak, peak.clone());
+            audio.save_to_path(file, WriteOptions::default())?;
+        }
+    }
+    Ok(())
+}
+
+/// The track gain and peak written into a file that has its other tags: `--replaygain` on a song from before it.
+fn write_track_gain(file: &Path) -> R<()> {
+    let (gain, peak) = track_gain(file, &Song::default());
+    if gain.is_empty() {
+        return Err("could not measure the loudness".into());
+    }
+    let mut audio = lofty::read_from_path(file)?;
+    let tag = audio.primary_tag_mut().ok_or("no tags")?;
+    tag.insert_text(ItemKey::ReplayGainTrackGain, gain);
+    tag.insert_text(ItemKey::ReplayGainTrackPeak, peak);
+    Ok(audio.save_to_path(file, WriteOptions::default())?)
+}
+
+/// The folder of an album artist: the folder above the song's when it is named after the album artist, as with
+/// `{album-artist}/{album}/...` output paths.
+fn artist_folder(file: &Path, s: &Song) -> Option<PathBuf> {
+    let folder = file.parent()?.parent()?;
+    let name = folder.file_name()?.to_string_lossy();
+    (!s.album_artist.is_empty() && search::slug(&name, "") == search::slug(&s.album_artist, ""))
+        .then(|| folder.to_path_buf())
+}
+
+/// The images that `--folder-art` puts next to the songs, which music servers (Navidrome, Jellyfin) show:
+/// `cover.jpg` in the song's folder, and the album artist's Spotify picture as `artist.jpg` in the artist's
+/// folder.
+fn folder_images(file: &Path, s: &Song) -> Vec<(PathBuf, Option<String>)> {
+    if !on("folder_art") {
+        return vec![];
+    }
+    let cover = file.parent().map(|dir| (dir.join("cover.jpg"), s.cover_url.clone()));
+    let artist =
+        artist_folder(file, s).filter(|_| !s.artist_id.is_empty()).map(|folder| (folder.join("artist.jpg"), None));
+    cover.into_iter().chain(artist).filter(|(image, _)| !image.exists()).collect()
+}
+
+fn write_folder_art(file: &Path, s: &Song) -> R<()> {
+    for (image, url) in folder_images(file, s) {
+        let url = url.or_else(|| spotify::artist_image(&s.artist_id));
+        let Some(bytes) = url.and_then(|url| http(&url, &[], None).ok()) else { continue };
+        // Songs of one album are written at the same time: each writes its own part file and renames it.
+        let part = image.with_extension(format!("{}.part", file.file_stem().unwrap_or_default().to_string_lossy()));
+        fs::write(&part, bytes)?;
+        fs::rename(&part, &image)?;
+    }
+    Ok(())
 }
 
 /// Downloads one video's audio to `out`, converting with FFmpeg unless it is already in the right format.
@@ -899,6 +1044,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         target = out;
     }
     write_tags(&target, s)?;
+    write_folder_art(&target, s)?;
     write_lrc(&target, s)?;
     if on("create_skip_file") {
         fs::write(skip_path(&target), "")?;
@@ -952,12 +1098,22 @@ fn meta_file(file: &Path) -> R<()> {
     let audio = lofty::read_from_path(file)?;
     let tag = audio.primary_tag().ok_or("no tags")?;
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
+    // A Spotify song written before the explicit flag reached Vorbis comments has its tags written again.
+    let from_spotify = source_url(tag).is_some_and(|url| url.contains("spotify"));
     let complete = has(ItemKey::TrackTitle)
         && has(ItemKey::TrackArtist)
         && has(ItemKey::TrackArtists)
         && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics))
-        && (on("skip_album_art") || !tag.pictures().is_empty());
+        && (on("skip_album_art") || !tag.pictures().is_empty())
+        && (!from_spotify || has(advisory_key(tag.tag_type())));
+    // Deezer's gain has no peak: `--replaygain` measures songs without one.
+    let measure = on("replaygain") && !has(ItemKey::ReplayGainTrackPeak);
+    let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
+    let wanted = Song { album_artist, artist_id: "-".into(), ..Song::default() };
+    let missing_art = !folder_images(file, &wanted).is_empty();
     let lyrics = tag.get_string(&ItemKey::Lyrics).map(String::from);
+    // The comment is the URL the audio was downloaded from; tags written again keep it.
+    let source = tag.comment().filter(|comment| comment.starts_with("http")).map(String::from);
     let (force, redownload) = (on("force_update_metadata"), on("redownload"));
     // The song as the file's own tags describe it.
     let mut artists: Vec<String> = tag.get_strings(&ItemKey::TrackArtists).map(String::from).collect();
@@ -976,7 +1132,10 @@ fn meta_file(file: &Path) -> R<()> {
     };
     // `--overwrite metadata` or `force` checks the files' lyrics again.
     let replace = matches!(text("overwrite"), Some("force" | "metadata"));
-    if complete && !force && !redownload && !replace {
+    if complete && !force && !redownload && !replace && !missing_art {
+        if measure {
+            write_track_gain(file)?;
+        }
         if !on("generate_lrc") || file.with_extension("lrc").exists() {
             return Ok(());
         }
@@ -1001,6 +1160,7 @@ fn meta_file(file: &Path) -> R<()> {
     };
     let Some(mut song) = found.or_else(|| url.is_none().then(|| local.clone())) else { return Err("no match".into()) };
     let on_spotify = !song.song_id.is_empty();
+    song.download_url = song.download_url.or(source);
     if on_spotify {
         spotify::enrich(&mut song);
     }
@@ -1018,6 +1178,13 @@ fn meta_file(file: &Path) -> R<()> {
             log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
             song.lyrics = Some(page.lyrics);
         }
+    }
+    if on_spotify {
+        write_folder_art(file, &song)?;
+    }
+    // A song whose tags are not written again (complete, or not on Spotify) is measured on its own.
+    if measure && (!on_spotify || (complete && !force)) {
+        write_track_gain(file)?;
     }
     if on_spotify {
         if !complete || force {
@@ -1080,6 +1247,7 @@ pub fn meta(paths: &[String]) -> R<()> {
             })
             .count()
     });
+    album_gains(&files);
     match failed {
         0 => Ok(()),
         count => Err(format!("{count} of {} files failed", files.len()).into()),
