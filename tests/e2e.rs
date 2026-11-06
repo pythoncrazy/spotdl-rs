@@ -114,6 +114,8 @@ fn url_finds_official_audio() {
         ELEANOR,
         "https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH",
         "https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4",
+        // "Lil' Homies - Album Version (Edited)": the suffix is a version note, not part of the title.
+        "https://open.spotify.com/track/1YTfq6avUGOxlJ1GluNIqj",
     ] {
         let url = ok(spotdl(&dir, &["url", track]));
         let url = url.lines().next().unwrap();

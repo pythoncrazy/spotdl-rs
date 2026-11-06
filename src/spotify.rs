@@ -251,12 +251,14 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     let albums = tracks.into_iter().map(|tracks| build(tracks, Song::default())).collect::<R<Vec<_>>>()?;
     let key = |song: &Song| (search::versionless(&song.name).to_lowercase(), song.artists.clone());
     // A bigger edition of the same album (same base title, or one that starts with it) that has at least 90% of a smaller edition's songs
-    // is kept whole, and the smaller edition is skipped; of two editions with the same songs, the first is
-    // kept. "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist. Titles
+    // is kept whole, and the smaller edition is skipped; of two editions with the same songs, the explicit one
+    // (the clean edit's "- Album Version (Edited)" titles are the same songs), then the first, is kept.
+    // "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist. Titles
     // are compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its
     // "(2026 Mix)" songs replaces the 2009 remaster.
     let titles: Vec<HashSet<String>> =
         albums.iter().map(|songs| songs.iter().map(|song| search::edition_title(&song.name)).collect()).collect();
+    let explicit: Vec<usize> = albums.iter().map(|songs| songs.iter().filter(|song| song.explicit).count()).collect();
     let title = |release: &Value| base_title(release["name"].as_str().unwrap_or_default()).to_lowercase();
     // "OK Computer OKNOTOK 1997 2017", "KID A MNESIA" and "Wish You Were Here 50" are editions of the albums whose
     // titles they start with.
@@ -268,7 +270,7 @@ fn artist(uri: &str) -> R<Vec<Song>> {
         let shared = titles[i].intersection(&titles[j]).count();
         j != i
             && same_title(&title(releases[j]), &title(releases[i]))
-            && (titles[j].len() > titles[i].len() || (titles[j].len() == titles[i].len() && j < i))
+            && (titles[j].len(), explicit[j], i) > (titles[i].len(), explicit[i], j)
             && shared * 10 >= titles[i].len() * 9
     };
     let n = releases.len();

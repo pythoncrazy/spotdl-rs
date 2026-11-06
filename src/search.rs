@@ -9,8 +9,10 @@ use std::{
 
 const REJECTED: &str = "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally reversed reverse amv";
 const PENALIZED: &str = "remaster remastered lyrics lyric visualizer video edit";
-const SUFFIXES: &str =
-    "remaster remastered mono stereo mix version edit single radio deluxe anniversary original bonus";
+// "album", "lp", "edited" and "explicit" make " - Album Version (Edited)" and " - LP Version" version notes: kept
+// in the title, they sank the exact clean track below the explicit one. The explicit badge tells the edits apart.
+const SUFFIXES: &str = "remaster remastered mono stereo mix version edit edited explicit single radio album lp deluxe \
+    anniversary original bonus";
 
 /// Until when (Unix seconds) every thread holds off YouTube after it blocked us.
 static PAUSE: AtomicU64 = AtomicU64::new(0);
@@ -379,4 +381,42 @@ pub fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
         }
     };
     Ok(ytdlp(url)?.into_iter().take(if single { 1 } else { usize::MAX }).filter_map(song).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{edition_title, score, versionless, Hit, Kind, Song};
+
+    fn song(name: &str, album: &str, duration: f64, explicit: bool) -> Song {
+        let artists = vec!["2Pac".to_string()];
+        Song {
+            name: name.into(),
+            artist: "2Pac".into(),
+            artists,
+            album_name: album.into(),
+            duration,
+            explicit,
+            ..Song::default()
+        }
+    }
+
+    fn atv(name: &str, duration: f64, explicit: bool) -> Hit {
+        let song = song(name, "Until The End Of Time", duration, explicit);
+        Hit { song, verified: true, isrc: false, kind: Kind::Atv, explicit }
+    }
+
+    #[test]
+    fn album_version_edited_is_a_version_note() {
+        assert_eq!(versionless("Lil' Homies - Album Version (Edited)"), "Lil' Homies");
+        assert_eq!(versionless("Breathin - LP Version"), "Breathin");
+        assert_eq!(edition_title("M.O.B. - Album Version (Edited)"), edition_title("M.O.B."));
+        // The clean track was scored 0 against its own exact clean audio.
+        let homies = song("Lil' Homies - Album Version (Edited)", "Until The End Of Time", 224.0, false);
+        assert!(score(&homies, &atv("Lil' Homies", 224.0, false)) > 90.0);
+        // The clean edit beats the explicit edit with a featured artist.
+        let happy = song("Happy Home II - Album Version (Edited)", "Until The End Of Time", 235.0, false);
+        let (clean, explicit) =
+            (atv("Happy Home II", 235.0, false), atv("Happy Home II (feat. Yusef Sharid)", 235.0, true));
+        assert!(score(&happy, &clean) > score(&happy, &explicit));
+    }
 }
