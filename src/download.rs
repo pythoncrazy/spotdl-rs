@@ -1,7 +1,7 @@
 use crate::{http, http_retrying, list, log, number, on, search, spotify, text, url_encode, Pace, Song, R};
 use lofty::{
     config::WriteOptions,
-    picture::{MimeType, Picture, PictureType},
+    picture::{MimeType, Picture, PictureInformation, PictureType},
     prelude::*,
     tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
 };
@@ -1042,7 +1042,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
             }
         }
     }
-    let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(|url| http(url, &[], None).ok());
+    let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(art);
     if let Some(cover) = cover {
         tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, cover));
@@ -1140,6 +1140,16 @@ fn artist_folder(file: &Path, s: &Song) -> Option<PathBuf> {
         .then(|| folder.to_path_buf())
 }
 
+/// The image at `url`. Spotify lists album covers (`ab67616d<size><hash>`) at most 640 px wide, but serves the
+/// same cover in its uploaded size (up to 2000 px) with the size `000082c1`; that one is taken when it is a JPEG
+/// wider than 640 px, as old uploads may lack it or be smaller. Artist pictures are taken as listed.
+fn art(url: &str) -> Option<Vec<u8>> {
+    let hash = url.strip_prefix("https://i.scdn.co/image/ab67616d").and_then(|rest| rest.get(8..));
+    let original = hash.map(|hash| format!("https://i.scdn.co/image/ab67616d000082c1{hash}"));
+    let larger = |bytes: &Vec<u8>| PictureInformation::from_jpeg(bytes).is_ok_and(|info| info.width > 640);
+    original.and_then(|original| http(&original, &[], None).ok().filter(larger)).or_else(|| http(url, &[], None).ok())
+}
+
 /// The images that `--folder-art` puts next to the songs, which music servers (Navidrome, Jellyfin) show:
 /// `cover.jpg` in the song's folder, and the album artist's Spotify picture as `artist.jpg` in the artist's
 /// folder.
@@ -1156,7 +1166,7 @@ fn folder_images(file: &Path, s: &Song) -> Vec<(PathBuf, Option<String>)> {
 fn write_folder_art(file: &Path, s: &Song) -> R<()> {
     for (image, url) in folder_images(file, s) {
         let url = url.or_else(|| spotify::artist_image(&s.artist_id));
-        let Some(bytes) = url.and_then(|url| http(&url, &[], None).ok()) else { continue };
+        let Some(bytes) = url.and_then(|url| art(&url)) else { continue };
         // Songs of one album are written at the same time: each writes its own part file and renames it.
         let part = image.with_extension(format!("{}.part", file.file_stem().unwrap_or_default().to_string_lossy()));
         fs::write(&part, bytes)?;
@@ -1736,7 +1746,7 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, compilation, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider,
+        among, art, compilation, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider,
         rate_args, redownload_jobs, reference, same_lyrics, template_path, unlisted, Relaxed, Song, GENIUS_BLOCKED,
         LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
@@ -1750,6 +1760,14 @@ mod tests {
         "[00:05.86]After everything said, huh, man, man\n[00:12.00]After everything said, huh\n\
         [00:18.27]\"Crazy, bipolar, antisemite\"\n[00:23.04]And I'm still the king\n\
         [00:31.56]They thought headlines was my kryptonite\n[00:36.14]Still the king";
+
+    /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
+    #[test]
+    fn album_covers_are_taken_in_their_original_size() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let cover = art("https://i.scdn.co/image/ab67616d0000b273b694e89ba937dd2631ff584c").unwrap();
+        assert_eq!(lofty::picture::PictureInformation::from_jpeg(&cover).unwrap().width, 1500);
+    }
 
     /// Spotify's compilations of one artist's songs were flagged as compilations, which players file under Various
     /// Artists, out of the artist's discography.
