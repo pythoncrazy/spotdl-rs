@@ -341,6 +341,14 @@ fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
     found.into_iter().map(|(_, _, lyrics)| lyrics).filter(|lyrics| seen.insert(lyrics.clone())).collect()
 }
 
+/// The first of LRCLIB's lyrics that `agrees`, synced ones first: [`lrclib`] puts the song's album first, for the
+/// aligner, and that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while
+/// others as long as the song are synced.
+fn synced_first(found: Vec<String>, agrees: impl Fn(&String) -> bool) -> Option<String> {
+    let at = found.iter().position(|lyrics| is_synced(lyrics) && agrees(lyrics));
+    at.or_else(|| found.iter().position(&agrees)).map(|at| found[at].clone())
+}
+
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
 /// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"), or nothing when
 /// Genius could not be asked.
@@ -596,7 +604,7 @@ fn provider(name: &str, song: &Song) -> Option<String> {
             let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
             let agrees =
                 |lyrics: &String| checks.as_ref().is_none_or(|by| !lyrics.is_empty() && same_lyrics(lyrics, by));
-            return lrclib(song, true).into_iter().find(agrees).map(|lyrics| lyrics.trim().to_string());
+            return synced_first(lrclib(song, true), agrees).map(|lyrics| lyrics.trim().to_string());
         }
         // A page without words is the song's answer that it has none, or else another song's.
         "genius" => {
@@ -1757,9 +1765,9 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        among, art, compilation, folder_images, genius_account, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path,
-        path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, template_path, unlisted,
-        write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        among, art, compilation, folder_images, genius_account, is_synced, lrclib_lyrics, lrclib_search, lrclib_tracks,
+        out_path, path, provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first,
+        template_path, unlisted, write_tags, Relaxed, Song, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -1870,6 +1878,29 @@ mod tests {
         let mixed = [track(582.0, true, ""), track(580.0, false, "Some words")];
         assert_eq!(lrclib_lyrics(&song, &mixed), vec!["Some words".to_string()]);
         assert!(lrclib_lyrics(&song, &[track(300.0, true, "")]).is_empty());
+    }
+
+    /// The `synced` provider takes LRCLIB's synced lyrics before the song's album's plain ones, which [`lrclib`]
+    /// lists first: Franz Ferdinand's "Lucid Dreams" on Hits To The Head got plain lyrics in its tags.
+    #[test]
+    fn synced_provider_takes_synced_lyrics_first() {
+        use serde_json::json;
+        let song = Song {
+            name: "Lucid Dreams".into(),
+            album_name: "Hits To The Head".into(),
+            duration: 224.0,
+            ..Song::default()
+        };
+        let track = |album: &str, key: &str, text: &str| json!({"albumName": album, "duration": 224.0, key: text});
+        let tracks = [
+            track("Tonight: Franz Ferdinand", "syncedLyrics", "[00:12.00] Lucid dreams"),
+            track("Hits To The Head", "plainLyrics", "Lucid dreams"),
+        ];
+        let found = lrclib_lyrics(&song, &tracks);
+        assert_eq!(found[0], "Lucid dreams");
+        assert_eq!(synced_first(found.clone(), |_| true).as_deref(), Some("[00:12.00] Lucid dreams"));
+        // Plain lyrics are taken when no synced ones agree.
+        assert_eq!(synced_first(found, |lyrics| !is_synced(lyrics)).as_deref(), Some("Lucid dreams"));
     }
 
     /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while:
