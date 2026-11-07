@@ -290,10 +290,14 @@ fn score(s: &Song, h: &Hit) -> f64 {
     };
     // A long shared note (" - Live At The BBC For "Pop Go The Beatles" / 23rd July, 1963") lifted the name ratio of
     // another song ("And Here We Are Again" for "Lower 5E"): the title before such a note must be in the result's.
-    let title = slug(s.name.split(" - ").next().unwrap_or_default(), "-");
+    // Featured artists are left out on both sides: YouTube Music writes "Hustler's Story [Instrumental] (feat. Akon,
+    // Big Gee & Scarface)" for "Hustler's Story (feat. Scarface, Akon & Big Gee) - Instrumental". An ISRC hit has
+    // the song's title and length already.
+    let title = clean_name(s.name.split(" - ").next().unwrap_or_default(), &s.artists);
     let parts = hit.name.split(" - ").flat_map(|part| part.split(['(', ')', '[', ']']));
-    let titled = !versionless_name.contains(" - ")
-        || format!("-{rname}-").contains(&format!("-{title}-"))
+    let titled = isrc
+        || !versionless_name.contains(" - ")
+        || format!("-{}-", clean_name(&hit.name, &s.artists)).contains(&format!("-{title}-"))
         || parts.map(|part| ratio(&title, &slug(part, "-"))).any(|r| r > 60.0);
     let time = (-0.1 * gap).exp() * 100.0;
     let avg = (artists + name) / 2.0;
@@ -567,6 +571,25 @@ mod tests {
         let lower = track(&note("Lower 5E", "10th September"), &["Rodney Burke", "Paul McCartney"], "On Air", 23.3);
         assert!(score(&lower, &hit("Lower 5E", "10th September", &["Paul McCartney"], 24.0)) > 0.0);
         assert_eq!(score(&lower, &hit("And Here We Are Again", "23rd July", &["Rodney Burke"], 16.0)), 0.0);
+        // A title with featured artists before its version note keeps its official track, from the ISRC search or
+        // from the text search, where YouTube Music writes the version in brackets and orders the features otherwise.
+        let story = track(
+            "Hustler's Story (feat. Scarface, Akon & Big Gee) - Instrumental",
+            &["The Notorious B.I.G.", "Scarface", "Akon", "Big Gee"],
+            "Duets: The Final Chapter (20th Anniversary Edition)",
+            249.0,
+        );
+        let atv = |isrc| {
+            let name = "Hustler's Story [Instrumental] (feat. Akon, Big Gee & Scarface)";
+            result(name, &["The Notorious B.I.G."], "Duets: The Final Chapter", 249.2, isrc)
+        };
+        assert!(score(&story, &atv(true)) > 0.0);
+        assert!(score(&story, &atv(false)) > 0.0);
+        let praise =
+            track("Praise The Lord (Da Shine) (feat. Skepta) - Durdenhauer Edit", &["A$AP Rocky", "Skepta"], "", 200.0);
+        let edit =
+            result("Praise The Lord (Da Shine) [Durdenhauer Edit] (feat. Skepta)", &["A$AP Rocky"], "", 200.0, false);
+        assert!(score(&praise, &edit) > 0.0);
     }
 
     #[test]
