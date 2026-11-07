@@ -12,7 +12,7 @@ spotdl url "Daft Punk - Get Lucky"
 spotdl meta ~/Music
 ```
 
-Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an action. A query is a Spotify URL or URI, a `.spotdl` file, a YouTube, YouTube Music or SoundCloud URL, or search text (`album:`, `playlist:` and `artist:` pick the result type). Use `youtube-url|spotify-url` to pin the video for a song; a pinned video wins over the search, also when the song appears in another query. An artist link gets every release on the artist page. Each song is downloaded once, from the first album that has it; reissues and singles add only new songs.
+Use `download`, `save`, `sync`, `url`, or `meta` before a query to select an action. A query is a Spotify URL or URI, a `.spotdl` file, a YouTube, YouTube Music or SoundCloud URL, or search text (`album:`, `playlist:` and `artist:` pick the result type). Use `youtube-url|spotify-url` to pin the video for a song; a pinned video wins over the search, also when the song appears in another query. An artist link gets every release on the artist page. Albums and EPs are downloaded whole, also songs that another album or EP has; singles and compilations add only songs that no album or EP has. A bigger edition of an album (deluxe, super deluxe) that has at least 90% of a smaller edition's songs replaces the smaller edition; an edition's title is the album's title or starts with it ("OK Computer OKNOTOK 1997 2017").
 
 In `--output`, `{disc-track-number}` is the track number (`07`), with the disc in front on albums that have more than one disc (`2-07`).
 
