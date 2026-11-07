@@ -1,7 +1,7 @@
 use crate::{http, http_retrying, list, log, number, on, search, spotify, text, url_encode, Pace, Song, R};
 use lofty::{
     config::WriteOptions,
-    picture::{MimeType, Picture, PictureType},
+    picture::{MimeType, Picture, PictureInformation, PictureType},
     prelude::*,
     tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
 };
@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
         Condvar, Mutex, OnceLock, PoisonError,
     },
 };
@@ -25,8 +25,15 @@ const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
 
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+/// The files `sync` moved to a new path, whose tags are written again.
+static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
+/// The files `meta --redownload` downloads again, by song URL.
+static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static LRCLIB: Pace = Pace::new(750);
 static GENIUS: Pace = Pace::new(500);
+/// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
+static AZLYRICS: Pace = Pace::new(1500);
+static MUSIXMATCH: Pace = Pace::new(1500);
 static ALIGNING: Mutex<usize> = Mutex::new(0);
 static ALIGNED: Condvar = Condvar::new();
 
@@ -97,15 +104,25 @@ pub fn fill(template: &str, s: &Song) -> String {
     })
 }
 
-/// The output file: each template part filled, made path-safe and cut to `max_filename_length` (and 200 bytes).
+/// The output file for the `--output` template.
 pub fn path(s: &Song) -> PathBuf {
-    let template = match text("output").unwrap_or_default() {
+    template_path(text("output").unwrap_or_default(), s)
+}
+
+/// The output file: each template part with a `{field}` filled, made path-safe and cut to `max_filename_length` (and
+/// 200 bytes). Parts without a field are the user's own folders (`..`, `My Music: 50% Off`) and stay as written, so
+/// files land where `--output` says and `--scan-for-songs`, which looks there, finds them.
+fn template_path(output: &str, s: &Song) -> PathBuf {
+    let template = match output {
         "" => "{artists} - {title}".into(),
         output if output.contains('{') => output.to_string(),
         dir => format!("{dir}/{{artists}} - {{title}}"),
     };
     let max = crate::number("max_filename_length");
     let part = |part: &str| {
+        if !part.contains('{') {
+            return part.to_string();
+        }
         let value = fill(part, s);
         let value = match text("restrict") {
             Some("strict") => search::slug(&value, "_"),
@@ -116,6 +133,8 @@ pub fn path(s: &Song) -> PathBuf {
         if value == "." || value == ".." {
             return "_".into();
         }
+        // A name with one leading dot is hidden, and Navidrome's scanner skips it (`...And Justice for All` is not).
+        let value = if value.starts_with('.') && !value.starts_with("..") { format!("_{value}") } else { value };
         let mut part = String::new();
         for c in value.chars().take(if max == 0 { usize::MAX } else { max as usize }) {
             if part.len() + c.len_utf8() > 200 {
@@ -129,6 +148,12 @@ pub fn path(s: &Song) -> PathBuf {
     let mut out = Path::new(if template.starts_with('/') { "/" } else { "" }).join(parts.collect::<PathBuf>());
     out.as_mut_os_string().push(format!(".{}", text("format").unwrap_or("opus")));
     out
+}
+
+/// The fixed folder of the output template, the part before its first `{field}`.
+fn output_root() -> PathBuf {
+    let output = Path::new(text("output").unwrap_or_default());
+    output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect()
 }
 
 fn skip_path(file: &Path) -> PathBuf {
@@ -150,7 +175,7 @@ fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
         let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if path.is_dir() {
             audio_files(&path, files);
-        } else if AUDIO.contains(&extension.as_str()) {
+        } else if AUDIO.contains(&extension.as_str()) && !temp_file(&path) {
             files.push(path);
         }
     }
@@ -176,7 +201,44 @@ fn html(page: &str, start: &str, end: &str) -> Option<String> {
             out.extend(text.chars().filter(|c| !matches!(c, '\n' | '\r')));
         }
     }
-    Some(out.replace("&#x27;", "'").replace("&quot;", "\"").replace("&amp;", "&"))
+    Some(entities(&out))
+}
+
+/// `text` with HTML entities decoded in one pass, so an escaped entity ("&amp;lt;") stays text ("&lt;"). Genius
+/// escapes `<`, `>`, `&`, `"` and `'`; azlyrics also uses `&#39;`-style numbers and `&nbsp;`.
+fn entities(text: &str) -> String {
+    let (mut out, mut rest) = (String::with_capacity(text.len()), text);
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let entity = rest.split_once(';').filter(|(name, _)| name.len() <= 8).and_then(|(name, after)| {
+            let char = match name {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                // A plain space: a no-break space in a tag looks the same but breaks word matching and search.
+                "nbsp" => ' ',
+                _ => {
+                    let number = name.strip_prefix('#')?;
+                    let code = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => number.parse().ok()?,
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((char, after))
+        });
+        if let Some((char, after)) = entity {
+            out.push(char);
+            rest = after;
+        } else {
+            out.push('&');
+        }
+    }
+    out + rest
 }
 
 /// Genius lyrics: the text of each `data-lyrics-container` div. The page puts song lists ("You might also
@@ -210,68 +272,104 @@ fn plain_title(title: &str) -> String {
     search::slug(&title[..end], "")
 }
 
-/// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones.
 /// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy, so that a busy moment does not
 /// replace synced lyrics with plain ones, all threads wait and then try again: long after 429 (too many requests
-/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests).
+/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests). Only this loop
+/// retries: [`http`]'s own retries would ask again within seconds, unpaced and during a hold, and keep the limit on.
 fn lrclib_search(url: &str) -> Option<Vec<Value>> {
-    let mut body = None;
     for attempt in 0..12 {
         LRCLIB.wait();
-        match http(url, &[], None) {
-            Ok(bytes) => {
-                body = String::from_utf8(bytes).ok();
-                break;
-            }
+        match http_retrying(url, &[], None, 0) {
+            Ok(bytes) => return serde_json::from_slice(&bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
                 LRCLIB.hold(std::time::Duration::from_secs(15 << attempt.min(3)));
             }
             Err(error) if error.to_string().contains("HTTP 503") => {
                 LRCLIB.hold(std::time::Duration::from_secs(2 + 2 * attempt.min(10)));
             }
+            // A timeout, a lost connection or another server error passes; a refused request does not.
+            Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
+                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
+            }
             Err(error) => {
                 log("WARNING", &format!("LRCLIB: {error}"));
-                break;
+                return None;
             }
         }
     }
-    body.and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
+    log("WARNING", &format!("LRCLIB: still too many requests for {url}"));
+    None
 }
 
-fn lrclib(song: &Song) -> Vec<String> {
+/// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones; `""` when
+/// LRCLIB says that the song is an instrumental. `keep`: the `.lrc` writer will search again (see [`lrclib_tracks`]).
+fn lrclib(song: &Song, keep: bool) -> Vec<String> {
     // LRCLIB files a song under one of its artists ("KING" of ¥$ is under Kanye West).
     let mut artists = vec![&song.artist];
     artists.extend(song.artists.iter().filter(|artist| **artist != song.artist));
     artists
         .into_iter()
         .filter(|artist| !artist.is_empty())
-        .map(|artist| lrclib_by(song, artist))
+        .map(|artist| lrclib_by(song, artist, keep))
         .find(|found| !found.is_empty())
         .unwrap_or_default()
 }
 
-fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
+fn lrclib_by(song: &Song, artist: &str, keep: bool) -> Vec<String> {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         url_encode(artist),
         url_encode(lyrics_title(song))
     );
-    // The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often busy, so it is asked once
-    // and the second search takes the results (they are then not kept: a library has many songs).
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Value>>>> = std::sync::LazyLock::new(Default::default);
-    let found = FOUND.lock().unwrap_or_else(PoisonError::into_inner).remove(&url);
-    let tracks = found.or_else(|| {
-        let tracks = lrclib_search(&url)?;
-        FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(url.clone(), tracks.clone());
-        Some(tracks)
-    });
-    let Some(tracks) = tracks else { return vec![] };
+    let Some(tracks) = lrclib_tracks(&url, keep, lrclib_search) else { return vec![] };
+    lrclib_lyrics(song, &tracks)
+}
+
+/// LRCLIB's search results kept for the `.lrc` writer, by URL, oldest first.
+type Kept = std::collections::VecDeque<(String, Vec<Value>)>;
+static LRCLIB_FOUND: std::sync::LazyLock<Mutex<Kept>> = std::sync::LazyLock::new(Default::default);
+/// A search reply can be over 100 KB; this is room for the songs in progress, not for a library.
+const LRCLIB_KEPT: usize = 256;
+
+/// `search`'s results for a URL. The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often
+/// busy, so it is asked once: the provider keeps its results (`keep`) and the writer takes them. The writer keeps
+/// nothing, since nothing searches after it, and results the writer does not take (no `.lrc` to write) are dropped
+/// when newer ones come: once kept by everyone, they filled gigabytes over a library.
+fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Option<Vec<Value>> {
+    let taken = {
+        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        found.iter().position(|(key, _)| key == url).and_then(|at| found.remove(at)).map(|(_, tracks)| tracks)
+    };
+    if taken.is_some() {
+        return taken;
+    }
+    let tracks = search(url)?;
+    if keep {
+        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        if found.len() >= LRCLIB_KEPT {
+            found.pop_front();
+        }
+        found.push_back((url.to_string(), tracks.clone()));
+    }
+    Some(tracks)
+}
+
+/// [`lrclib_by`]'s lyrics of LRCLIB's search results. When every version as long as the song is marked
+/// instrumental, LRCLIB answers that the song has no words: that answer is `""`, so that the lyrics providers stop
+/// and do not take another song's words from a site that goes by the title alone.
+fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
+    let near: Vec<&Value> = tracks
+        .iter()
+        .filter(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)
+        .collect();
+    if !near.is_empty() && near.iter().all(|track| track["instrumental"].as_bool() == Some(true)) {
+        return vec![String::new()];
+    }
     let album = plain_title(&song.album_name);
     let text =
         |track: &Value, key: &str| track[key].as_str().filter(|lyrics| !lyrics.trim().is_empty()).map(String::from);
-    let mut found: Vec<(bool, bool, String)> = tracks
-        .iter()
-        .filter(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)
+    let mut found: Vec<(bool, bool, String)> = near
+        .into_iter()
         .filter_map(|track| {
             let other = plain_title(track["albumName"].as_str().unwrap_or_default());
             let same_album =
@@ -285,10 +383,30 @@ fn lrclib_by(song: &Song, artist: &str) -> Vec<String> {
     found.into_iter().map(|(_, _, lyrics)| lyrics).filter(|lyrics| seen.insert(lyrics.clone())).collect()
 }
 
+/// The first of LRCLIB's lyrics that `agrees`, synced ones first: [`lrclib`] puts the song's album first, for the
+/// aligner, and that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while
+/// others as long as the song are synced.
+fn synced_first(found: Vec<String>, agrees: impl Fn(&String) -> bool) -> Option<String> {
+    let at = found.iter().position(|lyrics| is_synced(lyrics) && agrees(lyrics));
+    at.or_else(|| found.iter().position(&agrees)).map(|at| found[at].clone())
+}
+
+/// Whether the `synced` provider takes LRCLIB's `lyrics`: they agree with the Genius lyrics `checks`, or without
+/// those, they are synced (timed to a recording as long as the song) or LRCLIB's word that the song has none (`""`).
+/// Plain lyrics are anyone's text filed under any title: all 7 LRCLIB versions of Lee Fields's "Funky Screw", which
+/// has no Genius page, have the plain words of a Japanese comic song.
+fn lrclib_agrees(lyrics: &str, checks: Option<&String>) -> bool {
+    match checks {
+        Some(by) => !lyrics.is_empty() && same_lyrics(lyrics, by),
+        None => lyrics.is_empty() || is_synced(lyrics),
+    }
+}
+
 /// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
-/// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
-fn genius(song: &Song, artist: &str, max: usize) -> Vec<String> {
-    genius_titled(song, artist, max).into_iter().map(|page| page.lyrics).collect()
+/// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"), or nothing when
+/// Genius could not be asked.
+fn genius(song: &Song, artist: &str, max: usize) -> Option<Vec<String>> {
+    Some(genius_titled(song, artist, max)?.into_iter().map(|page| page.lyrics).collect())
 }
 
 /// A Genius page of lyrics.
@@ -304,39 +422,81 @@ struct Page {
 }
 
 /// Genius's page of the song, only one with the song's title: the check that replaces lyrics must not take
-/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
-fn genius_same(song: &Song, artist: &str) -> Option<Page> {
-    genius_titled(song, artist, 1).into_iter().next().filter(|page| page.titled)
+/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh"). The outer `None`: Genius
+/// could not be asked.
+fn genius_same(song: &Song, artist: &str) -> Option<Option<Page>> {
+    Some(genius_titled(song, artist, 1)?.into_iter().next().filter(|page| page.titled))
 }
 
 /// Whether the page is the song's recording and not another of the artist's songs with that title: Genius dates it
 /// to the release's year or has it on the release's album. Spotify calls Until the End of Time's "When I Get Free
 /// II (Remix)" "When I Get Free", the title of a song from R U Still Down; Genius has that song on R U Still Down
-/// and Euthanasia.
-fn released_on(song: &Song, page: &Page) -> bool {
-    page.same_year || {
-        let url = format!("https://genius.com/api/songs/{}", page.id);
-        let album = plain_title(&song.album_name);
-        let reply = genius_get(&url, &[]).and_then(|reply| serde_json::from_str::<Value>(&reply).ok());
-        let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
-        albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
-            !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
-        })
+/// and Euthanasia. `None` when Genius could not be asked.
+fn released_on(song: &Song, page: &Page) -> Option<bool> {
+    if page.same_year {
+        return Some(true);
+    }
+    let url = format!("https://genius.com/api/songs/{}", page.id);
+    let album = plain_title(&song.album_name);
+    let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok();
+    let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
+    Some(albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
+        !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
+    }))
+}
+
+/// The pages Genius gave for each song and artist. The lyrics provider and the `.lrc` writer both ask; Genius is
+/// paced, so a song's pages are fetched once. A failed request is not kept: the next ask tries again.
+static GENIUS_FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Page>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn genius_key(song: &Song, artist: &str, max: usize) -> String {
+    format!("{artist}\n{}\n{}\n{max}", song.name, song.year)
+}
+
+/// [`genius`]'s pages. `None` (Genius could not be asked) is not "no page": no page lets LRCLIB's lyrics in
+/// unchecked, while a Genius that cannot be asked leaves them for a later run that can check them.
+fn genius_titled(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
+    let key = genius_key(song, artist, max);
+    if let Some(pages) = GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+        return Some(pages.clone());
+    }
+    let pages = genius_pages(song, artist, max)?;
+    GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
+    Some(pages)
+}
+
+/// Genius's website answered 403: it blocks this client, so it is not asked again in this run (asking again would
+/// not be waiting out a limit but working around a block). The lyrics pages are on the website, so without it
+/// Genius cannot be asked at all.
+static GENIUS_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// The API's token is out of requests (the shared docs client has 100 an hour): the website's search is asked.
+static GENIUS_API_SPENT: AtomicBool = AtomicBool::new(false);
+/// The songs whose lyrics were left unchecked because Genius could not be asked, for [`report_unchecked`].
+static UNCHECKED: std::sync::LazyLock<Mutex<HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+fn unchecked(song: &Song) {
+    let mut songs = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner);
+    if songs.is_empty() {
+        log("WARNING", "Genius cannot be asked: LRCLIB lyrics, which it must check, are left for a later run");
+    }
+    songs.insert(format!("{} - {}", song.artist, song.name));
+}
+
+/// Says at the end of a run how many songs got no checked synced lyrics, so that a `meta` run adds them later.
+pub fn report_unchecked() {
+    let count = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner).len();
+    if count > 0 {
+        log("WARNING", &format!("{count} songs without LRCLIB lyrics or .lrc files: Genius could not be asked"));
     }
 }
 
-/// [`genius`]'s pages.
-fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<Page> {
-    // The lyrics provider and the `.lrc` writer both ask; Genius is paced, so a song's pages are fetched once.
-    static FOUND: std::sync::LazyLock<Mutex<HashMap<String, Vec<Page>>>> = std::sync::LazyLock::new(Default::default);
-    let key = format!("{artist}\n{}\n{}\n{max}", song.name, song.year);
-    if let Some(pages) = FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-        return pages.clone();
-    }
-    // A failed request is not kept: the next ask tries again.
-    let Some(pages) = genius_pages(song, artist, max) else { return vec![] };
-    FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
-    pages
+/// Whether the lyrics providers asked Genius, the lyrics authority, for the song and it answered: only then is
+/// "no lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which must not stop
+/// later runs from looking again.
+fn genius_answered(song: &Song) -> bool {
+    list("lyrics_providers").any(|name| name == "genius" || name == "synced")
+        && GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&genius_key(song, &song.artist, 1))
 }
 
 /// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
@@ -344,11 +504,20 @@ fn genius_titled(song: &Song, artist: &str, max: usize) -> Vec<Page> {
 /// and then try again. A timeout or a server error is tried again a few times.
 fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
     for attempt in 0..12 {
+        if GENIUS_BLOCKED.load(Relaxed) {
+            return None;
+        }
         GENIUS.wait();
         match http_retrying(url, headers, None, 0) {
             Ok(bytes) => return String::from_utf8(bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
                 GENIUS.hold(std::time::Duration::from_secs(30 << attempt.min(3)));
+            }
+            Err(error) if error.to_string().contains("HTTP 403") => {
+                if !GENIUS_BLOCKED.swap(true, Relaxed) {
+                    log("WARNING", &format!("Genius: {error}: it is not asked again in this run"));
+                }
+                return None;
             }
             // A timeout, a lost connection or a server error passes; a page that is not there does not.
             Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
@@ -364,18 +533,48 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
     None
 }
 
+/// Whether the artist `name` is one of `names` ("¥$" of "¥$, Kanye West & Ty Dolla $ign"): its slug is a run of
+/// whole words there, however they are spaced ("Lil Wayne", "LilWayne"). As a substring, "¥$" (slug "y") was in
+/// every name with a y, Genius Ukrainian Translations' too, and "Nas" in Jonas Brothers. A slug of a letter or two
+/// could still be another name's word ("Y"), so such a name must also be spelled the same there.
+fn among(name: &str, names: &str) -> bool {
+    let (slug, words) = (search::slug(name, ""), search::slug(names, " "));
+    let words: Vec<&str> = words.split(' ').collect();
+    let run = (0..words.len()).any(|start| {
+        let mut joined = String::new();
+        words[start..].iter().any(|word| {
+            joined.push_str(word);
+            joined == slug
+        })
+    });
+    !slug.is_empty() && run && (slug.len() >= 3 || names.to_lowercase().contains(&name.to_lowercase()))
+}
+
+/// Genius's own accounts ("Genius Ukrainian Translations (Український переклад)", "Genius Romanizations",
+/// "Genius Traducciones al Español") post translations of other artists' songs, never the songs' own lyrics.
+fn genius_account(primary: &str, artist: &str) -> bool {
+    primary.starts_with("Genius ") && !among(primary, artist)
+}
+
 /// The pages, or nothing when Genius could not be asked.
 fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
+    if GENIUS_BLOCKED.load(Relaxed) {
+        return None;
+    }
     let title = lyrics_title(song);
     let query = url_encode(&format!("{artist} {title}"));
     // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
     // which is asked when the API cannot answer (a token that many people use is often out of requests).
-    let auth = text("genius_token").filter(|token| !token.is_empty()).map(|token| format!("Bearer {token}"));
-    let from_api = auth.and_then(|auth| {
+    // A token out of requests stays so for the hour: it is not asked again in this run.
+    let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
+    let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
         GENIUS.wait();
         let url = format!("https://api.genius.com/search?q={query}");
-        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0).ok()?;
-        serde_json::from_slice::<Value>(&reply).ok()?["response"]["hits"].as_array().cloned()
+        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
+        if reply.as_ref().is_err_and(|error| error.to_string().contains("HTTP 429")) {
+            GENIUS_API_SPENT.store(true, Relaxed);
+        }
+        serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
     });
     let mut hits = match from_api {
         Some(hits) => hits,
@@ -385,15 +584,17 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
             reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default()
         }
     };
-    let (artist, song_title) = (search::slug(artist, ""), plain_title(title));
+    let song_title = plain_title(title);
+    fn primary(hit: &Value) -> &str {
+        hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default()
+    }
     // The same artist and the same title: the artist's first hit can be another of the artist's songs. The
     // artist may be one of several on the page ("¥$, Kanye West & Ty Dolla $ign").
     let same = |hit: &&Value| {
-        let artists = search::slug(hit["result"]["artist_names"].as_str().unwrap_or_default(), "");
-        let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
+        let artists = hit["result"]["artist_names"].as_str().unwrap_or_default();
         let hit_title = plain_title(hit["result"]["title"].as_str().unwrap_or_default());
-        !artist.is_empty()
-            && (artists.contains(&artist) || (!primary.is_empty() && artist.contains(&primary)))
+        (among(artist, artists) || among(primary(hit), artist))
+            && !genius_account(primary(hit), artist)
             && !hit_title.is_empty()
             && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
     };
@@ -407,8 +608,10 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     fn hit_title(hit: &Value) -> &str {
         hit["result"]["title"].as_str().unwrap_or_default()
     }
-    let whole_title = search::clean_name(search::versionless(&song.name), &song.artists);
-    let whole = |hit: &Value| search::clean_name(hit_title(hit), &song.artists) == whole_title;
+    // Artists' names are taken out of titles, but not names of a letter or two: "¥$" would take out every "y".
+    let artists: Vec<String> = song.artists.iter().filter(|a| search::slug(a, "").len() >= 3).cloned().collect();
+    let whole_title = search::clean_name(search::versionless(&song.name), &artists);
+    let whole = |hit: &Value| search::clean_name(hit_title(hit), &artists) == whole_title;
     // A question or exclamation mark tells two titles apart where the words are the same ("In the Flesh?").
     let marks = |title: &str| -> String {
         let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
@@ -416,10 +619,7 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     };
     let song_marks = marks(search::versionless(&song.name));
     let titled = |hit: &Value| whole(hit) && marks(hit_title(hit)) == song_marks;
-    let own = |hit: &Value| {
-        let primary = search::slug(hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default(), "");
-        !primary.is_empty() && artist.contains(&primary)
-    };
+    let own = |hit: &Value| among(primary(hit), artist);
     let exact = |hit: &Value| plain_title(hit_title(hit)) == song_title;
     hits.sort_by_key(|hit| {
         (!titled(hit), !whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
@@ -428,10 +628,37 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     let mut pages = vec![];
     for hit in hits.iter().take(max) {
         let (Some(url), Some(id)) = (hit["result"]["url"].as_str(), hit["result"]["id"].as_u64()) else { continue };
-        let Some(lyrics) = genius_lyrics(&genius_get(url, &[])?) else { continue };
+        // An instrumental's page has no lyrics blocks, only "This song is an instrumental", and the API says so too.
+        let page = genius_get(url, &[])?;
+        let said =
+            hit["result"]["instrumental"].as_bool() == Some(true) || page.contains("This song is an instrumental");
+        let Some(lyrics) = genius_lyrics(&page).or_else(|| said.then(|| "[Instrumental]".into())) else { continue };
         pages.push(Page { lyrics, id, titled: titled(hit), same_year: same_year(hit) });
     }
     Some(pages)
+}
+
+/// azlyrics answered with its "request for access" page (a redirect to b.azlyrics.com, with status 200) instead of
+/// lyrics: it takes this client for a bot, so it is not asked again in this run (asking again would be working
+/// around the check). Without this, every song found "no lyrics" there and nothing said why.
+static AZLYRICS_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// An azlyrics page came without the marker before its lyrics: its layout changed, which is said once.
+static AZLYRICS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// The lyrics on an azlyrics page, or nothing (and a warning, once) for its access check or a page it no longer
+/// lays out as expected.
+fn azlyrics(page: &str) -> Option<String> {
+    if page.contains("AZLyrics - request for access") {
+        if !AZLYRICS_BLOCKED.swap(true, Relaxed) {
+            log("WARNING", "azlyrics asks for access (a bot check): it is not asked again in this run");
+        }
+        return None;
+    }
+    let lyrics = html(page, "<!-- Usage of azlyrics.com", "</div>");
+    if lyrics.is_none() && !AZLYRICS_CHANGED.swap(true, Relaxed) {
+        log("WARNING", "azlyrics: a page without its lyrics marker; its layout may have changed");
+    }
+    lyrics
 }
 
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
@@ -439,20 +666,43 @@ fn provider(name: &str, song: &Song) -> Option<String> {
     let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let (artist, title) = (&song.artist, lyrics_title(song));
     let lyrics = match name {
+        // LRCLIB's lyrics are checked against Genius's; without an answer from Genius, they are left for a later run.
+        // LRCLIB's word that the song is an instrumental (`""`) counts only when Genius has no words to check it by.
         "synced" => {
-            let words = genius(song, artist, 1).into_iter().next();
-            lrclib(song).into_iter().find(|lyrics| words.as_ref().is_none_or(|words| same_lyrics(lyrics, words)))?
+            let Some(pages) = genius_titled(song, artist, 1) else {
+                unchecked(song);
+                return None;
+            };
+            let page = pages.into_iter().next();
+            if page.as_ref().is_some_and(|page| instrumental(song, page)) {
+                return Some(String::new());
+            }
+            let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
+            let agrees = |lyrics: &String| lrclib_agrees(lyrics, checks.as_ref());
+            return synced_first(lrclib(song, true), agrees).map(|lyrics| lyrics.trim().to_string());
         }
-        "genius" => genius(song, artist, 1).into_iter().next()?,
+        // A page without words is the song's answer that it has none, or else another song's.
+        "genius" => {
+            let page = genius_titled(song, artist, 1)?.into_iter().next()?;
+            if instrumental(song, &page) {
+                return Some(String::new());
+            }
+            Some(page.lyrics).filter(|lyrics| !words(lyrics).is_empty())?
+        }
         "azlyrics" => {
             let url = format!(
                 "https://www.azlyrics.com/lyrics/{}/{}.html",
                 search::slug(artist, ""),
                 search::slug(title, "")
             );
-            html(&get(&url, &[])?, "<!-- Usage of azlyrics.com", "</div>")?
+            if AZLYRICS_BLOCKED.load(Relaxed) {
+                return None;
+            }
+            AZLYRICS.wait();
+            azlyrics(&get(&url, &[])?)?
         }
         _ => {
+            MUSIXMATCH.wait();
             let url =
                 format!("https://www.musixmatch.com/lyrics/{}/{}", search::slug(artist, "-"), search::slug(title, "-"));
             let body = get(&url, &[])?.split_once("\"body\":")?.1.to_string();
@@ -462,8 +712,16 @@ fn provider(name: &str, song: &Song) -> Option<String> {
     Some(lyrics.trim().to_string()).filter(|lyrics| !lyrics.is_empty())
 }
 
+/// The lyrics of the first provider that has them. `Some(None)`: a provider found that the song has no words (an
+/// instrumental), so the providers after it, which go by the title alone, are not asked: azlyrics would give
+/// "Interstellar Overdrive" the words of another Pink Floyd song.
+fn found_lyrics(song: &Song) -> Option<Option<String>> {
+    let found = list("lyrics_providers").find_map(|name| provider(name, song))?;
+    Some(Some(found).filter(|lyrics| !lyrics.is_empty()))
+}
+
 fn find_lyrics(song: &Song) -> Option<String> {
-    list("lyrics_providers").find_map(|name| provider(name, song))
+    found_lyrics(song).flatten()
 }
 
 /// Whether the lyrics have `[mm:ss` timestamps.
@@ -492,36 +750,83 @@ fn plain_lyrics(lyrics: &str) -> String {
 /// and at most 8% with another song.
 fn same_lyrics(a: &str, b: &str) -> bool {
     let pairs = |lyrics: &str| -> HashSet<(String, String)> {
-        let words: Vec<String> = plain_lyrics(lyrics)
-            .lines()
-            .filter(|line| !(line.trim_start().starts_with('[') && line.trim_end().ends_with(']')))
-            .flat_map(|line| {
-                line.to_lowercase()
-                    .replace(['\'', '’'], "")
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|word| !word.is_empty())
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        words.windows(2).map(|pair| (pair[0].clone(), pair[1].clone())).collect()
+        words(lyrics).windows(2).map(|pair| (pair[0].clone(), pair[1].clone())).collect()
     };
     let (a, b) = (pairs(a), pairs(b));
-    let shorter = a.len().min(b.len());
-    // A few words cannot tell: an instrumental's "[Instrumental]", or a backing track's count-in that one site writes
-    // "1,2,3,4 (instrumental)" and another, with the studio talk, "One, two, three, four".
-    shorter < 20 || a.intersection(&b).count() * 10 >= shorter * 3
+    let (shorter, longer) = (a.len().min(b.len()), a.len().max(b.len()));
+    // A few words cannot tell: a backing track's count-in that one site writes "1,2,3,4 (instrumental)" and another,
+    // with the studio talk, "One, two, three, four", or two instrumentals' "[Instrumental]". No words against a
+    // song's words can: an instrumental's "[Instrumental]" is not "See-Saw"'s lyrics under "Interstellar Overdrive".
+    match shorter {
+        0 => longer < 20,
+        1..20 => true,
+        _ => a.intersection(&b).count() * 10 >= shorter * 3,
+    }
+}
+
+/// The lowercase words of the lyrics, without timestamps and section names ("[Chorus]").
+fn words(lyrics: &str) -> Vec<String> {
+    plain_lyrics(lyrics)
+        .lines()
+        .filter(|line| !(line.trim_start().starts_with('[') && line.trim_end().ends_with(']')))
+        .flat_map(|line| {
+            line.to_lowercase()
+                .replace(['\'', '’'], "")
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Whether Genius's page is the song's own (see [`genius_same`] and [`released_on`]) and has no words, only
+/// section names ("[Instrumental]"): the song is an instrumental. A page of another song with a like title
+/// ("Bohemian Rhapsody (Instrumental)") says nothing about the song.
+fn instrumental(song: &Song, page: &Page) -> bool {
+    page.titled && words(&page.lyrics).is_empty() && released_on(song, page) == Some(true)
+}
+
+/// Lyrics without the "You might also like" song list that Genius puts between its lyrics blocks, which earlier
+/// scrapes of its pages glued into the text ("I love youYou might also like[Chorus]"). One followed by a space is
+/// a line of lyrics ("You might also like me").
+fn unlisted(lyrics: &str) -> String {
+    const LIST: &str = "You might also like";
+    let (mut out, mut rest) = (String::new(), lyrics);
+    while let Some((before, after)) = rest.split_once(LIST) {
+        out.push_str(before);
+        if after.starts_with(' ') {
+            out.push_str(LIST);
+        } else if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// The words that the song's lyrics must have: its own plain lyrics (from the first lyrics provider that had
 /// them; Genius by default), or else its Genius page. Genius has a page for each song, with the artists and the
 /// release date; LRCLIB is a crowd's uploads and has, for example, "KING" from VULTURES 1 under BULLY's "KING".
-fn reference(song: &Song, own: Option<&String>) -> Option<String> {
-    own.filter(|lyrics| !is_synced(lyrics)).cloned().or_else(|| {
-        let artists = song.artists.iter().chain([&song.artist]);
-        let mut pages = artists.filter(|artist| !artist.is_empty()).filter_map(|artist| genius_same(song, artist));
-        pages.find(|page| released_on(song, page)).map(|page| page.lyrics)
-    })
+/// `Some(None)`: Genius has no such page. `None`: Genius could not be asked, so nothing can be checked.
+fn reference(song: &Song, own: Option<&String>) -> Option<Option<String>> {
+    if let Some(own) = own.filter(|lyrics| !is_synced(lyrics)) {
+        return Some(Some(own.clone()));
+    }
+    let mut asked = true;
+    for artist in song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty()) {
+        let Some(page) = genius_same(song, artist) else {
+            asked = false;
+            continue;
+        };
+        match page.map(|page| (released_on(song, &page), page)) {
+            Some((Some(true), page)) => return Some(Some(page.lyrics)),
+            Some((None, _)) => asked = false,
+            _ => {}
+        }
+    }
+    asked.then_some(None)
 }
 
 /// What the `lyrics_aligner` command made of the lyrics.
@@ -592,13 +897,17 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     // recording as long as the file and their words are the song's (see `reference`): the song's own, the old
     // `.lrc`, or LRCLIB's.
     // Without such lyrics, an old `.lrc` with the words of another song is removed.
+    // Without an answer from Genius, nothing can be checked: no `.lrc` is written and none is removed.
     let checked = |own: Option<String>| -> R<bool> {
-        let reference = reference(song, own.as_ref());
+        let Some(reference) = reference(song, own.as_ref()) else {
+            unchecked(song);
+            return Ok(true);
+        };
         let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
         // The old `.lrc` goes before LRCLIB, which is often busy.
         let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
         let old = fs::read_to_string(&sidecar).ok().filter(|lyrics| is_synced(lyrics));
-        let found = std::iter::once_with(|| lrclib(&recording)).flatten().filter(|lyrics| is_synced(lyrics));
+        let found = std::iter::once_with(|| lrclib(&recording, false)).flatten().filter(|lyrics| is_synced(lyrics));
         if let Some(lrc) = own_synced.into_iter().chain(old).chain(found).find(agrees) {
             fs::write(&sidecar, lrc)?;
         } else if replace && fs::read_to_string(&sidecar).is_ok_and(|old| !agrees(&old)) {
@@ -620,12 +929,12 @@ fn write_lrc(file: &Path, song: &Song) -> R<bool> {
     let sources: [Box<dyn FnOnce() -> Vec<String> + '_>; 5] = [
         Box::new(|| old.into_iter().collect()),
         Box::new(|| own_synced),
-        Box::new(|| lrclib(&recording)),
+        Box::new(|| lrclib(&recording, false).into_iter().filter(|lyrics| !lyrics.is_empty()).collect()),
         Box::new(|| own_plain),
         Box::new(|| {
             let artists = song.artists.iter().chain([&song.artist]);
             if song.song_id.is_empty() {
-                artists.flat_map(|artist| genius(song, artist, 4)).collect()
+                artists.filter_map(|artist| genius(song, artist, 4)).flatten().collect()
             } else {
                 vec![]
             }
@@ -664,6 +973,32 @@ fn url_key(format: TagType) -> ItemKey {
     }
 }
 
+/// The key that says the lyrics providers found no lyrics for the song, so that `meta` does not look for them on
+/// every run. It is not the lyrics key, which music servers would show as lyrics.
+fn no_lyrics_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::Mp4Ilst => ItemKey::Unknown("----:spotdl:NOLYRICS".into()),
+        _ => ItemKey::Unknown("SPOTDL_NOLYRICS".into()),
+    }
+}
+
+/// Writes only the lyrics into the tags, or without them (none found, or an instrumental's removed), the key that
+/// says that none were found.
+fn write_lyrics(file: &Path, lyrics: Option<String>) -> R<()> {
+    let mut audio = lofty::read_from_path(file)?;
+    let tag = audio.primary_tag_mut().ok_or("no tags")?;
+    let marker = no_lyrics_key(tag.tag_type());
+    tag.retain(|item| item.key() != &marker);
+    match lyrics {
+        Some(lyrics) => drop(tag.insert_text(ItemKey::Lyrics, lyrics)),
+        None => {
+            tag.remove_key(&ItemKey::Lyrics);
+            tag.push_unchecked(TagItem::new(marker, ItemValue::Text("1".into())));
+        }
+    }
+    Ok(audio.save_to_path(file, WriteOptions::default())?)
+}
+
 /// The Spotify URL of a tagged file, also from the `WWWAUDIOFILE` keys that earlier spotdl-rs versions wrote.
 fn source_url(tag: &Tag) -> Option<String> {
     let names = ["WOAS", "----:spotdl:WOAS", "WWWAUDIOFILE", "----:com.apple.iTunes:WWWAUDIOFILE"];
@@ -678,15 +1013,17 @@ fn source_url(tag: &Tag) -> Option<String> {
 
 /// The ReplayGain 2.0 reference loudness, in LUFS.
 const RG_REFERENCE: f64 = -18.0;
+/// Deezer's gain reads about 0.4 dB below the EBU R128 loudness FFmpeg measures for the same audio (deemix writes
+/// -(gain + 18.4) too), so gains from it at -18 played 0.4 dB louder than measured ones.
+const DEEZER_REFERENCE: f64 = RG_REFERENCE - 0.4;
 
 /// The EBU R128 integrated loudness (LUFS) and true peak (linear) of a file, measured by FFmpeg.
 fn loudness(file: &Path) -> Option<(f64, f64)> {
-    let output = Command::new(text("ffmpeg").unwrap_or("ffmpeg"))
-        .args(["-nostats", "-hide_banner", "-i"])
-        .arg(file)
-        .args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"])
-        .output()
-        .ok()?;
+    let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
+    ffmpeg.args(["-nostats", "-hide_banner", "-i"]).arg(file);
+    ffmpeg.args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"]);
+    // Without FFmpeg the gain silently fell back to Deezer's, or none.
+    let output = search::run(&mut ffmpeg).map_err(|error| log("WARNING", &format!("ReplayGain: {error}"))).ok()?;
     let log = String::from_utf8_lossy(&output.stderr);
     let summary = &log[log.rfind("Summary:")?..];
     let value = |label: &str, unit: &str| summary.split_once(label)?.1.split_once(unit)?.0.trim().parse::<f64>().ok();
@@ -699,8 +1036,7 @@ fn loudness(file: &Path) -> Option<(f64, f64)> {
 fn track_gain(file: &Path, s: &Song) -> (String, String) {
     match on("replaygain").then(|| loudness(file)).flatten() {
         Some((lufs, peak)) => (format!("{:.2} dB", RG_REFERENCE - lufs), format!("{peak:.6}")),
-        // Deezer's gain is the track's loudness against 0 dB.
-        None if s.extra.gain != 0.0 => (format!("{:.2} dB", RG_REFERENCE - s.extra.gain), String::new()),
+        None if s.extra.gain != 0.0 => (format!("{:.2} dB", DEEZER_REFERENCE - s.extra.gain), String::new()),
         None => (String::new(), String::new()),
     }
 }
@@ -714,12 +1050,35 @@ fn advisory_key(format: TagType) -> ItemKey {
     }
 }
 
+/// The key of the release type (album, single, EP, compilation): lofty drops a plain `RELEASETYPE` from MP4 files,
+/// which keep only atom names, so there it is Picard's freeform atom, which TagLib (and so Navidrome) reads as
+/// `RELEASETYPE`.
+fn release_type_key(format: TagType) -> ItemKey {
+    match format {
+        TagType::Mp4Ilst => ItemKey::Unknown("----:com.apple.iTunes:MusicBrainz Album Type".into()),
+        _ => ItemKey::Unknown("RELEASETYPE".into()),
+    }
+}
+
+/// The compilation flag marks a Various Artists release, as Picard and iTunes set it, and is the same for every song
+/// of the album. Spotify calls an artist's own anthologies and best-ofs (the 2018 White Album, 2Pac's Greatest Hits)
+/// compilations too: flagged, they are filed under Various Artists by players. `RELEASETYPE` keeps Spotify's word.
+fn compilation(s: &Song) -> bool {
+    s.album_type == "compilation" && s.album_artist.eq_ignore_ascii_case("Various Artists")
+}
+
 fn write_tags(file: &Path, s: &Song) -> R<()> {
     let mut audio = lofty::read_from_path(file)?;
     let format = audio.primary_tag_type();
     let id3 = format == TagType::Id3v2;
+    // spotdl's keys go into the file's own tag, so that the keys of other tools (MusicBrainz IDs, composers,
+    // sort names, album gains) stay.
+    let mut tag = audio.primary_tag().cloned().unwrap_or_else(|| Tag::new(format));
     let (gain, peak) = track_gain(file, s);
-    let mut tag = Tag::new(format);
+    // A measured gain (one with a peak) stays unless it is measured again: Deezer's gain is only an estimate.
+    let measured = tag.get_string(&ItemKey::ReplayGainTrackPeak).is_some_and(|peak| !peak.is_empty());
+    let gain = if peak.is_empty() && measured { String::new() } else { gain };
+    let has_lyrics = s.lyrics.as_deref().is_some_and(|lyrics| !lyrics.is_empty());
     tag.set_title(s.name.clone());
     tag.set_artist(s.artists.join(text("id3_separator").unwrap_or("/")));
     tag.set_album(s.album_name.clone());
@@ -727,7 +1086,9 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
     tag.set_track_total(s.tracks_count);
     tag.set_disk(s.disc_number);
     tag.set_disk_total(s.disc_count);
-    tag.set_comment(s.download_url.clone().unwrap_or_default());
+    if let Some(url) = &s.download_url {
+        tag.set_comment(url.clone());
+    }
     let bpm = match s.extra.bpm {
         0.0 => String::new(),
         bpm if id3 => bpm.round().to_string(),
@@ -744,35 +1105,48 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         (ItemKey::Label, single(s.publisher.clone())),
         (ItemKey::CopyrightMessage, single(s.copyright_text.clone().unwrap_or_default())),
         (ItemKey::Lyrics, single(s.lyrics.clone().unwrap_or_default())),
+        (no_lyrics_key(format), single(if !has_lyrics && genius_answered(s) { "1" } else { "" }.into())),
         (if id3 { ItemKey::IntegerBpm } else { ItemKey::Bpm }, single(bpm)),
         (ItemKey::Barcode, single(s.extra.upc.clone())),
         (ItemKey::ReplayGainTrackGain, single(gain)),
         (ItemKey::ReplayGainTrackPeak, single(peak)),
-        (ItemKey::FlagCompilation, single(if s.album_type == "compilation" { "1".into() } else { String::new() })),
+        (ItemKey::FlagCompilation, single(if compilation(s) { "1" } else { "" }.into())),
         (advisory_key(format), single(if s.explicit { "1" } else { "0" }.into())),
         (ItemKey::TrackArtists, if id3 { single(s.artists.join("\0")) } else { s.artists.clone() }),
         (ItemKey::Genre, s.genres.clone()),
-        (ItemKey::Unknown("RELEASETYPE".into()), single(s.album_type.clone())),
+        (release_type_key(format), single(s.album_type.clone())),
         (url_key(format), single(s.url.clone())),
     ];
-    for (key, value) in
-        items.into_iter().flat_map(|(key, values)| values.into_iter().map(move |value| (key.clone(), value)))
-    {
-        if value.is_empty() {
+    // Other tools may write unknown Vorbis keys in lower case.
+    let same_key = |a: &ItemKey, b: &ItemKey| match (a, b) {
+        (ItemKey::Unknown(a), ItemKey::Unknown(b)) => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    };
+    for (key, values) in items {
+        let values: Vec<String> = values.into_iter().filter(|value| !value.is_empty()).collect();
+        // A value spotdl does not have leaves the file's own, but the compilation flag is spotdl's to clear, and
+        // lyrics clear the key that says none were found.
+        let cleared = key == ItemKey::FlagCompilation || (has_lyrics && key == no_lyrics_key(format));
+        if values.is_empty() && !cleared {
             continue;
         }
-        let url = matches!(key, ItemKey::AudioSourceUrl);
-        let item = TagItem::new(key.clone(), if url { ItemValue::Locator(value) } else { ItemValue::Text(value) });
-        if matches!(key, ItemKey::Unknown(_)) {
-            tag.insert_unchecked(item);
-        } else {
-            tag.push(item);
+        tag.retain(|item| !same_key(item.key(), &key));
+        for value in values {
+            let url = matches!(key, ItemKey::AudioSourceUrl);
+            let item = TagItem::new(key.clone(), if url { ItemValue::Locator(value) } else { ItemValue::Text(value) });
+            if matches!(key, ItemKey::Unknown(_)) {
+                tag.push_unchecked(item);
+            } else {
+                tag.push(item);
+            }
         }
     }
-    let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(|url| http(url, &[], None).ok());
+    let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(art);
     if let Some(cover) = cover {
+        tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, cover));
     }
+    // Tags of other types (a stray ID3v1 tag) go.
     audio.clear();
     if file.extension().is_some_and(|extension| extension == "wav") {
         audio.insert_tag(lofty::iff::wav::RiffInfoList::from(tag.clone()).into());
@@ -789,12 +1163,20 @@ pub fn album_gains(files: &[PathBuf]) {
     if !on("replaygain") {
         return;
     }
-    let dirs: HashSet<&Path> = files.iter().filter_map(|file| file.parent()).collect();
-    dirs.into_par_iter().for_each(|dir| {
+    album_dirs(files).into_par_iter().for_each(|dir| {
         if let Err(error) = album_gain(dir) {
             log("ERROR", &format!("{}: album gain: {error}", dir.display()));
         }
     });
+}
+
+/// The folders of `files`. A bare file name's parent is "", which `read_dir` cannot open, so it counts as ".".
+fn album_dirs(files: &[PathBuf]) -> HashSet<&Path> {
+    files
+        .iter()
+        .filter_map(|file| file.parent())
+        .map(|dir| if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+        .collect()
 }
 
 fn album_gain(dir: &Path) -> R<()> {
@@ -803,7 +1185,7 @@ fn album_gain(dir: &Path) -> R<()> {
     for entry in fs::read_dir(dir)? {
         let file = entry?.path();
         let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !AUDIO.contains(&extension.as_str()) {
+        if !AUDIO.contains(&extension.as_str()) || temp_file(&file) {
             continue;
         }
         let audio = lofty::read_from_path(&file)?;
@@ -865,23 +1247,34 @@ fn artist_folder(file: &Path, s: &Song) -> Option<PathBuf> {
         .then(|| folder.to_path_buf())
 }
 
+/// The image at `url`. Spotify lists album covers (`ab67616d<size><hash>`) at most 640 px wide, but serves the
+/// same cover in its uploaded size (up to 2000 px) with the size `000082c1`; that one is taken when it is a JPEG
+/// wider than 640 px, as old uploads may lack it or be smaller. Artist pictures are taken as listed.
+fn art(url: &str) -> Option<Vec<u8>> {
+    let hash = url.strip_prefix("https://i.scdn.co/image/ab67616d").and_then(|rest| rest.get(8..));
+    let original = hash.map(|hash| format!("https://i.scdn.co/image/ab67616d000082c1{hash}"));
+    let larger = |bytes: &Vec<u8>| PictureInformation::from_jpeg(bytes).is_ok_and(|info| info.width > 640);
+    original.and_then(|original| http(&original, &[], None).ok().filter(larger)).or_else(|| http(url, &[], None).ok())
+}
+
 /// The images that `--folder-art` puts next to the songs, which music servers (Navidrome, Jellyfin) show:
 /// `cover.jpg` in the song's folder, and the album artist's Spotify picture as `artist.jpg` in the artist's
-/// folder.
+/// folder, whose URL (`None`) is looked up only when it is wanted. An album without a cover gets no `cover.jpg`:
+/// the artist's picture there would be shown as the album's cover, and never replaced.
 fn folder_images(file: &Path, s: &Song) -> Vec<(PathBuf, Option<String>)> {
-    if !on("folder_art") {
-        return vec![];
-    }
-    let cover = file.parent().map(|dir| (dir.join("cover.jpg"), s.cover_url.clone()));
+    let cover = file.parent().zip(s.cover_url.clone()).map(|(dir, url)| (dir.join("cover.jpg"), Some(url)));
     let artist =
         artist_folder(file, s).filter(|_| !s.artist_id.is_empty()).map(|folder| (folder.join("artist.jpg"), None));
     cover.into_iter().chain(artist).filter(|(image, _)| !image.exists()).collect()
 }
 
 fn write_folder_art(file: &Path, s: &Song) -> R<()> {
+    if !on("folder_art") {
+        return Ok(());
+    }
     for (image, url) in folder_images(file, s) {
         let url = url.or_else(|| spotify::artist_image(&s.artist_id));
-        let Some(bytes) = url.and_then(|url| http(&url, &[], None).ok()) else { continue };
+        let Some(bytes) = url.and_then(|url| art(&url)) else { continue };
         // Songs of one album are written at the same time: each writes its own part file and renames it.
         let part = image.with_extension(format!("{}.part", file.file_stem().unwrap_or_default().to_string_lossy()));
         fs::write(&part, bytes)?;
@@ -890,25 +1283,32 @@ fn write_folder_art(file: &Path, s: &Song) -> R<()> {
     Ok(())
 }
 
-/// Downloads one video's audio to `out`, converting with FFmpeg unless it is already in the right format.
-fn fetch(url: &str, out: &Path, id: &str) -> R<()> {
+/// Downloads one video's audio next to `out`, converting with FFmpeg unless it is already in the right format;
+/// returns the temporary file, which becomes `out` only once it is tagged.
+fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
     let (format, bitrate) = (text("format").unwrap_or("opus"), text("bitrate").unwrap_or("auto"));
     let selector = match format {
         "m4a" => "bestaudio[ext=m4a]/bestaudio",
         "opus" => "bestaudio[ext=webm]/bestaudio",
         _ => "bestaudio",
     };
+    // yt-dlp makes the template's folder when it writes the file, so a song with no match or no working download
+    // leaves no empty artist and album folders.
     let template = out.with_extension(format!("{id}.%(ext)s"));
-    let got = search::youtube(|| {
+    let (got, abr) = search::youtube(|| {
         let mut command = search::yt_dlp();
         command.args(["-f", selector, "--no-playlist", "--no-warnings", "--force-overwrites", "-q"]);
-        command.args(["--print", "after_move:filepath", "-o"]).arg(&template);
+        // The source's bitrate (`NA` when unknown) is what `--bitrate auto` encodes at.
+        command.args(["--print", "after_move:%(abr)s %(filepath)s", "-o"]).arg(&template);
         if on("sponsor_block") {
             command.args(["--sponsorblock-remove", "all"]);
         }
-        let output = command.arg(url).output().map_err(|error| error.to_string())?;
-        let got = String::from_utf8_lossy(&output.stdout).lines().rev().map(PathBuf::from).find(|path| path.is_file());
-        got.ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()))
+        let output = search::run(command.arg(url))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let got =
+            stdout.lines().rev().filter_map(|line| line.split_once(' ')).find(|(_, path)| Path::new(path).is_file());
+        got.map(|(abr, path)| (PathBuf::from(path), abr.parse::<f64>().ok()))
+            .ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()))
     })?;
     let extension = got.extension().unwrap_or_default().to_string_lossy().to_string();
     let keep = matches!(bitrate, "auto" | "disable");
@@ -929,34 +1329,74 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<()> {
         let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
         ffmpeg.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got);
         ffmpeg.args(["-vn", "-map_metadata", "-1", "-c:a", codec]);
-        if !keep {
-            ffmpeg.args(["-b:a", bitrate]);
+        if codec != "copy" {
+            ffmpeg.args(rate_args(bitrate, format, abr));
         }
-        let output = ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp).output()?;
+        let output = search::run(ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp))?;
         match output.status.success() {
             true => Ok(()),
             false => Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into()),
         }
     };
-    let result = convert().and_then(|()| Ok(fs::rename(&temp, out)?));
+    let result = convert();
     let _ = fs::remove_file(&got);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    result
+    result.map(|()| temp)
 }
 
-/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked.
-fn download(song: &Song, out: &Path) -> R<String> {
-    fs::create_dir_all(out.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-    let id = match song.song_id.as_str() {
-        "" => format!("{:x}", Sha1::digest(&song.url)),
-        id => id.into(),
-    };
+/// FFmpeg's arguments for `--bitrate`, as in Python spotDL: `auto` encodes at the source's bitrate (128k when
+/// yt-dlp does not know it), digits are a VBR quality (`-q:a`, LAME's V0 to V9), anything else a bitrate, and
+/// `disable` leaves the encoder's default. FLAC and WAV are lossless, so a bitrate means nothing to them.
+fn rate_args(bitrate: &str, format: &str, abr: Option<f64>) -> Vec<String> {
+    match bitrate {
+        "disable" => vec![],
+        "auto" if matches!(format, "flac" | "wav") => vec![],
+        "auto" => vec!["-b:a".into(), format!("{}k", abr.filter(|abr| *abr >= 1.0).map_or(128, |abr| abr as u32))],
+        _ if !bitrate.is_empty() && bitrate.bytes().all(|b| b.is_ascii_digit()) => vec!["-q:a".into(), bitrate.into()],
+        _ => vec!["-b:a".into(), bitrate.into()],
+    }
+}
+
+/// Whether `file` is one of `fetch`'s temporary files (`<stem>.<id>.converted.<format>`), which an interrupted
+/// run can leave behind: it is no song of the library.
+fn temp_file(file: &Path) -> bool {
+    file.file_stem().map(Path::new).and_then(Path::extension).is_some_and(|extension| extension == "converted")
+}
+
+/// Removes the temporary files an interrupted download of `out` left: yt-dlp's `<stem>.<id>.<ext>` (and
+/// `.part`) and `fetch`'s `<stem>.<id>.converted.<format>`. Only names that start with `<stem>.<id>.` go.
+fn remove_temp_files(out: &Path, id: &str) {
+    let prefix = out.with_extension(format!("{id}."));
+    let (Some(dir), Some(prefix)) = (prefix.parent(), prefix.file_name()) else { return };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The id in `fetch`'s temporary names (`<stem>.<id>.converted.<format>`). The stem may fill 200 bytes, so a
+/// Spotify id (22 bytes) or YouTube id (11) is kept, while a missing or longer id (SoundCloud slugs have no fixed
+/// length) is hashed to 16 hex digits: the names then stay under the 255-byte file name limit.
+fn temp_id(song: &Song) -> String {
+    match song.song_id.as_str() {
+        id if !id.is_empty() && id.len() <= 22 => id.into(),
+        _ => format!("{:x}", Sha1::digest(&song.url))[..16].into(),
+    }
+}
+
+/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the
+/// downloaded (untagged) temporary file.
+fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
+    let id = temp_id(song);
+    remove_temp_files(out, &id);
     let mut failure = None;
     if let Some(url) = &song.download_url {
         match fetch(url, out, &id) {
-            Ok(()) => return Ok(url.clone()),
+            Ok(temp) => return Ok((url.clone(), temp)),
             Err(error) => failure = Some(error),
         }
     }
@@ -969,17 +1409,30 @@ fn download(song: &Song, out: &Path) -> R<String> {
     };
     for url in candidates.into_iter().filter(|url| song.download_url.as_ref() != Some(url)) {
         match fetch(&url, out, &id) {
-            Ok(()) => return Ok(url),
+            Ok(temp) => return Ok((url, temp)),
             Err(error) => failure = Some(error),
         }
     }
     Err(failure.unwrap_or_else(|| "no match".into()))
 }
 
+/// The file `op` writes a song to: `meta --redownload` replaces a local song's own file (its name with the
+/// selected format's extension), not a file at the output template's path, which would leave the old file as a
+/// duplicate.
+fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
+    match REDOWNLOADS.get().filter(|_| op == "redownload").and_then(|files| files.get(&s.url)) {
+        Some(file) => (file.with_extension(text("format").unwrap_or("opus")), Some(file)),
+        None => (path(s), None),
+    }
+}
+
 /// Saves, prints or downloads one song; `redownload` is a download that replaces the file.
 fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if op == "save" {
         if on("preload") && s.download_url.is_none() {
+            // Spotify gives no ISRC; Deezer's is what lets the search find the release's own recording, as a
+            // download does. The save file keeps it, so a later download searches by it too.
+            enrich(s);
             s.download_url = search::find(s).ok().and_then(|urls| urls.into_iter().next());
         }
         s.lyrics = find_lyrics(s);
@@ -990,19 +1443,19 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     if op == "url" {
         if s.download_url.is_none() {
+            // The same search as a download's: with Deezer's ISRC.
+            enrich(s);
             s.download_url = search::find(s)?.into_iter().next();
         }
         return Ok(path(s));
     }
     let early = text("output").is_some_and(|output| ENRICHED.iter().any(|field| output.contains(field)));
     if early {
-        spotify::enrich(s);
+        enrich(s);
     }
-    let out = path(s);
+    let (out, local) = out_path(s, op);
     let scan = || {
-        let output = Path::new(text("output").unwrap_or_default());
-        let root: PathBuf =
-            output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect();
+        let root = output_root();
         let mut files = Vec::new();
         audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
         let tagged = files
@@ -1012,21 +1465,35 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     };
     let scanned = on("scan_for_songs").then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
     let detected = list("detect_formats").map(|format| out.with_extension(format)).find(|path| path.is_file());
-    let mut target = scanned.or_else(|| out.is_file().then(|| out.clone())).or(detected).unwrap_or_else(|| out.clone());
+    let mut target = local
+        .cloned()
+        .or(scanned)
+        .or_else(|| out.is_file().then(|| out.clone()))
+        .or(detected)
+        .unwrap_or_else(|| out.clone());
     let archived = text("archive").is_some_and(|file| {
         let read = || fs::read_to_string(file).unwrap_or_default().lines().map(String::from).collect();
         ARCHIVED.get_or_init(read).contains(&s.url)
     });
     let skip = on("respect_skip_file") && skip_path(&target).exists();
     let (exists, overwrite) = (target.is_file(), text("overwrite").unwrap_or("skip"));
-    if op != "redownload" && (archived || skip || exists && overwrite == "skip" && !on("force_update_metadata")) {
+    // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
+    let moved = exists && MOVED.get().is_some_and(|moved| moved.contains(&target));
+    let keep = archived || skip || exists && overwrite == "skip" && !on("force_update_metadata");
+    if op != "redownload" && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
         }
         return Ok(target);
     }
     if !early {
-        spotify::enrich(s);
+        enrich(s);
+    }
+    // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
+    if moved && s.lyrics.is_none() {
+        let tag = lofty::read_from_path(&target).ok();
+        let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
+        s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
     // Lyrics sites are paced, so fetch them while the audio downloads.
     let song = s.clone();
@@ -1036,14 +1503,23 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         (lyrics.join().ok().flatten(), downloaded)
     });
     s.lyrics = lyrics;
-    if let Some(url) = downloaded.transpose()? {
-        s.download_url = Some(url);
-        if target != out && target.is_file() {
-            fs::remove_file(&target)?;
+    match downloaded.transpose()? {
+        // The audio is tagged before it gets its name: a file at `out` is a finished song, which later runs skip
+        // and archive, so a failed or interrupted tagging must not leave an untagged one there.
+        Some((url, temp)) => {
+            s.download_url = Some(url);
+            if let Err(error) = write_tags(&temp, s).and_then(|()| Ok(fs::rename(&temp, &out)?)) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            if target != out && target.is_file() {
+                fs::remove_file(&target)?;
+                let _ = fs::remove_file(skip_path(&target));
+            }
+            target = out;
         }
-        target = out;
+        None => write_tags(&target, s)?,
     }
-    write_tags(&target, s)?;
     write_folder_art(&target, s)?;
     write_lrc(&target, s)?;
     if on("create_skip_file") {
@@ -1051,6 +1527,15 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     archive(&s.url)?;
     Ok(target)
+}
+
+/// Adds Deezer's metadata, warning when Deezer failed: the song is then tagged without genres, ISRC or barcode.
+fn enrich(s: &mut Song) -> bool {
+    let result = spotify::enrich(s);
+    if let Err(error) = &result {
+        log("WARNING", &format!("{} - {}: no Deezer genres, ISRC or barcode: {error}", s.artists.join(", "), s.name));
+    }
+    result.is_ok()
 }
 
 pub fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
@@ -1073,45 +1558,90 @@ pub fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
 /// Moves (or, for songs no longer listed, deletes) the files of songs whose output path changed.
 pub fn prune(old: &[Song], new: &[Song]) {
     let next: HashMap<&str, &Song> = new.iter().rev().map(|song| (song.url.as_str(), song)).collect();
+    // A file a listed song writes is that song's, also when its URL changed (Spotify gives re-released
+    // songs new IDs): it is kept for the song's job, not deleted before a download that can fail.
+    let kept: HashSet<PathBuf> = new.iter().map(path).collect();
     let files = |file: &Path| [file.to_path_buf(), skip_path(file), file.with_extension("lrc")];
+    let mut moved = HashSet::new();
     for song in old {
         let from = path(song);
-        let to = next.get(song.url.as_str()).map(|song| path(song));
-        if to.as_ref() == Some(&from) {
+        if kept.contains(&from) {
             continue;
         }
-        let targets = to.filter(|to| !to.exists()).map(|to| files(&to));
-        for (i, source) in files(&from).iter().enumerate().take(if on("sync_remove_lrc") { 3 } else { 2 }) {
+        let to = next.get(song.url.as_str()).map(|song| path(song));
+        let targets = to.as_ref().filter(|to| !to.exists()).map(|to| files(to));
+        // A moved song's `.lrc` goes with it; `--sync-remove-lrc` decides only whether a removed song's goes.
+        let lrc = to.is_some() || on("sync_remove_lrc");
+        let had = from.is_file();
+        for (i, source) in files(&from).iter().enumerate().take(if lrc { 3 } else { 2 }) {
+            // Only a missing source is no error: a renamed album's new folder does not exist yet.
+            if !source.exists() {
+                continue;
+            }
             let result = match &targets {
-                Some(targets) => fs::rename(source, &targets[i]),
+                Some(targets) => fs::create_dir_all(targets[i].parent().unwrap_or(Path::new("")))
+                    .and_then(|()| fs::rename(source, &targets[i])),
                 None => fs::remove_file(source),
             };
-            if let Some(error) = result.err().filter(|error| error.kind() != std::io::ErrorKind::NotFound) {
+            if let Err(error) = result {
                 log("ERROR", &format!("could not move or remove {}: {error}", source.display()));
             }
+        }
+        // The file at the new path has the old title, album or year in its tags until they are written again.
+        if let Some(to) = to.filter(|to| had && to.is_file()) {
+            moved.insert(to);
+        }
+        remove_empty(&from);
+    }
+    let _ = MOVED.set(moved);
+}
+
+/// Removes the folders of `file` (up to the output's fixed folder) that hold nothing more than the folder
+/// images of songs that are gone, so that a renamed or removed album leaves no empty album in the library.
+fn remove_empty(file: &Path) {
+    let root = output_root();
+    let image = |file: &PathBuf| {
+        file.is_file() && file.file_name().is_some_and(|name| name == "cover.jpg" || name == "artist.jpg")
+    };
+    for dir in
+        file.ancestors().skip(1).take_while(|dir| !dir.as_os_str().is_empty() && dir.starts_with(&root) && *dir != root)
+    {
+        let Ok(entries) =
+            fs::read_dir(dir).map(|entries| entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>())
+        else {
+            return;
+        };
+        if !entries.iter().all(image)
+            || entries.iter().try_for_each(fs::remove_file).and_then(|()| fs::remove_dir(dir)).is_err()
+        {
+            return;
         }
     }
 }
 
-/// Fills in missing tags, lyrics and `.lrc` files of local songs, and with `redownload` downloads them again.
-fn meta_file(file: &Path) -> R<()> {
+/// Fills in missing tags, lyrics and `.lrc` files of a local song, and returns it when `redownload` is to download
+/// it again.
+fn meta_file(file: &Path) -> R<Option<Song>> {
     let audio = lofty::read_from_path(file)?;
     let tag = audio.primary_tag().ok_or("no tags")?;
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
     // A Spotify song written before the explicit flag reached Vorbis comments has its tags written again.
     let from_spotify = source_url(tag).is_some_and(|url| url.contains("spotify"));
-    let complete = has(ItemKey::TrackTitle)
+    let tagged = has(ItemKey::TrackTitle)
         && has(ItemKey::TrackArtist)
         && has(ItemKey::TrackArtists)
-        && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics))
         && (on("skip_album_art") || !tag.pictures().is_empty())
         && (!from_spotify || has(advisory_key(tag.tag_type())));
+    // A song whose lyrics were looked for and not found (an instrumental) is not looked for again on each run.
+    let no_lyrics = has(no_lyrics_key(tag.tag_type()));
+    let complete = tagged && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics) || no_lyrics);
     // Deezer's gain has no peak: `--replaygain` measures songs without one.
     let measure = on("replaygain") && !has(ItemKey::ReplayGainTrackPeak);
     let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
-    let wanted = Song { album_artist, artist_id: "-".into(), ..Song::default() };
-    let missing_art = !folder_images(file, &wanted).is_empty();
-    let lyrics = tag.get_string(&ItemKey::Lyrics).map(String::from);
+    let wanted = Song { album_artist, artist_id: "-".into(), cover_url: Some(String::new()), ..Song::default() };
+    let missing_art = on("folder_art") && !folder_images(file, &wanted).is_empty();
+    let stored = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
+    let lyrics = stored.as_deref().map(unlisted).filter(|lyrics| !lyrics.is_empty());
     // The comment is the URL the audio was downloaded from; tags written again keep it.
     let source = tag.comment().filter(|comment| comment.starts_with("http")).map(String::from);
     let (force, redownload) = (on("force_update_metadata"), on("redownload"));
@@ -1126,6 +1656,7 @@ fn meta_file(file: &Path) -> R<()> {
         artists,
         album_name: tag.album().unwrap_or_default().into(),
         year: tag.year().unwrap_or_default(),
+        track_number: tag.track().unwrap_or_default(),
         duration: audio.properties().duration().as_secs_f64(),
         lyrics: lyrics.clone(),
         ..Song::default()
@@ -1136,90 +1667,131 @@ fn meta_file(file: &Path) -> R<()> {
         if measure {
             write_track_gain(file)?;
         }
-        if !on("generate_lrc") || file.with_extension("lrc").exists() {
-            return Ok(());
+        if !on("generate_lrc") || file.with_extension("lrc").exists() || (lyrics.is_none() && no_lyrics) {
+            return Ok(None);
         }
         if lyrics.as_deref().is_some_and(is_synced) {
-            return write_lrc(file, &local).map(drop);
+            return write_lrc(file, &local).map(|_| None);
         }
     }
     let url = source_url(tag).filter(|url| url.contains("spotify"));
     let found = match &url {
         Some(url) => spotify::resolve(url)?.into_iter().next(),
-        // Without a Spotify URL the search result must be the same song, so that a song that is not on Spotify
-        // (an unreleased one) does not take the tags of a released song with the same title.
-        None => spotify::resolve(&format!("{} - {}", local.artist, local.name))
-            .ok()
-            .and_then(|songs| songs.into_iter().next())
-            .filter(|song| {
-                let same = |a: &str, b: &str| search::versionless(a).eq_ignore_ascii_case(search::versionless(b));
+        // Without a Spotify URL the match must be the same song on the same release, so that a song that is not
+        // on Spotify (an unreleased one) does not take the tags of a released song with the same title, and an
+        // album's song does not take those of a compilation or another edition. The track search finds a song's
+        // most popular release (Three Little Birds of Exodus is on Legend), so the album is searched too.
+        None => {
+            let same = |a: &str, b: &str| search::versionless(a).eq_ignore_ascii_case(search::versionless(b));
+            let fits = |song: &Song| {
                 same(&song.name, &local.name)
                     && song.artists.contains(&local.artist)
                     && (song.duration - local.duration).abs() < 4.0
-            }),
+                    && (local.album_name.is_empty() || same(&song.album_name, &local.album_name))
+                    && (local.track_number == 0 || song.track_number == local.track_number)
+            };
+            let track = spotify::resolve(&format!("{} - {}", local.artist, local.name)).ok();
+            track.and_then(|songs| songs.into_iter().next()).filter(fits).or_else(|| {
+                let album = format!("album:{} {}", local.artist, local.album_name);
+                let songs = (!local.album_name.is_empty()).then(|| spotify::resolve(&album).ok()).flatten()?;
+                songs.into_iter().find(fits)
+            })
+        }
     };
     let Some(mut song) = found.or_else(|| url.is_none().then(|| local.clone())) else { return Err("no match".into()) };
     let on_spotify = !song.song_id.is_empty();
     song.download_url = song.download_url.or(source);
-    if on_spotify {
-        spotify::enrich(&mut song);
+    if on_spotify && !enrich(&mut song) {
+        // Without Deezer the date is Spotify's, which can be only a year or month: the file's Deezer day stays.
+        let date = tag.get_string(&ItemKey::RecordingDate);
+        if let Some(date) = date.filter(|date| date.len() > song.date.len() && date.starts_with(&song.date)) {
+            song.date = date.into();
+        }
     }
-    // `force` fetches the lyrics again, for example to get synced lyrics that were not available before.
-    song.lyrics =
-        if force { find_lyrics(&song).or(lyrics.clone()) } else { lyrics.clone().or_else(|| find_lyrics(&song)) };
+    // `force` fetches the lyrics again, for example to get synced lyrics that were not available before; so does
+    // `--overwrite metadata` for a song whose lyrics were not found before.
+    let look = !no_lyrics || replace;
+    // An instrumental's lyrics are removed: they are another song's ("See-Saw"'s under "Interstellar Overdrive").
+    let mut cleared = false;
+    song.lyrics = if force {
+        match found_lyrics(&song) {
+            Some(None) => {
+                cleared = lyrics.is_some();
+                None
+            }
+            found => found.flatten().or(lyrics.clone()),
+        }
+    } else {
+        lyrics.clone().or_else(|| look.then(|| find_lyrics(&song)).flatten())
+    };
     // Lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under BULLY's) are replaced by the
     // song's Genius lyrics.
     if replace && !force {
         // Genius's page is asked for its albums only when the lyrics differ.
         let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
-        let page = song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist)));
+        let page =
+            song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist).flatten()));
         let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
-        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page)) {
-            log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
-            song.lyrics = Some(page.lyrics);
+        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page) == Some(true)) {
+            cleared = words(&page.lyrics).is_empty();
+            if !cleared {
+                log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
+            }
+            song.lyrics = (!cleared).then_some(page.lyrics);
         }
+    }
+    if cleared {
+        log("WARNING", &format!("{}: lyrics removed, the song is an instrumental", file.display()));
     }
     if on_spotify {
         write_folder_art(file, &song)?;
     }
-    // A song whose tags are not written again (complete, or not on Spotify) is measured on its own.
-    if measure && (!on_spotify || (complete && !force)) {
+    // A song whose tags are not written again (tagged, or not on Spotify) is measured on its own.
+    if measure && (!on_spotify || (tagged && !force)) {
         write_track_gain(file)?;
     }
     if on_spotify {
-        if !complete || force {
+        // Missing lyrics alone do not write the tags again: only the lyrics, or the key that none were found. Tags
+        // written again keep the file's lyrics when the song has none, so an instrumental's are removed after them.
+        if !tagged || force {
             write_tags(file, &song)?;
-        } else if song.lyrics != lyrics {
-            let mut audio = lofty::read_from_path(file)?;
-            audio
-                .primary_tag_mut()
-                .ok_or("no tags")?
-                .insert_text(ItemKey::Lyrics, song.lyrics.clone().unwrap_or_default());
-            audio.save_to_path(file, WriteOptions::default())?;
+        }
+        if cleared || (tagged && !force && (song.lyrics != stored || (!complete && genius_answered(&song)))) {
+            write_lyrics(file, song.lyrics.clone())?;
         }
         write_lrc(file, &song)?;
     } else {
         // A song that is not on Spotify keeps its own tags. Without other lyrics, the words of its old `.lrc` file
         // are timed again. New lyrics go into the tags unless the aligner finds that they are another song's.
-        let new = song.lyrics.clone().filter(|_| song.lyrics != lyrics);
-        if song.lyrics.is_none() {
+        let new = song.lyrics.clone().filter(|_| song.lyrics != stored);
+        let none_found = song.lyrics.is_none() && (cleared || !no_lyrics && genius_answered(&song));
+        if song.lyrics.is_none() && !cleared {
             song.lyrics = fs::read_to_string(file.with_extension("lrc")).ok().map(|lrc| plain_lyrics(&lrc));
         }
         let fits = write_lrc(file, &song)?;
         if let Some(new) = new.filter(|_| fits) {
-            let mut audio = lofty::read_from_path(file)?;
-            audio.primary_tag_mut().ok_or("no tags")?.insert_text(ItemKey::Lyrics, new);
-            audio.save_to_path(file, WriteOptions::default())?;
+            write_lyrics(file, Some(new))?;
+        } else if none_found {
+            write_lyrics(file, None)?;
         }
     }
-    if redownload && on_spotify {
-        let album = format!("https://open.spotify.com/album/{}", song.album_id);
-        let songs = if on("fetch_albums") { spotify::resolve(&album)? } else { vec![song] };
-        for song in songs {
-            process(song, "redownload").1?;
+    Ok((redownload && on_spotify).then_some(song))
+}
+
+/// One download per output file, local songs first: a song is downloaded once, also when it is on the album of
+/// several files (`--fetch-albums`), and the threads do not write the same file. A pinned video is kept.
+fn redownload_jobs(songs: Vec<Song>) -> Vec<Song> {
+    let (mut jobs, mut slots) = (Vec::<Song>::new(), HashMap::new());
+    for song in songs {
+        let slot = *slots.entry(out_path(&song, "redownload").0).or_insert_with(|| {
+            jobs.push(song.clone());
+            jobs.len() - 1
+        });
+        if jobs[slot].download_url.is_none() {
+            jobs[slot].download_url = song.download_url;
         }
     }
-    Ok(())
+    jobs
 }
 
 pub fn meta(paths: &[String]) -> R<()> {
@@ -1232,31 +1804,70 @@ pub fn meta(paths: &[String]) -> R<()> {
     }
     // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites and the aligner.
     let pool = rayon::ThreadPoolBuilder::new().num_threads(number("threads").max(1) as usize).build()?;
-    let failed = pool.install(|| {
+    let results: Vec<R<Option<Song>>> = pool.install(|| {
         files
             .par_iter()
             .with_max_len(1)
-            .filter(|file| {
+            .map(|file| {
                 let result = meta_file(file);
                 println!(
                     "{}: {}",
                     file.display(),
-                    result.as_ref().map_or_else(|error| error.to_string(), |()| "updated".into())
+                    result.as_ref().map_or_else(|error| error.to_string(), |_| "updated".into())
                 );
-                result.is_err()
+                result
             })
-            .count()
+            .collect()
     });
-    album_gains(&files);
-    match failed {
-        0 => Ok(()),
-        count => Err(format!("{count} of {} files failed", files.len()).into()),
+    let (count, failed) = (files.len(), results.iter().filter(|result| result.is_err()).count());
+    // The songs are downloaded again after all files are done, as a download, so that each is downloaded once.
+    let local: Vec<(PathBuf, Song)> =
+        files.iter().zip(results).filter_map(|(file, result)| Some((file.clone(), result.ok()??))).collect();
+    let _ = REDOWNLOADS.set(local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect());
+    let mut songs: Vec<Song> = local.into_iter().map(|(_, song)| song).collect();
+    let mut lost = 0;
+    if on("fetch_albums") {
+        let mut albums: Vec<String> = songs
+            .iter()
+            .filter(|song| !song.album_id.is_empty())
+            .map(|song| format!("https://open.spotify.com/album/{}", song.album_id))
+            .collect();
+        albums.sort();
+        albums.dedup();
+        let resolved: Vec<_> =
+            pool.install(|| albums.par_iter().map(|album| (album, spotify::resolve(album))).collect());
+        for (album, result) in resolved {
+            match result {
+                Ok(more) => songs.extend(more),
+                Err(error) => {
+                    log("ERROR", &format!("{album}: {error}"));
+                    lost += 1;
+                }
+            }
+        }
+    }
+    let jobs = redownload_jobs(songs);
+    let done: Vec<R<PathBuf>> =
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, "redownload").1).collect());
+    lost += done.iter().filter(|result| result.is_err()).count();
+    album_gains(&files.into_iter().chain(done.into_iter().flatten()).collect::<Vec<_>>());
+    report_unchecked();
+    match (failed, lost) {
+        (0, 0) => Ok(()),
+        (failed, 0) => Err(format!("{failed} of {count} files failed").into()),
+        (failed, lost) => Err(format!("{failed} of {count} files and {lost} downloads failed").into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::same_lyrics;
+    use super::{
+        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced,
+        lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args,
+        redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id, template_path, track_gain,
+        unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+    };
+    use std::path::PathBuf;
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -1267,17 +1878,385 @@ mod tests {
         [00:18.27]\"Crazy, bipolar, antisemite\"\n[00:23.04]And I'm still the king\n\
         [00:31.56]They thought headlines was my kryptonite\n[00:36.14]Still the king";
 
+    /// Only `&#x27;`, `&quot;` and `&amp;` were decoded, so a Genius "<3" or "->" stayed "&lt;3" or "-&gt;".
+    #[test]
+    fn lyrics_decode_every_html_entity_once() {
+        let page = "<div data-lyrics-container=\"true\">I &lt;3 you<br/>Don&#x27;t go -&gt; &quot;there&quot; \
+            &amp; back<br/>&amp;lt;em&amp;gt; &#39;Til&nbsp;dawn&#x2019; &copy; &#xZZ; R&B</div>";
+        let lyrics = "I <3 you\nDon't go -> \"there\" & back\n&lt;em&gt; 'Til dawn\u{2019} &copy; &#xZZ; R&B";
+        assert_eq!(genius_lyrics(page).unwrap(), lyrics);
+    }
+
+    /// Deezer's gain was taken against -18 LUFS, but it reads 0.4 dB below the loudness FFmpeg measures: Get Lucky
+    /// (Deezer's -11.3) measures -7.10 dB, not -6.70, so unmeasured songs played 0.4 dB louder than measured ones.
+    #[test]
+    fn deezer_gain_is_converted_like_a_measured_one() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let mut song = Song::default();
+        song.extra.gain = -11.3;
+        assert_eq!(track_gain(&PathBuf::from("no-such-file.opus"), &song), ("-7.10 dB".into(), String::new()));
+    }
+
+    /// With the default template a song is a bare file name, whose parent "" `read_dir` cannot open, so
+    /// `--replaygain` logged ": album gain: No such file or directory" and wrote no album gain.
+    #[test]
+    fn album_gain_reads_the_current_folder_for_bare_file_names() {
+        let files = [PathBuf::from("a.opus"), PathBuf::from("./b.opus"), PathBuf::from("x/c.opus")];
+        let dirs = album_dirs(&files);
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(std::path::Path::new(".")) && dirs.contains(std::path::Path::new("x")));
+    }
+
+    /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
+    #[test]
+    fn album_covers_are_taken_in_their_original_size() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let cover = art("https://i.scdn.co/image/ab67616d0000b273b694e89ba937dd2631ff584c").unwrap();
+        assert_eq!(lofty::picture::PictureInformation::from_jpeg(&cover).unwrap().width, 1500);
+    }
+
+    /// An album without a cover URL got its artist's picture as `cover.jpg`, which servers show as its cover.
+    #[test]
+    fn albums_without_a_cover_get_no_cover_image() {
+        let file = std::env::temp_dir().join("spotdl-no-such-folder/Artist/Album/Artist - Song.opus");
+        let song = |cover: Option<&str>| Song {
+            album_artist: "Artist".into(),
+            artist_id: "id".into(),
+            cover_url: cover.map(String::from),
+            ..Song::default()
+        };
+        let artist = (file.parent().unwrap().parent().unwrap().join("artist.jpg"), None);
+        let cover = (file.parent().unwrap().join("cover.jpg"), Some("url".to_string()));
+        assert_eq!(folder_images(&file, &song(Some("url"))), [cover, artist.clone()]);
+        assert_eq!(folder_images(&file, &song(None)), [artist]);
+    }
+
+    /// The release type was written as a plain `RELEASETYPE` key, which lofty silently drops from M4A files.
+    #[test]
+    fn release_type_is_written_to_every_format() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let dir = std::env::temp_dir().join(format!("spotdl-release-type-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = Song { name: "Song".into(), album_type: "single".into(), ..Song::default() };
+        for (extension, codec) in [("m4a", "aac"), ("opus", "libopus")] {
+            let file = dir.join(format!("t.{extension}"));
+            let made = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "1", "-c:a", codec])
+                .arg(&file)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            write_tags(&file, &song).unwrap();
+            let audio = lofty::read_from_path(&file).unwrap();
+            let tag = lofty::file::TaggedFileExt::primary_tag(&audio).unwrap();
+            assert_eq!(tag.get_string(&release_type_key(tag.tag_type())), Some("single"), "{extension}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Spotify's compilations of one artist's songs were flagged as compilations, which players file under Various
+    /// Artists, out of the artist's discography.
+    #[test]
+    fn only_various_artists_compilations_are_flagged() {
+        let album =
+            |kind: &str, artist: &str| Song { album_type: kind.into(), album_artist: artist.into(), ..Song::default() };
+        assert!(compilation(&album("compilation", "Various Artists")));
+        assert!(compilation(&album("compilation", "various artists")));
+        assert!(!compilation(&album("compilation", "The Beatles")));
+        assert!(!compilation(&album("album", "Various Artists")));
+    }
+
     #[test]
     fn lyrics_of_one_song_agree_and_of_two_songs_do_not() {
         let synced = "[00:00.30]The time is now, right now\n[00:04.18]This is the hour, this is the new dawn, \
             this is the new day\n[00:10.38]Now is the time, for nature and all her glory have named you her king";
         assert!(same_lyrics(synced, BULLY_KING));
         assert!(!same_lyrics(VULTURES_KING, BULLY_KING));
+        // An instrumental's page has no words, which another song's words are not.
+        assert!(!same_lyrics("[Instrumental]", BULLY_KING));
+        assert!(same_lyrics("[Instrumental]", "[Instrumental]"));
         // Too few words to tell.
-        assert!(same_lyrics("[Instrumental]", BULLY_KING));
         let count_in = "Drive my car take 1\n\n1,2,3,4\n\n(instrumental)\n\n2\n\n1,2,3,4\n\n(instrumental)";
         let talk = "[00:01.30]\"Drive My Car,\" take one\n[00:12.63]Can you take it a little bit slower this time?\n\
             [00:17.37]One, two, three, four\n[01:02.16]Two\n[01:13.77]That's the coming in part\n[01:15.61]One, two";
         assert!(same_lyrics(count_in, talk));
+    }
+
+    /// `--bitrate auto` was taken as `disable` (FFmpeg's 128k for MP3), and `--bitrate 0` went to `-b:a 0`, which
+    /// FFmpeg also takes as 128k CBR instead of LAME's V0.
+    #[test]
+    fn bitrates_are_passed_as_python_spotdl_does() {
+        assert_eq!(rate_args("auto", "mp3", Some(160.155)), ["-b:a", "160k"]);
+        assert_eq!(rate_args("auto", "ogg", None), ["-b:a", "128k"]);
+        assert!(rate_args("auto", "flac", Some(160.0)).is_empty());
+        assert!(rate_args("disable", "mp3", Some(160.0)).is_empty());
+        assert_eq!(rate_args("0", "mp3", Some(160.0)), ["-q:a", "0"]);
+        assert_eq!(rate_args("256k", "mp3", Some(160.0)), ["-b:a", "256k"]);
+    }
+
+    /// LRCLIB's word that a song is an instrumental is an answer (`""`), but only when every version as long as the
+    /// song says so: all 20 results for Pink Floyd's "Interstellar Overdrive" are instrumental.
+    #[test]
+    fn lrclib_instrumentals_are_an_answer() {
+        let song = Song { name: "Interstellar Overdrive".into(), duration: 581.0, ..Song::default() };
+        let track = |d: f64, i: bool, p: &str| serde_json::json!({"duration": d, "instrumental": i, "plainLyrics": p});
+        let instrumental = [track(582.0, true, ""), track(580.0, true, ""), track(300.0, false, "Marigolds")];
+        assert_eq!(lrclib_lyrics(&song, &instrumental), vec![String::new()]);
+        let mixed = [track(582.0, true, ""), track(580.0, false, "Some words")];
+        assert_eq!(lrclib_lyrics(&song, &mixed), vec!["Some words".to_string()]);
+        assert!(lrclib_lyrics(&song, &[track(300.0, true, "")]).is_empty());
+    }
+
+    /// The `synced` provider takes LRCLIB's synced lyrics before the song's album's plain ones, which [`lrclib`]
+    /// lists first: Franz Ferdinand's "Lucid Dreams" on Hits To The Head got plain lyrics in its tags.
+    #[test]
+    fn synced_provider_takes_synced_lyrics_first() {
+        use serde_json::json;
+        let song = Song {
+            name: "Lucid Dreams".into(),
+            album_name: "Hits To The Head".into(),
+            duration: 224.0,
+            ..Song::default()
+        };
+        let track = |album: &str, key: &str, text: &str| json!({"albumName": album, "duration": 224.0, key: text});
+        let tracks = [
+            track("Tonight: Franz Ferdinand", "syncedLyrics", "[00:12.00] Lucid dreams"),
+            track("Hits To The Head", "plainLyrics", "Lucid dreams"),
+        ];
+        let found = lrclib_lyrics(&song, &tracks);
+        assert_eq!(found[0], "Lucid dreams");
+        assert_eq!(synced_first(found.clone(), |_| true).as_deref(), Some("[00:12.00] Lucid dreams"));
+        // Plain lyrics are taken when no synced ones agree.
+        assert_eq!(synced_first(found, |lyrics| !is_synced(lyrics)).as_deref(), Some("Lucid dreams"));
+    }
+
+    /// Without Genius lyrics to check them by, LRCLIB's plain lyrics are not taken (Lee Fields's "Funky Screw" got a
+    /// Japanese comic song's), but its synced lyrics and its word that the song is an instrumental are.
+    #[test]
+    fn unchecked_lrclib_lyrics_must_be_synced() {
+        let song = Song { name: "Funky Screw".into(), duration: 211.0, ..Song::default() };
+        let plain = serde_json::json!({"duration": 210.6, "syncedLyrics": "", "plainLyrics": "半チャーハン 一升半"});
+        let unchecked = |found| synced_first(found, |lyrics: &String| lrclib_agrees(lyrics, None));
+        assert_eq!(unchecked(lrclib_lyrics(&song, std::slice::from_ref(&plain))), None);
+        let synced = serde_json::json!({"duration": 211.0, "syncedLyrics": "[00:12.00] Screw"});
+        assert_eq!(unchecked(lrclib_lyrics(&song, &[plain, synced])).as_deref(), Some("[00:12.00] Screw"));
+        assert_eq!(unchecked(vec![String::new()]).as_deref(), Some(""));
+        // Genius's lyrics still check plain ones.
+        assert!(lrclib_agrees(BULLY_KING, Some(&BULLY_KING.to_string())));
+        assert!(!lrclib_agrees("", Some(&BULLY_KING.to_string())));
+    }
+
+    /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while:
+    /// every search's results, kept until the run ended, filled gigabytes over a library.
+    #[test]
+    fn lrclib_results_are_not_kept_for_the_whole_run() {
+        let reply = |_: &str| Some(vec![serde_json::json!({"duration": 200.0, "plainLyrics": "Words"})]);
+        let none = |_: &str| None;
+        let kept = |url: &str| LRCLIB_FOUND.lock().unwrap().iter().any(|(key, _)| key == url);
+        // The writer's search, the only one when Genius answered, keeps nothing.
+        assert!(lrclib_tracks("test:writer", false, reply).is_some());
+        assert!(!kept("test:writer"));
+        // The provider's search is kept, and the writer takes it.
+        assert!(lrclib_tracks("test:provider", true, reply).is_some());
+        assert!(lrclib_tracks("test:provider", false, none).is_some());
+        assert!(!kept("test:provider"));
+        // Results nobody takes make room for newer ones.
+        for n in 0..=LRCLIB_KEPT {
+            lrclib_tracks(&format!("test:untaken {n}"), true, reply);
+        }
+        assert!(LRCLIB_FOUND.lock().unwrap().len() <= LRCLIB_KEPT);
+        assert!(!kept("test:untaken 0") && kept(&format!("test:untaken {LRCLIB_KEPT}")));
+    }
+
+    /// Genius's "You might also like", glued into lyrics by earlier scrapes, is not lyrics.
+    #[test]
+    fn genius_song_lists_are_dropped_from_lyrics() {
+        assert_eq!(unlisted("[Instrumental and Screams]You might also like"), "[Instrumental and Screams]");
+        assert_eq!(unlisted("I love youYou might also like[Chorus]\nOh"), "I love you\n[Chorus]\nOh");
+        assert_eq!(unlisted("Hey\nYou might also like[Bridge]"), "Hey\n[Bridge]");
+        assert_eq!(unlisted("You might also like me"), "You might also like me");
+    }
+
+    /// A Genius that cannot be asked (its website answers 403) is not a Genius without the song's page, which
+    /// would let LRCLIB's lyrics in unchecked: BULLY's "KING" would get VULTURES 1's.
+    #[test]
+    fn lyrics_are_not_checked_against_a_genius_that_cannot_be_asked() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        GENIUS_BLOCKED.store(true, Relaxed);
+        let artists = vec!["¥$".to_string(), "Kanye West".to_string()];
+        let song = Song { name: "KING".into(), artist: "¥$".into(), artists, year: 2026, ..Song::default() };
+        assert_eq!(reference(&song, None), None);
+        assert_eq!(provider("synced", &song), None);
+        // The song's own plain lyrics still check synced lyrics.
+        assert_eq!(reference(&song, Some(&BULLY_KING.into())), Some(Some(BULLY_KING.into())));
+    }
+
+    /// azlyrics's access check comes as a 200 page (from b.azlyrics.com): it was taken for a song without lyrics,
+    /// on every song, with nothing logged. It turns azlyrics off for the run; a lyrics page still gives its lyrics.
+    #[test]
+    fn azlyrics_access_check_turns_it_off() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let lyrics = "<div class=\"ringtone\"></div><div>\n<!-- Usage of azlyrics.com content by any third-party \
+            lyrics provider is prohibited. -->\nIs this the real life?<br>\nIs this just fantasy?\n</div>";
+        assert_eq!(azlyrics(lyrics).as_deref(), Some("Is this the real life?\nIs this just fantasy?"));
+        assert!(!AZLYRICS_BLOCKED.load(Relaxed));
+        let gate =
+            "<html><head><title>AZLyrics - request for access</title></head><body><form>...</form></body></html>";
+        assert_eq!(azlyrics(gate), None);
+        assert!(AZLYRICS_BLOCKED.load(Relaxed));
+        // Not asked again: no request is sent.
+        let song = Song { name: "Creep".into(), artist: "Radiohead".into(), ..Song::default() };
+        assert_eq!(provider("azlyrics", &song), None);
+    }
+
+    /// LRCLIB is asked again only through the paced loop: `http`'s own retries came 2, 4 and 8 seconds after a
+    /// 503 or 429, from each thread, ignoring the hold that told every thread to wait.
+    #[test]
+    fn lrclib_retries_wait_for_the_shared_hold() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/search", server.local_addr().unwrap());
+        let (sent, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (n, stream) in server.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                sent.send(Instant::now()).unwrap();
+                let (status, body) = if n == 0 { ("503 Service Unavailable", "") } else { ("200 OK", "[]") };
+                let reply =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let search = std::thread::spawn(move || lrclib_search(&url));
+        let first = asked.recv().unwrap();
+        // Another thread was told to slow down.
+        super::LRCLIB.hold(Duration::from_secs(5));
+        assert_eq!(search.join().unwrap(), Some(Vec::new()));
+        assert!(asked.recv().unwrap() - first >= Duration::from_secs(4));
+    }
+
+    /// An artist is matched by whole words: "¥$" (slug "y") took Genius Ukrainian Translations' "CARNIVAL" as its
+    /// own, as that name has a y in it.
+    #[test]
+    fn genius_artists_are_matched_by_whole_names() {
+        assert!(among("¥$", "¥$, Kanye West & Ty Dolla $ign"));
+        assert!(!among("¥$", "Genius Ukrainian Translations (Український переклад)"));
+        assert!(!among("¥$", "Kanye West & Ty Dolla $ign"));
+        assert!(!among("¥$", "Y & Kanye West"));
+        assert!(!among("Nas", "Jonas Brothers"));
+        assert!(among("Lil Wayne", "Drake & LilWayne"));
+        assert!(among("Kanye West", "¥$, Kanye West & Ty Dolla $ign"));
+        assert!(!among("", "Kanye West"));
+        assert!(genius_account("Genius Ukrainian Translations (Український переклад)", "¥$"));
+        assert!(genius_account("Genius Traducciones al Español", "Bad Bunny"));
+        assert!(!genius_account("¥$", "¥$"));
+    }
+
+    /// `meta --redownload --fetch-albums` downloaded an album once for each of its files, from several threads into
+    /// the same file, and saved songs at the output template's path, leaving the local `.mp3` beside the new `.opus`.
+    #[test]
+    fn redownloads_replace_local_files_and_download_each_song_once() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let file = PathBuf::from("/music/Artist/Album (2020)/Artist - Album (2020) - 01 - One.mp3");
+        let _ = REDOWNLOADS.set([("https://open.spotify.com/track/1".into(), file.clone())].into());
+        let song = |id: &str, name: &str| Song {
+            url: format!("https://open.spotify.com/track/{id}"),
+            name: name.into(),
+            artists: vec!["Artist".into()],
+            ..Song::default()
+        };
+        let local = Song { download_url: Some("https://music.youtube.com/watch?v=pinned".into()), ..song("1", "One") };
+        // The local song, then the album's songs of each of two files of the album.
+        let album = [song("1", "One"), song("2", "Two")];
+        let songs = [vec![local], album.to_vec(), album.to_vec()].concat();
+        let jobs = redownload_jobs(songs);
+        assert_eq!(jobs.iter().map(|song| song.name.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
+        assert_eq!(jobs[0].download_url.as_deref(), Some("https://music.youtube.com/watch?v=pinned"));
+        assert_eq!(out_path(&jobs[0], "redownload"), (file.with_extension("opus"), Some(&file)));
+        assert_eq!(out_path(&jobs[1], "redownload"), (path(&jobs[1]), None));
+        // Only `meta --redownload` writes to the local file; a download goes by the output template.
+        assert_eq!(out_path(&jobs[0], "download").0, PathBuf::from("Artist - One.opus"));
+    }
+
+    /// The folders written in `--output` were filled like song values: `../lib` became `_/lib` and `My Music: 50% Off`
+    /// became `My Music 50 Off`, so songs went elsewhere than `--scan-for-songs` looked.
+    #[test]
+    fn output_folders_stay_as_written() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let song = Song { name: "Song: A".into(), artists: vec!["Art".into()], ..Song::default() };
+        let out = |template: &str| template_path(template, &song);
+        assert_eq!(out("../lib/{artists} - {title}.{output-ext}"), PathBuf::from("../lib/Art - Song A.opus"));
+        assert_eq!(out("./x/{title}"), PathBuf::from("./x/Song A.opus"));
+        assert_eq!(out("../Music"), PathBuf::from("../Music/Art - Song A.opus"));
+        assert_eq!(
+            out("/srv/My Music: 50% Off/{artists}/{title}"),
+            PathBuf::from("/srv/My Music: 50% Off/Art/Song A.opus")
+        );
+        // A filled part is still made safe: a value cannot climb out of the folder.
+        let climb = Song { name: "../etc".into(), artists: vec!["Art".into()], ..Song::default() };
+        assert_eq!(template_path("lib/{title}", &climb), PathBuf::from("lib/..etc.opus"));
+    }
+
+    /// Slipknot's `.5: The Gray Chapter` made the hidden folder `.5 The Gray Chapter (2014)` and files starting with
+    /// `.5`, which Navidrome's scanner and file browsers skip, so the album never showed up.
+    #[test]
+    fn leading_dot_names_are_not_hidden() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let album = |name: &str| Song {
+            name: "Song A".into(),
+            artists: vec!["Slipknot".into()],
+            album_artist: "Slipknot".into(),
+            album_name: name.into(),
+            year: 2014,
+            track_number: 1,
+            ..Song::default()
+        };
+        let out = |name: &str| {
+            template_path("{album-artist}/{album} ({year})/{album} - {track-number} - {title}", &album(name))
+        };
+        assert_eq!(
+            out(".5: The Gray Chapter"),
+            PathBuf::from("Slipknot/_.5 The Gray Chapter (2014)/_.5 The Gray Chapter - 01 - Song A.opus")
+        );
+        // Names that start with `..` are shown and scanned, and stay as they are.
+        assert_eq!(
+            out("...And Justice for All"),
+            PathBuf::from("Slipknot/...And Justice for All (2014)/...And Justice for All - 01 - Song A.opus")
+        );
+    }
+
+    /// A song without a Spotify id got its URL's 40-digit SHA1 as the temporary names' id, and a SoundCloud song its
+    /// slug: with a 200-byte stem the names went over 255 bytes and FFmpeg failed with "File name too long".
+    #[test]
+    fn temp_names_fit_the_file_name_limit() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let song = |id: &str, url: &str| Song {
+            song_id: id.into(),
+            url: url.into(),
+            name: "Live At The BBC ".repeat(20),
+            artists: vec!["Art".into()],
+            ..Song::default()
+        };
+        let slug = "a-very-long-soundcloud-track-slug-that-goes-on-and-on-and-on-and-on-and-on-forever";
+        for song in [
+            song("", "https://open.spotify.com/track/none"),
+            song(slug, &format!("https://soundcloud.com/art/{slug}")),
+            song("4uLU6hMCjMI75M1A2tKUQC", "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"),
+        ] {
+            let out = path(&song);
+            let id = temp_id(&song);
+            for name in [format!("{id}.converted.flac"), format!("{id}.webm.part")] {
+                assert!(out.with_extension(name).file_name().unwrap().len() <= 255);
+            }
+        }
+        // Short ids stay as they were, so earlier runs' temporary files are still found and removed.
+        assert_eq!(temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")), "4uLU6hMCjMI75M1A2tKUQC");
     }
 }

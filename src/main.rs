@@ -80,6 +80,9 @@ pub struct Extra {
     pub upc: String,
     pub bpm: f64,
     pub gain: f64,
+    /// The song as it was before `--playlist-numbering` or `--playlist-retain-track-cover` gave it the playlist's
+    /// album, album artist, disc and track: Deezer's album is found, cached and read by the real ones.
+    pub release: Option<Box<Song>>,
 }
 
 static CONFIG: OnceLock<Value> = OnceLock::new();
@@ -146,21 +149,48 @@ pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 
 /// GET (or POST, given a body), retrying connection errors, 429 and 5xx with exponential backoff.
 pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8>> {
-    http_retrying(url, headers, body, number("max_retries"))
+    http_paced(url, headers, body, number("max_retries"), None)
 }
 
 /// [`http`] with `retries` retries; 0 for a caller that paces its own retries.
 pub fn http_retrying(url: &str, headers: &[(&str, &str)], body: Option<&str>, retries: u64) -> R<Vec<u8>> {
+    http_paced(url, headers, body, retries, None)
+}
+
+/// The pause before retry `attempt`: the server's Retry-After, else doubling. Capped, so that a dead host or a long
+/// ban under a high `--max-retries` fails within minutes rather than hanging each request for half an hour.
+fn backoff(attempt: u64, retry_after: Option<u64>) -> Duration {
+    Duration::from_secs(retry_after.unwrap_or(1 << attempt.min(5)).min(60))
+}
+
+/// [`http_retrying`], spaced by `pace`: a 429 holds it, so that every thread waits the pause out together rather
+/// than each asking again at its own time and keeping the limit on.
+pub fn http_paced(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    retries: u64,
+    pace: Option<&Pace>,
+) -> R<Vec<u8>> {
     let mut attempt = 0;
     loop {
+        if let Some(pace) = pace {
+            pace.wait();
+        }
         let method = if body.is_some() { "POST" } else { "GET" };
         let request = ureq::http::Request::builder().method(method).uri(url);
         let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
         let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
-        let retry = reply.as_ref().map_or(true, |reply| reply.status() == 429 || reply.status().is_server_error());
+        let status = reply.as_ref().map(|reply| reply.status()).ok();
+        let retry = status.is_none_or(|status| status == 429 || status.is_server_error());
         if retry && attempt < retries {
             attempt += 1;
-            std::thread::sleep(Duration::from_secs(1 << attempt));
+            let after = reply.as_ref().ok().and_then(|reply| reply.headers().get("retry-after"));
+            let pause = backoff(attempt, after.and_then(|after| after.to_str().ok()?.trim().parse().ok()));
+            match pace {
+                Some(pace) if status.is_some_and(|status| status == 429) => pace.hold(pause),
+                _ => std::thread::sleep(pause),
+            }
             continue;
         }
         let mut reply = reply?;
@@ -175,9 +205,14 @@ pub fn http_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body:
     Ok(serde_json::from_slice(&http(url, headers, body)?)?)
 }
 
-/// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all).
+/// The longest time a [`cached`] entry is read, but for those kept for good.
+const CACHE_DAYS: u64 = 7;
+
+/// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all, at most [`CACHE_DAYS`] or forever).
 pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
-    let path = HOME.join("cache").join(&format!("{:x}", Sha1::digest(key))[..16]);
+    // Entries kept for good go to their own folder, which [`prune_cache`] leaves alone: the names are hashes.
+    let dir = if days == u64::MAX { HOME.join("cache/keep") } else { HOME.join("cache") };
+    let path = dir.join(&format!("{:x}", Sha1::digest(key))[..16]);
     let days = if on("no_cache") { 0 } else { days };
     let age = fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|time| time.elapsed().ok());
     if age.is_some_and(|age| age.as_secs() / 86_400 < days) {
@@ -187,9 +222,21 @@ pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value
     }
     let value = fetch()?;
     if days > 0 {
-        let _ = fs::create_dir_all(HOME.join("cache")).and_then(|_| fs::write(&path, value.to_string()));
+        let _ = fs::create_dir_all(dir).and_then(|_| fs::write(&path, value.to_string()));
     }
     Ok(value)
+}
+
+/// Deletes the files in `dir` older than `days`. An expired entry is otherwise only replaced when its key is asked for
+/// again, so the cache (mostly YouTube Music replies of up to 300 KB) grew with every new query, without end.
+fn prune_cache(dir: &Path, days: u64) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let meta = entry.metadata().ok().filter(|meta| meta.is_file());
+        let age = meta.and_then(|meta| meta.modified().ok()?.elapsed().ok());
+        if age.is_some_and(|age| age.as_secs() / 86_400 >= days) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn url_encode(value: &str) -> String {
@@ -287,6 +334,7 @@ fn settings(args: &[String]) -> R<(String, Vec<String>)> {
 fn arrange(mut songs: Vec<Song>) -> Vec<Song> {
     let (numbering, retain) = (on("playlist_numbering"), on("playlist_retain_track_cover"));
     for song in songs.iter_mut().filter(|song| (numbering || retain) && song.list_name.is_some()) {
+        song.extra.release = Some(Box::new(song.clone()));
         song.album_name = song.list_name.clone().unwrap_or_default();
         song.track_number = song.list_position.map_or(song.track_number, |position| position as u32);
         song.tracks_count = song.list_length.map_or(song.tracks_count, |length| length as u32);
@@ -415,6 +463,7 @@ fn run() -> R<()> {
     }
     let meta_threads = number("meta_threads").max(1) as usize;
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
+    prune_cache(&HOME.join("cache"), CACHE_DAYS);
     if op == "meta" {
         return download::meta(&queries);
     }
@@ -452,6 +501,7 @@ fn run() -> R<()> {
     let done: Vec<(Song, R<PathBuf>)> =
         pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
     download::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
+    download::report_unchecked();
     let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
     let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
     if let Some(path) = sync_path {
@@ -474,5 +524,69 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backoff, http_paced, prune_cache, Pace};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant, SystemTime},
+    };
+
+    #[test]
+    fn the_cache_drops_expired_entries_but_keeps_the_kept_ones() {
+        let dir = std::env::temp_dir().join(format!("spotdl-cache-{}", std::process::id()));
+        fs::create_dir_all(dir.join("keep")).unwrap();
+        let week_ago = SystemTime::now() - Duration::from_secs(7 * 86_400 + 60);
+        for (name, old) in [("old", true), ("new", false), ("keep/old", true)] {
+            let file = fs::File::create(dir.join(name)).unwrap();
+            if old {
+                file.set_modified(week_ago).unwrap();
+            }
+        }
+        prune_cache(&dir, 7);
+        let left = ["old", "new", "keep/old"].map(|name| dir.join(name).exists());
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(left, [false, true, true]);
+    }
+
+    #[test]
+    fn retry_pauses_are_capped() {
+        assert_eq!(backoff(1, None), Duration::from_secs(2));
+        // `--max-retries 10` against a dead host: not 1024 s for the last retry.
+        assert_eq!(backoff(10, None), Duration::from_secs(32));
+        assert_eq!(backoff(1, Some(5)), Duration::from_secs(5));
+        assert_eq!(backoff(1, Some(86_400)), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_429_holds_every_thread_for_its_retry_after() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (i, stream) in server.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let _ = stream.read(&mut [0; 4096]);
+                let reply = if i == 0 { "429 Too Many Requests\r\nRetry-After: 1" } else { "200 OK" };
+                let _ = write!(stream, "HTTP/1.1 {reply}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        static PACE: Pace = Pace::new(0);
+        let start = Instant::now();
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            PACE.wait();
+            start.elapsed()
+        });
+        assert_eq!(http_paced(&url, &[], None, 3, Some(&PACE)).unwrap(), b"ok");
+        // One second as the server asked, not the two of the doubling pause.
+        assert!((900..1900).contains(&start.elapsed().as_millis()), "{:?}", start.elapsed());
+        // Another thread that asks during the hold waits it out too.
+        assert!(other.join().unwrap() >= Duration::from_millis(900));
     }
 }
