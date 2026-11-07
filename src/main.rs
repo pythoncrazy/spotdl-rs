@@ -21,7 +21,7 @@ pub static HOME: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(home.unwrap_or_default()).join(".spotdl")
 });
 
-const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"lyrics_aligner":null,"lyrics_aligner_jobs":1,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
+const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"lyrics_aligner":null,"lyrics_aligner_jobs":1,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"replaygain":false,"folder_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
 const ALIASES: [(&str, &str); 4] = [
     ("audio", "audio_providers"),
     ("lyrics", "lyrics_providers"),
@@ -451,6 +451,7 @@ fn run() -> R<()> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let done: Vec<(Song, R<PathBuf>)> =
         pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
+    download::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
     let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
     let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
     if let Some(path) = sync_path {
