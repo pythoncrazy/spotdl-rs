@@ -86,7 +86,7 @@ fn save_keeps_pins_and_lists_every_song() {
 }
 
 #[test]
-fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
+fn artist_keeps_albums_and_eps_whole_and_prefers_deluxe_editions() {
     let dir = dir("artist");
     let file = dir.join("kendrick.spotdl");
     let kendrick = "https://open.spotify.com/artist/2YZyLoL8N0Wb9xBt1NhZWg";
@@ -114,6 +114,15 @@ fn artist_keeps_albums_whole_and_prefers_deluxe_editions() {
     let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
     assert_eq!(album("2014 Forest Hills Drive (10 Year Anniversary Edition)"), 21);
     assert_eq!(album("2014 Forest Hills Drive"), 0);
+
+    // An EP keeps the songs that are also on an album: "She's A Riot" is on the EP and on "Learn To Exist".
+    let file = dir.join("giants.spotdl");
+    let giants = "https://open.spotify.com/artist/6wFwvxJkurQPU2UdeD4qVt";
+    ok(spotdl(&dir, &["save", giants, "--save-file", file.to_str().unwrap(), "--audio-providers="]));
+    let songs = json_file(&file);
+    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
+    assert_eq!(album("She's A Riot"), 5);
+    assert_eq!(album("Learn To Exist"), 12);
 }
 
 #[test]
