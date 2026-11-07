@@ -149,6 +149,14 @@ pub fn versionless(name: &str) -> &str {
     name.rsplit_once(" - ").filter(suffix).map_or(name, |(title, _)| title)
 }
 
+/// The slugged title without version notes, featured artists or a " - Remix" suffix, to compare the editions of
+/// an album: "Getting Better - Remix", "Getting Better - 2017 Mix" and "Getting Better - Remastered 2009" are all
+/// "getting-better", and "Norwegian Wood (This Bird Has Flown) [2026 Mix]" is "norwegian-wood-this-bird-has-flown".
+pub fn edition_title(name: &str) -> String {
+    let name = clean_name(versionless(name), &[]);
+    name.strip_suffix("-remix").unwrap_or(&name).into()
+}
+
 /// The slugged title without featured artists, soundtrack notes and version groups.
 fn clean_name(name: &str, artists: &[String]) -> String {
     let (mut clean, mut rest) = (String::new(), name);
