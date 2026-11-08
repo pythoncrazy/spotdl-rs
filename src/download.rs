@@ -571,13 +571,17 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     let query = url_encode(&format!("{artist} {title}"));
     // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
     // which is asked when the API cannot answer (a token that many people use is often out of requests).
-    // A token out of requests stays so for the hour: it is not asked again in this run.
+    // A token out of requests stays so for the hour, and a rejected one (401) for good: neither is asked again in
+    // this run.
     let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
     let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
         GENIUS.wait();
         let url = format!("https://api.genius.com/search?q={query}");
         let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
-        if reply.as_ref().is_err_and(|error| error.to_string().contains("HTTP 429")) {
+        if reply
+            .as_ref()
+            .is_err_and(|error| ["HTTP 429", "HTTP 401"].iter().any(|code| error.to_string().contains(code)))
+        {
             GENIUS_API_SPENT.store(true, Relaxed);
         }
         serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
