@@ -124,7 +124,11 @@ fn query(op: &str, variables: Value) -> R<Value> {
             let headers = [UA, ("Authorization", &format!("Bearer {token}"))];
             let reply = http_paced(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
             match reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?)) {
-                Ok(reply) if reply.get("data").is_some() => return Ok(reply),
+                // A GraphQL failure comes as `"data": null` (or with every field null), with "errors": it is no
+                // answer, and must not be cached as one ("Stay - 2016 Remix" then resolved to no song for a week).
+                Ok(reply) if reply["data"].as_object().is_some_and(|data| data.values().any(|v| !v.is_null())) => {
+                    return Ok(reply)
+                }
                 Ok(reply) => last = format!("{op}: {}", reply["errors"]),
                 Err(error) if error.to_string().starts_with("HTTP 401") => last = error.to_string(),
                 // Lost connections, 429 and 5xx were retried above: asking again here would square the requests.
@@ -320,7 +324,8 @@ fn editions(names: &[&str], albums: &[Vec<Song>]) -> Vec<usize> {
     // titles they start with.
     let same_title = |a: &str, b: &str| {
         let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-        long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        // "Revenge Of The Dreamers III: Director's Cut" is an edition of "Revenge Of The Dreamers III".
+        long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
     };
     // A clean edition never replaces one with explicit songs. Of two editions with the same songs, the explicit
     // one, then the one titled only with the album's title, then the first, is kept: "Animals (2018 Remix)",
@@ -948,6 +953,11 @@ mod tests {
         let original = songs(&["Signs of Life", "A New Machine, Pt. 1"], false);
         let names = ["A Momentary Lapse of Reason (2019 Remix)", "A Momentary Lapse of Reason"];
         assert_eq!(editions(&names, &[remix, original]), [1]);
+        // An edition after a colon: the Director's Cut has the 18 songs of the album and 12 more.
+        let titles: Vec<String> = (1..=30).map(|n| format!("Song {n}")).collect();
+        let names_of = |n: usize| titles[..n].iter().map(String::as_str).collect::<Vec<_>>();
+        let cut = ["Revenge Of The Dreamers III", "Revenge Of The Dreamers III: Director's Cut"];
+        assert_eq!(editions(&cut, &[songs(&names_of(18), true), songs(&names_of(30), true)]), [1]);
         // The clean edition, bigger here and sharing only 3 of its 5 titles, never replaces the explicit one; the
         // explicit one replaces it.
         let clean = [
