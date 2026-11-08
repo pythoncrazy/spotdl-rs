@@ -142,7 +142,8 @@ pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .max_idle_connections_per_host(64)
-        .proxy(text("proxy").and_then(|proxy| ureq::Proxy::new(proxy).ok()))
+        // `--proxy`, or else the usual HTTPS_PROXY / ALL_PROXY variables, as Python spotDL's requests reads them.
+        .proxy(text("proxy").and_then(|proxy| ureq::Proxy::new(proxy).ok()).or_else(ureq::Proxy::try_from_env))
         .build();
     ureq::Agent::new_with_config(config)
 });

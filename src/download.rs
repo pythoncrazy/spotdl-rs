@@ -495,8 +495,14 @@ pub fn report_unchecked() {
 /// "no lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which must not stop
 /// later runs from looking again.
 fn genius_answered(song: &Song) -> bool {
-    list("lyrics_providers").any(|name| name == "genius" || name == "synced")
-        && GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&genius_key(song, &song.artist, 1))
+    if !list("lyrics_providers").any(|name| name == "genius" || name == "synced") {
+        return false;
+    }
+    // Only the song's own page without words is "no lyrics": a search with no such page, or one that found
+    // nothing, leaves a vocal song to be looked up again later.
+    let pages =
+        GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&genius_key(song, &song.artist, 1)).cloned();
+    pages.into_iter().flatten().any(|page| instrumental(song, &page))
 }
 
 /// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
@@ -787,12 +793,50 @@ fn instrumental(song: &Song, page: &Page) -> bool {
     page.titled && words(&page.lyrics).is_empty() && released_on(song, page) == Some(true)
 }
 
+/// Lyrics without Genius's ticket ad: "See Don Toliver Live", "Get tickets as low as $462", and the song list that
+/// follows it ("You might also like", then titles and artists) up to the next section or blank line.
+fn without_ads(lyrics: &str) -> String {
+    let lines: Vec<&str> = lyrics.lines().collect();
+    let (mut kept, mut i) = (Vec::new(), 0);
+    while i < lines.len() {
+        let ad = |line: &str| line.trim_start().starts_with("Get tickets as low as");
+        if lines[i].trim_start().starts_with("See ") && lines.get(i + 1).is_some_and(|line| ad(line)) {
+            i += 2;
+            if lines.get(i).is_some_and(|line| line.trim() == "You might also like") {
+                i += 1;
+                while i < lines.len() && !lines[i].trim().is_empty() && !lines[i].trim_start().starts_with('[') {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+    kept.join("\n")
+}
+
+/// The words of a `.lrc` file without the "You might also like" marker that earlier Genius scrapes glued into lines
+/// ("[02:39.30]You might also like[Chorus]").
+fn clean_lrc(file: &Path) -> R<()> {
+    const LIST: &str = "You might also like";
+    let lrc = file.with_extension("lrc");
+    let Ok(text) = fs::read_to_string(&lrc) else { return Ok(()) };
+    if !text.contains(LIST) {
+        return Ok(());
+    }
+    let lines =
+        text.lines().map(|line| if line.contains(&format!("{LIST} ")) { line.into() } else { line.replace(LIST, "") });
+    Ok(fs::write(&lrc, lines.collect::<Vec<_>>().join("\n") + "\n")?)
+}
+
 /// Lyrics without the "You might also like" song list that Genius puts between its lyrics blocks, which earlier
 /// scrapes of its pages glued into the text ("I love youYou might also like[Chorus]"). One followed by a space is
 /// a line of lyrics ("You might also like me").
 fn unlisted(lyrics: &str) -> String {
     const LIST: &str = "You might also like";
-    let (mut out, mut rest) = (String::new(), lyrics);
+    let lyrics = &without_ads(lyrics);
+    let (mut out, mut rest) = (String::new(), lyrics.as_str());
     while let Some((before, after)) = rest.split_once(LIST) {
         out.push_str(before);
         if after.starts_with(' ') {
@@ -1663,9 +1707,14 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     };
     // `--overwrite metadata` or `force` checks the files' lyrics again.
     let replace = matches!(text("overwrite"), Some("force" | "metadata"));
+    clean_lrc(file)?;
     if complete && !force && !redownload && !replace && !missing_art {
         if measure {
             write_track_gain(file)?;
+        }
+        // Lyrics with Genius's song list or ticket ad in them are cleaned, also when nothing else is written.
+        if stored.is_some() && lyrics != stored {
+            write_lyrics(file, lyrics.clone())?;
         }
         if !on("generate_lrc") || file.with_extension("lrc").exists() || (lyrics.is_none() && no_lyrics) {
             return Ok(None);
@@ -1726,7 +1775,8 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     };
     // Lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under BULLY's) are replaced by the
     // song's Genius lyrics.
-    if replace && !force {
+    let genius = list("lyrics_providers").any(|name| name == "genius" || name == "synced");
+    if replace && !force && genius {
         // Genius's page is asked for its albums only when the lyrics differ.
         let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
         let page =
@@ -1753,7 +1803,9 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     if on_spotify {
         // Missing lyrics alone do not write the tags again: only the lyrics, or the key that none were found. Tags
         // written again keep the file's lyrics when the song has none, so an instrumental's are removed after them.
-        if !tagged || force {
+        // `--overwrite metadata` writes the tags again from Spotify and Deezer (fixed track totals, dates and
+        // flags reach files tagged before), keeping the file's lyrics, source URL and measured gain.
+        if !tagged || force || replace {
             write_tags(file, &song)?;
         }
         if cleared || (tagged && !force && (song.lyrics != stored || (!complete && genius_answered(&song)))) {
@@ -2075,6 +2127,10 @@ mod tests {
         assert_eq!(unlisted("I love youYou might also like[Chorus]\nOh"), "I love you\n[Chorus]\nOh");
         assert_eq!(unlisted("Hey\nYou might also like[Bridge]"), "Hey\n[Bridge]");
         assert_eq!(unlisted("You might also like me"), "You might also like me");
+        // Genius's ticket ad and the song list after it go; the lyrics around them stay.
+        let ad = "[Verse]\nI got it\nSee Don Toliver Live\nGet tickets as low as $462\nYou might also like\nOpposite\nDon Toliver\n\n[Chorus]\nYeah";
+        assert_eq!(unlisted(ad), "[Verse]\nI got it\n\n[Chorus]\nYeah");
+        assert_eq!(unlisted("See you later\nGet up"), "See you later\nGet up");
     }
 
     /// A Genius that cannot be asked (its website answers 403) is not a Genius without the song's page, which
