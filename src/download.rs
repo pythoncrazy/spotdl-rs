@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
-        Condvar, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Mutex, OnceLock, PoisonError,
     },
 };
 
@@ -34,31 +34,6 @@ static GENIUS: Pace = Pace::new(500);
 /// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
 static AZLYRICS: Pace = Pace::new(1500);
 static MUSIXMATCH: Pace = Pace::new(1500);
-static ALIGNING: Mutex<usize> = Mutex::new(0);
-static ALIGNED: Condvar = Condvar::new();
-
-/// One of the `lyrics_aligner_jobs` places for an aligner run; the place is free again when this is dropped.
-struct Turn;
-
-impl Turn {
-    fn take() -> Self {
-        let jobs = number("lyrics_aligner_jobs").max(1) as usize;
-        let mut running = ALIGNING.lock().unwrap_or_else(PoisonError::into_inner);
-        while *running >= jobs {
-            running = ALIGNED.wait(running).unwrap_or_else(PoisonError::into_inner);
-        }
-        *running += 1;
-        Turn
-    }
-}
-
-impl Drop for Turn {
-    fn drop(&mut self) {
-        *ALIGNING.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
-        ALIGNED.notify_one();
-    }
-}
-
 fn path_safe(value: &str) -> String {
     value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect()
 }
@@ -374,7 +349,8 @@ fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
             let other = plain_title(track["albumName"].as_str().unwrap_or_default());
             let same_album =
                 !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other));
-            let synced = text(track, "syncedLyrics");
+            // Synced lyrics timed to a longer recording keep their words, as plain lyrics.
+            let synced = text(track, "syncedLyrics").filter(|lyrics| timed_for(lyrics, song.duration));
             Some((!same_album, synced.is_none(), synced.or_else(|| text(track, "plainLyrics"))?))
         })
         .collect();
@@ -383,9 +359,9 @@ fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
     found.into_iter().map(|(_, _, lyrics)| lyrics).filter(|lyrics| seen.insert(lyrics.clone())).collect()
 }
 
-/// The first of LRCLIB's lyrics that `agrees`, synced ones first: [`lrclib`] puts the song's album first, for the
-/// aligner, and that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while
-/// others as long as the song are synced.
+/// The first of LRCLIB's lyrics that `agrees`, synced ones first: [`lrclib`] puts the song's album first, and
+/// that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while others as long as
+/// the song are synced.
 fn synced_first(found: Vec<String>, agrees: impl Fn(&String) -> bool) -> Option<String> {
     let at = found.iter().position(|lyrics| is_synced(lyrics) && agrees(lyrics));
     at.or_else(|| found.iter().position(&agrees)).map(|at| found[at].clone())
@@ -400,13 +376,6 @@ fn lrclib_agrees(lyrics: &str, checks: Option<&String>) -> bool {
         Some(by) => !lyrics.is_empty() && same_lyrics(lyrics, by),
         None => lyrics.is_empty() || is_synced(lyrics),
     }
-}
-
-/// Genius's lyrics for the song's title by `artist`: the pages of up to `max` hits with that artist and title
-/// (a song can have several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"), or nothing when
-/// Genius could not be asked.
-fn genius(song: &Song, artist: &str, max: usize) -> Option<Vec<String>> {
-    Some(genius_titled(song, artist, max)?.into_iter().map(|page| page.lyrics).collect())
 }
 
 /// A Genius page of lyrics.
@@ -454,7 +423,8 @@ fn genius_key(song: &Song, artist: &str, max: usize) -> String {
     format!("{artist}\n{}\n{}\n{max}", song.name, song.year)
 }
 
-/// [`genius`]'s pages. `None` (Genius could not be asked) is not "no page": no page lets LRCLIB's lyrics in
+/// Genius's pages for the song's title by `artist`: up to `max` hits with that artist and title (a song can have
+/// several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"). `None` (Genius could not be asked) is not "no page": no page lets LRCLIB's lyrics in
 /// unchecked, while a Genius that cannot be asked leaves them for a later run that can check them.
 fn genius_titled(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     let key = genius_key(song, artist, max);
@@ -502,7 +472,10 @@ fn genius_answered(song: &Song) -> bool {
     // nothing, leaves a vocal song to be looked up again later.
     let pages =
         GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&genius_key(song, &song.artist, 1)).cloned();
-    pages.into_iter().flatten().any(|page| instrumental(song, &page))
+    pages.is_some_and(|pages| {
+        pages.iter().any(|page| instrumental(song, page))
+            || (instrumental_title(&song.name) && pages.iter().all(|page| words(&page.lyrics).is_empty()))
+    })
 }
 
 /// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
@@ -568,47 +541,62 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
         return None;
     }
     let title = lyrics_title(song);
-    let query = url_encode(&format!("{artist} {title}"));
     // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
     // which is asked when the API cannot answer (a token that many people use is often out of requests).
     // A token out of requests stays so for the hour, and a rejected one (401) for good: neither is asked again in
     // this run.
-    let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
-    let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
-        GENIUS.wait();
-        let url = format!("https://api.genius.com/search?q={query}");
-        let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
-        if reply
-            .as_ref()
-            .is_err_and(|error| ["HTTP 429", "HTTP 401"].iter().any(|code| error.to_string().contains(code)))
-        {
-            GENIUS_API_SPENT.store(true, Relaxed);
-        }
-        serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
-    });
-    let mut hits = match from_api {
-        Some(hits) => hits,
-        None => {
-            let url = format!("https://genius.com/api/search/song?q={query}");
-            let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok()?;
-            reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default()
+    let search = |title: &str| -> Option<Vec<Value>> {
+        let query = url_encode(&format!("{artist} {title}"));
+        let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
+        let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
+            GENIUS.wait();
+            let url = format!("https://api.genius.com/search?q={query}");
+            let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
+            if reply
+                .as_ref()
+                .is_err_and(|error| ["HTTP 429", "HTTP 401"].iter().any(|code| error.to_string().contains(code)))
+            {
+                GENIUS_API_SPENT.store(true, Relaxed);
+            }
+            serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
+        });
+        match from_api {
+            Some(hits) => Some(hits),
+            None => {
+                let url = format!("https://genius.com/api/search/song?q={query}");
+                let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok()?;
+                Some(reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default())
+            }
         }
     };
     let song_title = plain_title(title);
     fn primary(hit: &Value) -> &str {
         hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default()
     }
+    // An instrumental ("Big Poppa - Instrumental", "Girl (Take 2 - Instrumental Backing Track)") takes only a page
+    // of an instrumental version (Genius has the studio talk of the Beatles' takes), never the sung song's words.
+    let wordless = instrumental_title(&song.name);
     // The same artist and the same title: the artist's first hit can be another of the artist's songs. The
     // artist may be one of several on the page ("¥$, Kanye West & Ty Dolla $ign").
-    let same = |hit: &&Value| {
+    let same = |hit: &Value| {
         let artists = hit["result"]["artist_names"].as_str().unwrap_or_default();
-        let hit_title = plain_title(hit["result"]["title"].as_str().unwrap_or_default());
+        let full_title = hit["result"]["title"].as_str().unwrap_or_default();
+        let hit_title = plain_title(full_title);
         (among(artist, artists) || among(primary(hit), artist))
             && !genius_account(primary(hit), artist)
             && !hit_title.is_empty()
             && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
+            && (!wordless || instrumental_title(full_title) || hit["result"]["instrumental"].as_bool() == Some(true))
     };
-    hits.retain(|hit| same(&hit));
+    let mut hits = search(title)?;
+    hits.retain(same);
+    // A title with a note after " - " ("Robbery - Live from the Sydney Opera House") has no page of its own: the
+    // song's page has its words.
+    let base = title.split(" - ").next().unwrap_or(title).trim();
+    if hits.is_empty() && base != title && !base.is_empty() {
+        hits = search(base)?;
+        hits.retain(same);
+    }
     // The page of the song's whole title goes first: "WHISKEY (RELEASE ME)" before Maroon 5's "Whiskey" (feat.
     // A$AP Rocky), and "For No One" before "For No One (Take 10 / Backing Track)", a session take from the 2022 box
     // set whose "For No One - 2022 Mix" is the song. Then the artist's own page, then the same title without notes
@@ -684,7 +672,11 @@ fn provider(name: &str, song: &Song) -> Option<String> {
                 return None;
             };
             let page = pages.into_iter().next();
-            if page.as_ref().is_some_and(|page| instrumental(song, page)) {
+            // An instrumental without a page of its own has no words: LRCLIB files the sung song's under its title.
+            let wordless = |page: &Page| words(&page.lyrics).is_empty();
+            if page.as_ref().is_some_and(|page| instrumental(song, page))
+                || (instrumental_title(&song.name) && page.as_ref().is_none_or(wordless))
+            {
                 return Some(String::new());
             }
             let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
@@ -693,7 +685,9 @@ fn provider(name: &str, song: &Song) -> Option<String> {
         }
         // A page without words is the song's answer that it has none, or else another song's.
         "genius" => {
-            let page = genius_titled(song, artist, 1)?.into_iter().next()?;
+            let Some(page) = genius_titled(song, artist, 1)?.into_iter().next() else {
+                return instrumental_title(&song.name).then(String::new);
+            };
             if instrumental(song, &page) {
                 return Some(String::new());
             }
@@ -790,6 +784,17 @@ fn words(lyrics: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a note of the title says that the recording has no singing: "Big Poppa - Instrumental; 2014 Remaster",
+/// "Girl (Take 2 - Instrumental Backing Track)", "Paperback Writer - Takes 1 & 2 / Backing Track". A song called
+/// "Instrumental" is not one.
+fn instrumental_title(title: &str) -> bool {
+    let Some(end) = [" (", " [", " - "].iter().filter_map(|note| title.find(note)).min() else { return false };
+    let notes = search::slug(&title[end..], "-");
+    let words: Vec<&str> = notes.split('-').collect();
+    words.iter().any(|word| matches!(*word, "instrumental" | "instrumentals" | "karaoke"))
+        || words.windows(2).any(|pair| pair == ["backing", "track"])
+}
+
 /// Whether Genius's page is the song's own (see [`genius_same`] and [`released_on`]) and has no words, only
 /// section names ("[Instrumental]"): the song is an instrumental. A page of another song with a like title
 /// ("Bohemian Rhapsody (Instrumental)") says nothing about the song.
@@ -874,142 +879,70 @@ fn reference(song: &Song, own: Option<&String>) -> Option<Option<String>> {
             _ => {}
         }
     }
-    asked.then_some(None)
+    // An instrumental without a page of its own has no words to check others by: none are its.
+    asked.then(|| instrumental_title(&song.name).then(|| "[Instrumental]".to_string()))
 }
 
-/// What the `lyrics_aligner` command made of the lyrics.
-enum Aligned {
-    Lrc(String),
-    /// The lyrics are not the words of this recording (exit status 3).
-    NoFit,
-    /// The recording cannot tell: its words are not heard (exit status 4).
-    Unsure,
-    Failed,
-}
-
-/// Plain lyrics timed to the recording by the `lyrics_aligner` command. The command gets the audio file, a text
-/// file with the lyrics and the `.lrc` file to write. It exits with status 3 when the lyrics do not fit the
-/// recording, and with status 4 when it cannot tell (the words of the recording are not heard).
-fn align(file: &Path, lyrics: &str) -> Aligned {
-    let mut command = text("lyrics_aligner").unwrap_or_default().split_whitespace();
-    let Some(program) = command.next() else { return Aligned::Failed };
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    let temp =
-        std::env::temp_dir().join(format!("spotdl-align-{}-{}", std::process::id(), COUNT.fetch_add(1, Relaxed)));
-    let (input, output) = (temp.with_extension("txt"), temp.with_extension("lrc"));
-    if fs::write(&input, lyrics).is_err() {
-        return Aligned::Failed;
-    }
-    // `lyrics_aligner_jobs` songs at a time (default 1): the aligner uses every CPU core, or the GPU.
-    let result = {
-        let _turn = Turn::take();
-        Command::new(program).args(command).arg(file).arg(&input).arg(&output).output()
-    };
-    let lrc = match result {
-        Ok(result) if result.status.success() => {
-            fs::read_to_string(&output).ok().filter(|lrc| is_synced(lrc)).map_or(Aligned::Failed, Aligned::Lrc)
-        }
-        Ok(result) => {
-            let error = String::from_utf8_lossy(&result.stderr);
-            let error = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default();
-            log("WARNING", &format!("lyrics aligner: {}: {}", file.display(), error.trim()));
-            match result.status.code() {
-                Some(3) => Aligned::NoFit,
-                Some(4) => Aligned::Unsure,
-                _ => Aligned::Failed,
-            }
-        }
-        Err(error) => {
-            log("WARNING", &format!("lyrics aligner: {program}: {error}"));
-            Aligned::Failed
-        }
-    };
-    let _ = (fs::remove_file(&input), fs::remove_file(&output));
-    lrc
-}
-
-/// The `.lrc` next to the file; false when the aligner finds that no lyrics found are the song's. Synced lyrics
-/// are timed to one recording: without an aligner, they are used when they were timed to a recording as long as
-/// the file (the song's own lyrics, or else LRCLIB's for the file's length).
-fn write_lrc(file: &Path, song: &Song) -> R<bool> {
+/// The `.lrc` next to the file. Synced lyrics are timed to one recording: they are used when they were timed to a
+/// recording as long as the file (no line after its end, see [`timed_for`]) and their words are the song's (see
+/// [`reference`]): the song's own, the old `.lrc`, or LRCLIB's for the file's length. Without such lyrics, an old
+/// `.lrc` with the words of another song, or timed to a longer recording, is removed. Without an answer from
+/// Genius, nothing can be checked: no `.lrc` is written and none is removed.
+fn write_lrc(file: &Path, song: &Song) -> R<()> {
     let sidecar = file.with_extension("lrc");
     let replace = matches!(text("overwrite"), Some("force" | "metadata"));
     if !on("generate_lrc") || (sidecar.exists() && !replace) {
-        return Ok(true);
+        return Ok(());
     }
     let length = lofty::read_from_path(file)?.properties().duration().as_secs_f64();
     let recording = Song { duration: length, ..song.clone() };
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
-    // Without an aligner, or when it cannot hear the words, synced lyrics are used when they were timed to a
-    // recording as long as the file and their words are the song's (see `reference`): the song's own, the old
-    // `.lrc`, or LRCLIB's.
-    // Without such lyrics, an old `.lrc` with the words of another song is removed.
-    // Without an answer from Genius, nothing can be checked: no `.lrc` is written and none is removed.
-    let checked = |own: Option<String>| -> R<bool> {
-        let Some(reference) = reference(song, own.as_ref()) else {
-            unchecked(song);
-            return Ok(true);
-        };
-        let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
-        // The old `.lrc` goes before LRCLIB, which is often busy.
-        let own_synced = own.filter(|lyrics| fits && is_synced(lyrics));
-        let old = fs::read_to_string(&sidecar).ok().filter(|lyrics| is_synced(lyrics));
-        let found = std::iter::once_with(|| lrclib(&recording, false)).flatten().filter(|lyrics| is_synced(lyrics));
-        if let Some(lrc) = own_synced.into_iter().chain(old).chain(found).find(agrees) {
+    let Some(reference) = reference(song, own.as_ref()) else {
+        unchecked(song);
+        return Ok(());
+    };
+    let agrees = |lyrics: &String| reference.as_ref().is_none_or(|words| same_lyrics(lyrics, words));
+    let timed = |lyrics: &String| is_synced(lyrics) && timed_for(lyrics, length);
+    // The old `.lrc` goes before LRCLIB, which is often busy.
+    let own_synced = own.filter(|lyrics| fits && timed(lyrics));
+    let old = fs::read_to_string(&sidecar).ok();
+    let found = std::iter::once_with(|| lrclib(&recording, false)).flatten().filter(timed);
+    let kept = old.clone().filter(timed);
+    if let Some(lrc) = own_synced.into_iter().chain(kept).chain(found).find(agrees) {
+        if old.as_ref() != Some(&lrc) {
             fs::write(&sidecar, lrc)?;
-        } else if replace && fs::read_to_string(&sidecar).is_ok_and(|old| !agrees(&old)) {
-            log("WARNING", &format!("{}: removed, its lyrics are another song's", sidecar.display()));
+        }
+    } else if let Some(old) = old.filter(|_| replace) {
+        let why = if !agrees(&old) { "its lyrics are another song's" } else { "it is timed to a longer recording" };
+        if !agrees(&old) || !timed_for(&old, length) {
+            log("WARNING", &format!("{}: removed, {why}", sidecar.display()));
             fs::remove_file(&sidecar)?;
         }
-        Ok(true)
+    }
+    Ok(())
+}
+
+/// Whether synced lyrics fit a recording `length` seconds long: no line comes long after its end. LRCLIB files
+/// lyrics timed to an album version or another concert under a shorter edit's length ("Lucid Dreams" on Hits To The
+/// Head runs 4 minutes past the song). Lyrics a little off are still the song's timing: up to 15 seconds over is
+/// another master's fade or a slow upload ("Walk Away - 7"" is 3 seconds over, "This Fire" 13). Plain lyrics fit
+/// any recording.
+fn timed_for(lyrics: &str, length: f64) -> bool {
+    last_time(lyrics).is_none_or(|last| last <= length + SLACK)
+}
+
+/// Seconds that the last line of synced lyrics may come after the end of the recording.
+const SLACK: f64 = 15.0;
+
+/// The time of the last `[mm:ss.xx]` line, in seconds.
+fn last_time(lyrics: &str) -> Option<f64> {
+    let time = |line: &str| {
+        let (stamp, _) = line.trim_start().strip_prefix('[')?.split_once(']')?;
+        let (minutes, seconds) = stamp.split_once(':')?;
+        Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?)
     };
-    if !text("lyrics_aligner").is_some_and(|command| !command.trim().is_empty()) {
-        return checked(own);
-    }
-    // The aligner checks each candidate against the recording, in this order, and times the first that fits: the
-    // old `.lrc`, the song's own synced lyrics, LRCLIB's versions as long as the file, the song's own plain lyrics,
-    // and for a song that is not on Spotify, the Genius pages of each of its artists. Same titles and lengths do not
-    // make the same song ("KING" on BULLY and on VULTURES 1). LRCLIB is often busy, so it is asked only when the
-    // lyrics before it do not fit.
-    let old = fs::read_to_string(&sidecar).ok().filter(|lrc| is_synced(lrc));
-    let (own_synced, own_plain): (Vec<String>, Vec<String>) = own.clone().into_iter().partition(|l| is_synced(l));
-    let sources: [Box<dyn FnOnce() -> Vec<String> + '_>; 5] = [
-        Box::new(|| old.into_iter().collect()),
-        Box::new(|| own_synced),
-        Box::new(|| lrclib(&recording, false).into_iter().filter(|lyrics| !lyrics.is_empty()).collect()),
-        Box::new(|| own_plain),
-        Box::new(|| {
-            let artists = song.artists.iter().chain([&song.artist]);
-            if song.song_id.is_empty() {
-                artists.filter_map(|artist| genius(song, artist, 4)).flatten().collect()
-            } else {
-                vec![]
-            }
-        }),
-    ];
-    let candidates = sources.into_iter().flat_map(|source| source());
-    let mut tried = HashSet::new();
-    let mut no_fit = false;
-    for lyrics in candidates.into_iter().filter(|lyrics| tried.insert(plain_lyrics(lyrics))) {
-        match align(file, &lyrics) {
-            Aligned::Lrc(lrc) => {
-                fs::write(sidecar, lrc)?;
-                return Ok(true);
-            }
-            Aligned::NoFit => no_fit = true,
-            // One transcript serves every candidate, so the others cannot tell either. An old `.lrc` stays.
-            Aligned::Unsure if sidecar.exists() => return Ok(true),
-            Aligned::Unsure => return checked(own),
-            Aligned::Failed => return Ok(true),
-        }
-    }
-    // An old `.lrc` with the words of another recording is removed.
-    if no_fit && sidecar.exists() {
-        log("WARNING", &format!("{}: removed, its lyrics do not fit the song", sidecar.display()));
-        fs::remove_file(sidecar)?;
-    }
-    Ok(!no_fit)
+    lyrics.lines().filter_map(time).reduce(f64::max)
 }
 
 /// Where the Spotify URL goes: the keys Python spotDL uses, so either tool can rescan the other's files.
@@ -1689,7 +1622,14 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     let wanted = Song { album_artist, artist_id: "-".into(), cover_url: Some(String::new()), ..Song::default() };
     let missing_art = on("folder_art") && !folder_images(file, &wanted).is_empty();
     let stored = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
-    let lyrics = stored.as_deref().map(unlisted).filter(|lyrics| !lyrics.is_empty());
+    // Synced lyrics in the tags with lines after the song's end are timed to a longer recording: their words stay,
+    // without the times.
+    let length = audio.properties().duration().as_secs_f64();
+    let untimed = |lyrics: String| match timed_for(&lyrics, length) {
+        true => lyrics,
+        false => plain_lyrics(&lyrics).trim().to_string(),
+    };
+    let lyrics = stored.as_deref().map(unlisted).map(untimed).filter(|lyrics| !lyrics.is_empty());
     // The comment is the URL the audio was downloaded from; tags written again keep it.
     let source = tag.comment().filter(|comment| comment.starts_with("http")).map(String::from);
     let (force, redownload) = (on("force_update_metadata"), on("redownload"));
@@ -1705,7 +1645,7 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
         album_name: tag.album().unwrap_or_default().into(),
         year: tag.year().unwrap_or_default(),
         track_number: tag.track().unwrap_or_default(),
-        duration: audio.properties().duration().as_secs_f64(),
+        duration: length,
         lyrics: lyrics.clone(),
         ..Song::default()
     };
@@ -1792,6 +1732,19 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
                 log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
             }
             song.lyrics = (!cleared).then_some(page.lyrics);
+        } else if let Some(old) = song.lyrics.clone().filter(|_| instrumental_title(&song.name)) {
+            // An instrumental's lyrics are those of its own page ("Big Poppa (Instrumental)", the studio talk of a
+            // Beatles take), or none; the sung song's words are another recording's.
+            let pages: Option<Vec<Vec<Page>>> = artists.clone().map(|artist| genius_titled(&song, artist, 1)).collect();
+            let pages = pages.map(|pages| pages.concat());
+            if let Some(pages) = pages.filter(|pages| !pages.iter().any(|page| same_lyrics(&old, &page.lyrics))) {
+                let page = pages.into_iter().find(|page| !words(&page.lyrics).is_empty());
+                cleared = page.is_none();
+                if !cleared {
+                    log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
+                }
+                song.lyrics = page.map(|page| page.lyrics);
+            }
         }
     }
     if cleared {
@@ -1817,15 +1770,11 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
         }
         write_lrc(file, &song)?;
     } else {
-        // A song that is not on Spotify keeps its own tags. Without other lyrics, the words of its old `.lrc` file
-        // are timed again. New lyrics go into the tags unless the aligner finds that they are another song's.
+        // A song that is not on Spotify keeps its own tags; only its lyrics change.
         let new = song.lyrics.clone().filter(|_| song.lyrics != stored);
         let none_found = song.lyrics.is_none() && (cleared || !no_lyrics && genius_answered(&song));
-        if song.lyrics.is_none() && !cleared {
-            song.lyrics = fs::read_to_string(file.with_extension("lrc")).ok().map(|lrc| plain_lyrics(&lrc));
-        }
-        let fits = write_lrc(file, &song)?;
-        if let Some(new) = new.filter(|_| fits) {
+        write_lrc(file, &song)?;
+        if let Some(new) = new {
             write_lyrics(file, Some(new))?;
         } else if none_found {
             write_lyrics(file, None)?;
@@ -1858,7 +1807,7 @@ pub fn meta(paths: &[String]) -> R<()> {
             false => audio_files(path, &mut files),
         }
     }
-    // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites and the aligner.
+    // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites.
     let pool = rayon::ThreadPoolBuilder::new().num_threads(number("threads").max(1) as usize).build()?;
     let results: Vec<R<Option<Song>>> = pool.install(|| {
         files
@@ -1918,10 +1867,11 @@ pub fn meta(paths: &[String]) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics, is_synced,
-        lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path, provider, rate_args,
-        redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id, template_path, track_gain,
-        unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics,
+        instrumental_title, is_synced, lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path,
+        provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id,
+        template_path, timed_for, track_gain, unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED,
+        LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -2048,6 +1998,42 @@ mod tests {
         assert!(rate_args("disable", "mp3", Some(160.0)).is_empty());
         assert_eq!(rate_args("0", "mp3", Some(160.0)), ["-q:a", "0"]);
         assert_eq!(rate_args("256k", "mp3", Some(160.0)), ["-b:a", "256k"]);
+    }
+
+    #[test]
+    fn titles_with_an_instrumental_note_are_instrumentals() {
+        for title in [
+            "Big Poppa - Instrumental; 2014 Remaster",
+            "Girl (Take 2 - Instrumental Backing Track)",
+            "Paperback Writer - Takes 1 & 2 / Backing Track",
+            "No Complaints (Instrumental) (Bonus)",
+            "Juicy - Remix Instrumental; 2014 Remaster",
+        ] {
+            assert!(instrumental_title(title), "{title}");
+        }
+        for title in [
+            "Instrumental",
+            "Big Poppa",
+            "Track 1 - Live",
+            "Backing Track Blues",
+            "Robbery - Live from the Sydney Opera House",
+        ] {
+            assert!(!instrumental_title(title), "{title}");
+        }
+    }
+
+    /// LRCLIB files lyrics timed to a longer version under a shorter edit's length: such synced lyrics give only
+    /// their words. A last line up to 15 seconds after the end is the same recording, a little off.
+    #[test]
+    fn synced_lyrics_with_lines_after_the_end_are_plain() {
+        assert!(timed_for("[00:10.00]a\n[03:20.00]b", 199.0));
+        assert!(timed_for("[00:10.00]a\n[03:33.00]b", 199.0));
+        assert!(!timed_for("[00:10.00]a\n[03:35.00]b", 199.0));
+        assert!(!timed_for("[00:10.00]a\n[07:20.00]b\n[03:20.00]c", 199.0));
+        assert!(timed_for("plain words\nno times", 1.0));
+        let song = Song { name: "Lucid Dreams".into(), duration: 199.0, ..Song::default() };
+        let track = serde_json::json!({"duration": 199.0, "syncedLyrics": "[07:20.00]Lucid dreams", "plainLyrics": "Lucid dreams"});
+        assert_eq!(lrclib_lyrics(&song, &[track]), vec!["Lucid dreams".to_string()]);
     }
 
     /// LRCLIB's word that a song is an instrumental is an answer (`""`), but only when every version as long as the
