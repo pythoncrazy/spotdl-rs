@@ -500,35 +500,33 @@ fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyric
 }
 
 #[test]
-fn lyrics_aligner_times_lyrics_keeps_them_when_unsure_and_removes_lyrics_of_another_song() {
-    let dir = dir("aligner");
+fn synced_lyrics_timed_past_the_end_of_the_song_lose_their_times_and_their_lrc() {
+    let dir = dir("timed");
     let file = local_song(&dir);
     let lrc = file.with_extension("lrc");
-    let aligner = |name: &str, body: &str| {
-        let script = dir.join(name);
-        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        Command::new("chmod").arg("+x").arg(&script).status().unwrap();
-        script.to_str().unwrap().to_string()
+    meta(&dir, &file, &[]);
+    let words: Vec<String> = lyrics(&file).unwrap().lines().filter(|l| !l.starts_with('[')).map(String::from).collect();
+    // The song's own words, timed to the 10-second recording, or with lines up to a minute in.
+    let timed = |step: usize| -> String {
+        let line = |(i, l): (usize, &String)| format!("[00:{:05.2}]{l}", (i * step) as f64 / 10.0 % 60.0);
+        words.iter().take(9).enumerate().map(line).collect::<Vec<_>>().join("\n") + "\n"
     };
-    let args = ["--generate-lrc", "--overwrite", "metadata", "--lyrics-aligner"];
+    let (fits, longer) = (timed(10), timed(70));
+    let args = ["--generate-lrc", "--overwrite", "metadata"];
 
-    // The aligner gets the audio, the plain lyrics and the .lrc to write.
-    let fits = aligner("fits.sh", r#"[ -f "$1" ] && grep -q "Verse 1" "$2" && echo "[00:01.00]timed" > "$3""#);
-    meta(&dir, &file, &[&args[..], &[&fits]].concat());
-    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]timed\n");
-    assert!(lyrics(&file).is_some());
+    fs::write(&lrc, &fits).unwrap();
+    let output = meta(&dir, &file, &args);
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), fits, "{output}");
 
-    // Exit status 4: the aligner cannot hear the words, so the old .lrc stays.
-    let unsure = aligner("unsure.sh", "exit 4");
-    let output = meta(&dir, &file, &[&args[..], &[&unsure]].concat());
-    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]timed\n", "{output}");
-
-    // Exit status 3: the lyrics are another song's, so the old .lrc goes and no lyrics go into the tags.
-    let mut tagged = lofty::read_from_path(&file).unwrap();
-    tagged.primary_tag_mut().unwrap().remove_key(&ItemKey::Lyrics);
-    tagged.save_to_path(&file, WriteOptions::default()).unwrap();
-    let other = aligner("other.sh", "exit 3");
-    let output = meta(&dir, &file, &[&args[..], &[&other]].concat());
+    fs::write(&lrc, &longer).unwrap();
+    let output = meta(&dir, &file, &args);
     assert!(!lrc.exists(), "{output}");
-    assert!(lyrics(&file).is_none());
+
+    // Synced lyrics in the tags with lines after the end keep their words, without the times.
+    let mut tagged = lofty::read_from_path(&file).unwrap();
+    tagged.primary_tag_mut().unwrap().insert_text(ItemKey::Lyrics, longer.clone());
+    tagged.save_to_path(&file, WriteOptions::default()).unwrap();
+    meta(&dir, &file, &[]);
+    let plain = lyrics(&file).unwrap();
+    assert!(!plain.contains("[00:") && plain.contains(words[0].as_str()), "{plain}");
 }
