@@ -923,12 +923,17 @@ fn write_lrc(file: &Path, song: &Song) -> R<()> {
     Ok(())
 }
 
-/// Whether synced lyrics fit a recording `length` seconds long: no line comes after its end. LRCLIB files lyrics
-/// timed to an album version or another concert under a shorter edit's length ("Lucid Dreams" on Hits To The Head
-/// runs 4 minutes past the song). Plain lyrics fit any recording.
+/// Whether synced lyrics fit a recording `length` seconds long: no line comes long after its end. LRCLIB files
+/// lyrics timed to an album version or another concert under a shorter edit's length ("Lucid Dreams" on Hits To The
+/// Head runs 4 minutes past the song). Lyrics a little off are still the song's timing: up to 15 seconds over is
+/// another master's fade or a slow upload ("Walk Away - 7"" is 3 seconds over, "This Fire" 13). Plain lyrics fit
+/// any recording.
 fn timed_for(lyrics: &str, length: f64) -> bool {
-    last_time(lyrics).is_none_or(|last| last <= length + 2.0)
+    last_time(lyrics).is_none_or(|last| last <= length + SLACK)
 }
+
+/// Seconds that the last line of synced lyrics may come after the end of the recording.
+const SLACK: f64 = 15.0;
 
 /// The time of the last `[mm:ss.xx]` line, in seconds.
 fn last_time(lyrics: &str) -> Option<f64> {
@@ -2018,10 +2023,12 @@ mod tests {
     }
 
     /// LRCLIB files lyrics timed to a longer version under a shorter edit's length: such synced lyrics give only
-    /// their words. A last line up to 2 seconds after the end is the same recording.
+    /// their words. A last line up to 15 seconds after the end is the same recording, a little off.
     #[test]
     fn synced_lyrics_with_lines_after_the_end_are_plain() {
         assert!(timed_for("[00:10.00]a\n[03:20.00]b", 199.0));
+        assert!(timed_for("[00:10.00]a\n[03:33.00]b", 199.0));
+        assert!(!timed_for("[00:10.00]a\n[03:35.00]b", 199.0));
         assert!(!timed_for("[00:10.00]a\n[07:20.00]b\n[03:20.00]c", 199.0));
         assert!(timed_for("plain words\nno times", 1.0));
         let song = Song { name: "Lucid Dreams".into(), duration: 199.0, ..Song::default() };
