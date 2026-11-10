@@ -5,6 +5,7 @@ mod html;
 mod http;
 mod lrclib;
 mod lyrics;
+mod meta;
 mod replaygain;
 mod search;
 mod spotify;
@@ -380,7 +381,7 @@ fn run() -> R<()> {
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
     prune_cache(&HOME.join("cache"), CACHE_DAYS);
     if op == "meta" {
-        return download::meta(&queries);
+        return meta::meta(&queries);
     }
     let sync_file = queries.first().filter(|query| op == "sync" && queries.len() == 1 && query.ends_with(".spotdl"));
     let read = |path: &String| -> R<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };

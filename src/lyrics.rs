@@ -336,6 +336,37 @@ pub(crate) fn reference(song: &Song, own: Option<&String>) -> Asked<Option<Strin
     Ok(instrumental_title(&song.name).then(|| "[Instrumental]".to_string()))
 }
 
+/// What `--overwrite metadata` makes of the lyrics already in the tags (`song.lyrics`).
+pub(crate) enum Check {
+    Keep,
+    /// The lyrics are another song's. They are replaced by the song's own, or, without words, removed.
+    Replace(Option<String>),
+}
+
+/// Checks the lyrics of a song against Genius's page of the song: lyrics that are another song's (LRCLIB's "KING" of
+/// VULTURES 1 under BULLY's) are replaced. Only a Genius page with the song's own title, dated to the release's year
+/// or listed on the release's album, can replace or remove lyrics; when that page has no words (an instrumental), they
+/// are removed.
+pub(crate) fn recheck(song: &Song) -> Check {
+    let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
+    // Genius's page is asked for its albums only when the lyrics differ.
+    let page =
+        song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(song, artist).ok().flatten()));
+    let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
+    if let Some(page) = page.filter(|page| differ(page) && released_on(song, page) == Ok(true)) {
+        return Check::Replace(Some(page.lyrics).filter(|lyrics| !words(lyrics).is_empty()));
+    }
+    // An instrumental's lyrics are those of its own page ("Big Poppa (Instrumental)", the studio talk of a Beatles
+    // take), or none; the sung song's words are another recording's.
+    let Some(old) = song.lyrics.as_ref().filter(|_| instrumental_title(&song.name)) else { return Check::Keep };
+    let pages: Asked<Vec<Vec<Page>>> = artists.map(|artist| genius_titled(song, artist, 1)).collect();
+    let Ok(pages) = pages.map(|pages| pages.concat()) else { return Check::Keep };
+    if pages.iter().any(|page| same_lyrics(old, &page.lyrics)) {
+        return Check::Keep;
+    }
+    Check::Replace(pages.into_iter().find(|page| !words(&page.lyrics).is_empty()).map(|page| page.lyrics))
+}
+
 /// The `.lrc` next to the file. Synced lyrics are timed to one recording: they are used when they were timed to a
 /// recording as long as the file (no line after its end, see [`timed_for`]) and their words are the song's (see
 /// [`reference`]): the song's own, the old `.lrc`, or LRCLIB's for the file's length. Without such lyrics, an old
