@@ -1,5 +1,4 @@
-//! Downloading songs: fetching the audio, tagging it, and putting it where the output template
-//! says.
+//! Downloading songs: fetching the audio, tagging it, and putting it where the output template says.
 
 use crate::files::{audio_files, output_root, path, skip_path, write_folder_art};
 use crate::lyrics::{find_lyrics, write_lrc};
@@ -18,15 +17,7 @@ use std::{
 };
 
 /// Template fields that only exist after Deezer enrichment.
-const ENRICHED: [&str; 7] = [
-    "{genre}",
-    "{isrc}",
-    "{publisher}",
-    "{upc}",
-    "{bpm}",
-    "{gain}",
-    "{original-date}",
-];
+const ENRICHED: [&str; 7] = ["{genre}", "{isrc}", "{publisher}", "{upc}", "{bpm}", "{gain}", "{original-date}"];
 
 static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 
@@ -37,17 +28,14 @@ static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
 
 fn archive(url: &str) -> R<()> {
     if let Some(path) = settings().archive.as_deref() {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
         std::io::Write::write_all(&mut file, format!("{url}\n").as_bytes())?;
     }
     Ok(())
 }
 
-/// Downloads one video's audio next to `out`, converting with FFmpeg unless it is already in the
-/// right format; returns the temporary file, which becomes `out` only once it is tagged.
+/// Downloads one video's audio next to `out`, converting with FFmpeg unless it is already in the right format; returns
+/// the temporary file, which becomes `out` only once it is tagged.
 fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
     let (format, bitrate) = (settings().format.as_str(), settings().bitrate.as_str());
     let selector = match format {
@@ -55,41 +43,25 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         "opus" => "bestaudio[ext=webm]/bestaudio",
         _ => "bestaudio",
     };
-    // yt-dlp makes the template's folder when it writes the file, so a song with no match or no
-    // working download leaves no empty artist and album folders.
+    // yt-dlp makes the template's folder when it writes the file, so a song with no match or no working download leaves
+    // no empty artist and album folders.
     let template = out.with_extension(format!("{id}.%(ext)s"));
     let (got, abr) = search::youtube(|| {
         let mut command = search::yt_dlp();
-        command.args([
-            "-f",
-            selector,
-            "--no-playlist",
-            "--no-warnings",
-            "--force-overwrites",
-            "-q",
-        ]);
+        command.args(["-f", selector, "--no-playlist", "--no-warnings", "--force-overwrites", "-q"]);
         // The source's bitrate (`NA` when unknown) is what `--bitrate auto` encodes at.
-        command
-            .args(["--print", "after_move:%(abr)s %(filepath)s", "-o"])
-            .arg(&template);
+        command.args(["--print", "after_move:%(abr)s %(filepath)s", "-o"]).arg(&template);
         if settings().sponsor_block {
             command.args(["--sponsorblock-remove", "all"]);
         }
         let output = search::run(command.arg(url))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let got = stdout
-            .lines()
-            .rev()
-            .filter_map(|line| line.split_once(' '))
-            .find(|(_, path)| Path::new(path).is_file());
+        let got =
+            stdout.lines().rev().filter_map(|line| line.split_once(' ')).find(|(_, path)| Path::new(path).is_file());
         got.map(|(abr, path)| (PathBuf::from(path), abr.parse::<f64>().ok()))
             .ok_or_else(|| format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()))
     })?;
-    let extension = got
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let extension = got.extension().unwrap_or_default().to_string_lossy().to_string();
     let keep = matches!(bitrate, "auto" | "disable");
     let temp = out.with_extension(format!("{id}.converted.{format}"));
     let convert = || -> R<()> {
@@ -106,29 +78,17 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
             _ => "pcm_s16le",
         };
         let mut ffmpeg = Command::new(settings().ffmpeg.as_str());
-        ffmpeg
-            .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
-            .arg(&got);
+        ffmpeg.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got);
         ffmpeg.args(["-vn", "-map_metadata", "-1", "-c:a", codec]);
         if codec != "copy" {
             ffmpeg.args(rate_args(bitrate, format, abr));
         }
         let output = search::run(
-            ffmpeg
-                .args(
-                    settings()
-                        .ffmpeg_args
-                        .as_deref()
-                        .unwrap_or_default()
-                        .split_whitespace(),
-                )
-                .arg(&temp),
+            ffmpeg.args(settings().ffmpeg_args.as_deref().unwrap_or_default().split_whitespace()).arg(&temp),
         )?;
         match output.status.success() {
             true => Ok(()),
-            false => {
-                Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into())
-            }
+            false => Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into()),
         }
     };
     let result = convert();
@@ -139,21 +99,14 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
     result.map(|()| temp)
 }
 
-/// FFmpeg's arguments for `--bitrate`, as in Python spotDL: `auto` encodes at the source's bitrate
-/// (128k when yt-dlp does not know it), digits are a VBR quality (`-q:a`, LAME's V0 to V9),
-/// anything else a bitrate, and `disable` leaves the encoder's default. FLAC and WAV are lossless,
-/// so a bitrate means nothing to them.
+/// FFmpeg's arguments for `--bitrate`, as in Python spotDL: `auto` encodes at the source's bitrate (128k when yt-dlp
+/// does not know it), digits are a VBR quality (`-q:a`, LAME's V0 to V9), anything else a bitrate, and `disable` leaves
+/// the encoder's default. FLAC and WAV are lossless, so a bitrate means nothing to them.
 fn rate_args(bitrate: &str, format: &str, abr: Option<f64>) -> Vec<String> {
     match bitrate {
         "disable" => vec![],
         "auto" if matches!(format, "flac" | "wav") => vec![],
-        "auto" => vec![
-            "-b:a".into(),
-            format!(
-                "{}k",
-                abr.filter(|abr| *abr >= 1.0).map_or(128, |abr| abr as u32)
-            ),
-        ],
+        "auto" => vec!["-b:a".into(), format!("{}k", abr.filter(|abr| *abr >= 1.0).map_or(128, |abr| abr as u32))],
         _ if !bitrate.is_empty() && bitrate.bytes().all(|b| b.is_ascii_digit()) => {
             vec!["-q:a".into(), bitrate.into()]
         }
@@ -161,34 +114,24 @@ fn rate_args(bitrate: &str, format: &str, abr: Option<f64>) -> Vec<String> {
     }
 }
 
-/// Removes the temporary files an interrupted download of `out` left: yt-dlp's `<stem>.<id>.<ext>`
-/// (and `.part`) and `fetch`'s `<stem>.<id>.converted.<format>`. Only names that start with
-/// `<stem>.<id>.` go.
+/// Removes the temporary files an interrupted download of `out` left: yt-dlp's `<stem>.<id>.<ext>` (and `.part`) and
+/// `fetch`'s `<stem>.<id>.converted.<format>`. Only names that start with `<stem>.<id>.` go.
 fn remove_temp_files(out: &Path, id: &str) {
     let prefix = out.with_extension(format!("{id}."));
     let (Some(dir), Some(prefix)) = (prefix.parent(), prefix.file_name()) else {
         return;
     };
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(prefix.as_encoded_bytes())
-        {
+        if entry.file_name().as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
             let _ = fs::remove_file(entry.path());
         }
     }
 }
 
-/// The id in `fetch`'s temporary names (`<stem>.<id>.converted.<format>`). The stem may fill 200
-/// bytes, so a Spotify id (22 bytes) or YouTube id (11) is kept, while a missing or longer id
-/// (SoundCloud slugs have no fixed length) is hashed to 16 hex digits: the names then stay under
-/// the 255-byte file name limit.
+/// The id in `fetch`'s temporary names (`<stem>.<id>.converted.<format>`). The stem may fill 200 bytes, so a Spotify id
+/// (22 bytes) or YouTube id (11) is kept, while a missing or longer id (SoundCloud slugs have no fixed length) is
+/// hashed to 16 hex digits: the names then stay under the 255-byte file name limit.
 fn temp_id(song: &Song) -> String {
     match song.song_id.as_str() {
         id if !id.is_empty() && id.len() <= 22 => id.into(),
@@ -196,8 +139,8 @@ fn temp_id(song: &Song) -> String {
     }
 }
 
-/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and
-/// the downloaded (untagged) temporary file.
+/// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the downloaded
+/// (untagged) temporary file.
 fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     let id = temp_id(song);
     remove_temp_files(out, &id);
@@ -215,10 +158,7 @@ fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
         }
         Err(error) => return Err(error),
     };
-    for url in candidates
-        .into_iter()
-        .filter(|url| song.download_url.as_ref() != Some(url))
-    {
+    for url in candidates.into_iter().filter(|url| song.download_url.as_ref() != Some(url)) {
         match fetch(&url, out, &id) {
             Ok(temp) => return Ok((url, temp)),
             Err(error) => failure = Some(error),
@@ -227,15 +167,10 @@ fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     Err(failure.unwrap_or_else(|| "no match".into()))
 }
 
-/// The file `op` writes a song to: `meta --redownload` replaces a local song's own file (its name
-/// with the selected format's extension), not a file at the output template's path, which would
-/// leave the old file as a duplicate.
+/// The file `op` writes a song to: `meta --redownload` replaces a local song's own file (its name with the selected
+/// format's extension), not a file at the output template's path, which would leave the old file as a duplicate.
 pub(crate) fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
-    match REDOWNLOADS
-        .get()
-        .filter(|_| op == "redownload")
-        .and_then(|files| files.get(&s.url))
-    {
+    match REDOWNLOADS.get().filter(|_| op == "redownload").and_then(|files| files.get(&s.url)) {
         Some(file) => (file.with_extension(settings().format.as_str()), Some(file)),
         None => (path(s), None),
     }
@@ -245,13 +180,10 @@ pub(crate) fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>
 fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if op == "save" {
         if settings().preload && s.download_url.is_none() {
-            // Spotify gives no ISRC; Deezer's is what lets the search find the release's own
-            // recording, as a download does. The save file keeps it, so a later download searches
-            // by it too.
+            // Spotify gives no ISRC; Deezer's is what lets the search find the release's own recording, as a download
+            // does. The save file keeps it, so a later download searches by it too.
             enrich(s);
-            s.download_url = search::find(s)
-                .ok()
-                .and_then(|urls| urls.into_iter().next());
+            s.download_url = search::find(s).ok().and_then(|urls| urls.into_iter().next());
         }
         s.lyrics = find_lyrics(s);
         return Ok(path(s));
@@ -267,9 +199,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         }
         return Ok(path(s));
     }
-    let early = ENRICHED
-        .iter()
-        .any(|field| settings().output.contains(field));
+    let early = ENRICHED.iter().any(|field| settings().output.contains(field));
     if early {
         enrich(s);
     }
@@ -277,23 +207,11 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     let scan = || {
         let root = output_root();
         let mut files = Vec::new();
-        audio_files(
-            if root.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                &root
-            },
-            &mut files,
-        );
-        let tagged = files
-            .into_iter()
-            .filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
+        audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
+        let tagged = files.into_iter().filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
         tagged.collect()
     };
-    let scanned = settings()
-        .scan_for_songs
-        .then(|| SCANNED.get_or_init(scan).get(&s.url).cloned())
-        .flatten();
+    let scanned = settings().scan_for_songs.then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
     let detected = settings()
         .detect_formats
         .iter()
@@ -307,22 +225,14 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         .or(detected)
         .unwrap_or_else(|| out.clone());
     let archived = settings().archive.as_deref().is_some_and(|file| {
-        let read = || {
-            fs::read_to_string(file)
-                .unwrap_or_default()
-                .lines()
-                .map(String::from)
-                .collect()
-        };
+        let read = || fs::read_to_string(file).unwrap_or_default().lines().map(String::from).collect();
         ARCHIVED.get_or_init(read).contains(&s.url)
     });
     let skip = settings().respect_skip_file && skip_path(&target).exists();
     let (exists, overwrite) = (target.is_file(), settings().overwrite.as_str());
-    // A moved file is not downloaded again, but its tags are written again for its new title, album
-    // or year.
+    // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
     let moved = exists && MOVED.get().is_some_and(|moved| moved.contains(&target));
-    let keep =
-        archived || skip || exists && overwrite == "skip" && !settings().force_update_metadata;
+    let keep = archived || skip || exists && overwrite == "skip" && !settings().force_update_metadata;
     if op != "redownload" && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
@@ -332,31 +242,23 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if !early {
         enrich(s);
     }
-    // A moved file's lyrics are the song's: they are kept rather than fetched again from paced
-    // sites.
+    // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
     if moved && s.lyrics.is_none() {
         let tag = audio(&target).ok();
-        let lyrics = tag.as_ref().and_then(|audio| {
-            audio
-                .primary_tag()?
-                .get_string(&ItemKey::Lyrics)
-                .map(String::from)
-        });
+        let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
         s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
     // Lyrics sites are paced, so fetch them while the audio downloads.
     let song = s.clone();
     let (lyrics, downloaded) = std::thread::scope(|scope| {
         let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(&song)));
-        let downloaded =
-            (!exists || overwrite == "force" || op == "redownload").then(|| download(&song, &out));
+        let downloaded = (!exists || overwrite == "force" || op == "redownload").then(|| download(&song, &out));
         (lyrics.join().ok().flatten(), downloaded)
     });
     s.lyrics = lyrics;
     match downloaded.transpose()? {
-        // The audio is tagged before it gets its name: a file at `out` is a finished song, which
-        // later runs skip and archive, so a failed or interrupted tagging must not leave an
-        // untagged one there.
+        // The audio is tagged before it gets its name: a file at `out` is a finished song, which later runs skip and
+        // archive, so a failed or interrupted tagging must not leave an untagged one there.
         Some((url, temp)) => {
             s.download_url = Some(url);
             if let Err(error) = write_tags(&temp, s).and_then(|()| Ok(fs::rename(&temp, &out)?)) {
@@ -380,19 +282,11 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     Ok(target)
 }
 
-/// Adds Deezer's metadata, warning when Deezer failed: the song is then tagged without genres, ISRC
-/// or barcode.
+/// Adds Deezer's metadata, warning when Deezer failed: the song is then tagged without genres, ISRC or barcode.
 pub(crate) fn enrich(s: &mut Song) -> bool {
     let result = spotify::enrich(s);
     if let Err(error) = &result {
-        log(
-            "WARNING",
-            &format!(
-                "{} - {}: no Deezer genres, ISRC or barcode: {error}",
-                s.artists.join(", "),
-                s.name
-            ),
-        );
+        log("WARNING", &format!("{} - {}: no Deezer genres, ISRC or barcode: {error}", s.artists.join(", "), s.name));
     }
     result.is_ok()
 }
@@ -416,22 +310,11 @@ pub(crate) fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
 
 /// Moves (or, for songs no longer listed, deletes) the files of songs whose output path changed.
 pub(crate) fn prune(old: &[Song], new: &[Song]) {
-    let next: HashMap<&str, &Song> = new
-        .iter()
-        .rev()
-        .map(|song| (song.url.as_str(), song))
-        .collect();
-    // A file a listed song writes is that song's, also when its URL changed (Spotify gives
-    // re-released songs new IDs): it is kept for the song's job, not deleted before a download that
-    // can fail.
+    let next: HashMap<&str, &Song> = new.iter().rev().map(|song| (song.url.as_str(), song)).collect();
+    // A file a listed song writes is that song's, also when its URL changed (Spotify gives re-released songs new IDs):
+    // it is kept for the song's job, not deleted before a download that can fail.
     let kept: HashSet<PathBuf> = new.iter().map(path).collect();
-    let files = |file: &Path| {
-        [
-            file.to_path_buf(),
-            skip_path(file),
-            file.with_extension("lrc"),
-        ]
-    };
+    let files = |file: &Path| [file.to_path_buf(), skip_path(file), file.with_extension("lrc")];
     let mut moved = HashSet::new();
     for song in old {
         let from = path(song);
@@ -440,15 +323,10 @@ pub(crate) fn prune(old: &[Song], new: &[Song]) {
         }
         let to = next.get(song.url.as_str()).map(|song| path(song));
         let targets = to.as_ref().filter(|to| !to.exists()).map(|to| files(to));
-        // A moved song's `.lrc` goes with it; `--sync-remove-lrc` decides only whether a removed
-        // song's goes.
+        // A moved song's `.lrc` goes with it; `--sync-remove-lrc` decides only whether a removed song's goes.
         let lrc = to.is_some() || settings().sync_remove_lrc;
         let had = from.is_file();
-        for (i, source) in files(&from)
-            .iter()
-            .enumerate()
-            .take(if lrc { 3 } else { 2 })
-        {
+        for (i, source) in files(&from).iter().enumerate().take(if lrc { 3 } else { 2 }) {
             // Only a missing source is no error: a renamed album's new folder does not exist yet.
             if !source.exists() {
                 continue;
@@ -459,14 +337,10 @@ pub(crate) fn prune(old: &[Song], new: &[Song]) {
                 None => fs::remove_file(source),
             };
             if let Err(error) = result {
-                log(
-                    "ERROR",
-                    &format!("could not move or remove {}: {error}", source.display()),
-                );
+                log("ERROR", &format!("could not move or remove {}: {error}", source.display()));
             }
         }
-        // The file at the new path has the old title, album or year in its tags until they are
-        // written again.
+        // The file at the new path has the old title, album or year in its tags until they are written again.
         if let Some(to) = to.filter(|to| had && to.is_file()) {
             moved.insert(to);
         }
@@ -475,36 +349,23 @@ pub(crate) fn prune(old: &[Song], new: &[Song]) {
     let _ = MOVED.set(moved);
 }
 
-/// Removes the folders of `file` (up to the output's fixed folder) that hold nothing more than the
-/// folder images of songs that are gone, so that a renamed or removed album leaves no empty album
-/// in the library.
+/// Removes the folders of `file` (up to the output's fixed folder) that hold nothing more than the folder images of
+/// songs that are gone, so that a renamed or removed album leaves no empty album in the library.
 fn remove_empty(file: &Path) {
     let root = output_root();
     let image = |file: &PathBuf| {
-        file.is_file()
-            && file
-                .file_name()
-                .is_some_and(|name| name == "cover.jpg" || name == "artist.jpg")
+        file.is_file() && file.file_name().is_some_and(|name| name == "cover.jpg" || name == "artist.jpg")
     };
-    for dir in file
-        .ancestors()
-        .skip(1)
-        .take_while(|dir| !dir.as_os_str().is_empty() && dir.starts_with(&root) && *dir != root)
+    for dir in
+        file.ancestors().skip(1).take_while(|dir| !dir.as_os_str().is_empty() && dir.starts_with(&root) && *dir != root)
     {
-        let Ok(entries) = fs::read_dir(dir).map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .collect::<Vec<_>>()
-        }) else {
+        let Ok(entries) =
+            fs::read_dir(dir).map(|entries| entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>())
+        else {
             return;
         };
         if !entries.iter().all(image)
-            || entries
-                .iter()
-                .try_for_each(fs::remove_file)
-                .and_then(|()| fs::remove_dir(dir))
-                .is_err()
+            || entries.iter().try_for_each(fs::remove_file).and_then(|()| fs::remove_dir(dir)).is_err()
         {
             return;
         }
@@ -515,8 +376,8 @@ fn remove_empty(file: &Path) {
 mod tests {
     use super::*;
 
-    /// `--bitrate auto` was taken as `disable` (FFmpeg's 128k for MP3), and `--bitrate 0` went to
-    /// `-b:a 0`, which FFmpeg also takes as 128k CBR instead of LAME's V0.
+    /// `--bitrate auto` was taken as `disable` (FFmpeg's 128k for MP3), and `--bitrate 0` went to `-b:a 0`, which
+    /// FFmpeg also takes as 128k CBR instead of LAME's V0.
     #[test]
     fn bitrates_are_passed_as_python_spotdl_does() {
         assert_eq!(rate_args("auto", "mp3", Some(160.155)), ["-b:a", "160k"]);
@@ -527,9 +388,8 @@ mod tests {
         assert_eq!(rate_args("256k", "mp3", Some(160.0)), ["-b:a", "256k"]);
     }
 
-    /// A song without a Spotify id got its URL's 40-digit SHA1 as the temporary names' id, and a
-    /// SoundCloud song its slug: with a 200-byte stem the names went over 255 bytes and FFmpeg
-    /// failed with "File name too long".
+    /// A song without a Spotify id got its URL's 40-digit SHA1 as the temporary names' id, and a SoundCloud song its
+    /// slug: with a 200-byte stem the names went over 255 bytes and FFmpeg failed with "File name too long".
     #[test]
     fn temp_names_fit_the_file_name_limit() {
         crate::settings::use_defaults();
@@ -540,15 +400,11 @@ mod tests {
             artists: vec!["Art".into()],
             ..Song::default()
         };
-        let slug =
-            "a-very-long-soundcloud-track-slug-that-goes-on-and-on-and-on-and-on-and-on-forever";
+        let slug = "a-very-long-soundcloud-track-slug-that-goes-on-and-on-and-on-and-on-and-on-forever";
         for song in [
             song("", "https://open.spotify.com/track/none"),
             song(slug, &format!("https://soundcloud.com/art/{slug}")),
-            song(
-                "4uLU6hMCjMI75M1A2tKUQC",
-                "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC",
-            ),
+            song("4uLU6hMCjMI75M1A2tKUQC", "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"),
         ] {
             let out = path(&song);
             let id = temp_id(&song);
@@ -556,12 +412,8 @@ mod tests {
                 assert!(out.with_extension(name).file_name().unwrap().len() <= 255);
             }
         }
-        // Short ids stay as they were, so earlier runs' temporary files are still found and
-        // removed.
-        assert_eq!(
-            temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")),
-            "4uLU6hMCjMI75M1A2tKUQC"
-        );
+        // Short ids stay as they were, so earlier runs' temporary files are still found and removed.
+        assert_eq!(temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")), "4uLU6hMCjMI75M1A2tKUQC");
     }
 }
 

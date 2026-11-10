@@ -1,5 +1,4 @@
-//! Fuzz tests for the title matching of `search.rs`: nothing may panic, and the scores and ratios
-//! stay in range.
+//! Fuzz tests for the title matching of `search.rs`: nothing may panic, and the scores and ratios stay in range.
 
 use super::*;
 use crate::gen::{json, runs, song, text};
@@ -9,25 +8,11 @@ fn title_matching_holds_its_properties_for_any_title() {
     runs("titles", |rng| {
         let (a, b) = (text(rng, 8), text(rng, 8));
         let (similar, back) = (ratio(&a, &b), ratio(&b, &a));
-        assert!(
-            (0.0..=100.0).contains(&similar) && (similar - back).abs() < 1e-9,
-            "{a:?} {b:?}"
-        );
+        assert!((0.0..=100.0).contains(&similar) && (similar - back).abs() < 1e-9, "{a:?} {b:?}");
         assert_eq!(ratio(&a, &a), 100.0, "{a:?}");
-        assert!(
-            slug(&a, "-")
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-            "{a:?}"
-        );
+        assert!(slug(&a, "-").bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'), "{a:?}");
         let artists = [text(rng, 2), text(rng, 2)];
-        let _ = (
-            clean_name(&a, &artists),
-            versionless(&a),
-            edition_title(&a),
-            markers(&a),
-            unnumbered(&a),
-        );
+        let _ = (clean_name(&a, &artists), versionless(&a), edition_title(&a), markers(&a), unnumbered(&a));
         let _ = (is_note(&a), is_version_suffix(&a), altered(&a));
     });
 }
@@ -45,12 +30,7 @@ fn scores_are_finite_and_never_negative() {
             explicit: rng.below(2) == 0,
         };
         let score = score(&wanted, &hit);
-        assert!(
-            score.is_finite() && score >= 0.0,
-            "{score} for {:?} and {:?}",
-            wanted.name,
-            hit.song.name
-        );
+        assert!(score.is_finite() && score >= 0.0, "{score} for {:?} and {:?}", wanted.name, hit.song.name);
         let _ = isrc_picks(&wanted, vec![hit]).count();
     });
 }

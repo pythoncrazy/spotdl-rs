@@ -1,6 +1,6 @@
-//! Seeded fuzzing helpers, for tests only: hostile text, API-shaped JSON and songs, and a runner
-//! that names the seed of a failing input. `FUZZ_ITERS` (default 3000) sets the inputs per test and
-//! `FUZZ_SEED` the first seed: `FUZZ_ITERS=2000000 cargo test --release fuzz` runs for minutes.
+//! Seeded fuzzing helpers, for tests only: hostile text, API-shaped JSON and songs, and a runner that names the seed of
+//! a failing input. `FUZZ_ITERS` (default 3000) sets the inputs per test and `FUZZ_SEED` the first seed:
+//! `FUZZ_ITERS=2000000 cargo test --release fuzz` runs for minutes.
 
 use crate::Song;
 use serde_json::{json, Value};
@@ -20,8 +20,8 @@ impl Rng {
     }
 }
 
-/// Pieces that the parsers treat specially, and the kind of text that has broken tools before:
-/// multi-byte and combining characters, no-break spaces, bidi marks, NUL and other controls.
+/// Pieces that the parsers treat specially, and the kind of text that has broken tools before: multi-byte and combining
+/// characters, no-break spaces, bidi marks, NUL and other controls.
 const PIECES: &[&str] = &[
     "",
     " ",
@@ -149,21 +149,13 @@ pub fn text(rng: &mut Rng, max: usize) -> String {
 pub fn lyrics(rng: &mut Rng) -> String {
     let line = |rng: &mut Rng| {
         let stamp = if rng.below(2) == 0 {
-            format!(
-                "[{:02}:{:02}.{:02}]",
-                rng.below(8),
-                rng.below(60),
-                rng.below(100)
-            )
+            format!("[{:02}:{:02}.{:02}]", rng.below(8), rng.below(60), rng.below(100))
         } else {
             String::new()
         };
         stamp + &text(rng, 6)
     };
-    (0..rng.below(12))
-        .map(|_| line(rng))
-        .collect::<Vec<_>>()
-        .join("\n")
+    (0..rng.below(12)).map(|_| line(rng)).collect::<Vec<_>>().join("\n")
 }
 
 const KEYS: &[&str] = &[
@@ -224,9 +216,8 @@ const KEYS: &[&str] = &[
     "explicit_lyrics",
 ];
 
-/// JSON like the web players' and lyrics sites' replies, with the keys the code reads, in the wrong
-/// places and with the wrong types: a changed or half-empty reply must fail a song, not abort the
-/// run.
+/// JSON like the web players' and lyrics sites' replies, with the keys the code reads, in the wrong places and with the
+/// wrong types: a changed or half-empty reply must fail a song, not abort the run.
 pub fn json(rng: &mut Rng, depth: usize) -> Value {
     match rng.below(if depth == 0 { 7 } else { 10 }) {
         0 => Value::Null,
@@ -236,11 +227,7 @@ pub fn json(rng: &mut Rng, depth: usize) -> Value {
         4 => json!(u64::MAX - rng.below(3) as u64),
         5 => json!(text(rng, 4)),
         6 => json!(-1.5e300),
-        7 | 8 => Value::Object(
-            (0..rng.below(5))
-                .map(|_| (rng.pick(KEYS).to_string(), json(rng, depth - 1)))
-                .collect(),
-        ),
+        7 | 8 => Value::Object((0..rng.below(5)).map(|_| (rng.pick(KEYS).to_string(), json(rng, depth - 1))).collect()),
         _ => Value::Array((0..rng.below(4)).map(|_| json(rng, depth - 1)).collect()),
     }
 }
@@ -266,19 +253,12 @@ pub fn song(rng: &mut Rng) -> Song {
 
 /// Runs `test` on `FUZZ_ITERS` inputs, each from its own seed, and says which seed failed.
 pub fn runs(name: &str, test: impl Fn(&mut Rng)) {
-    let var = |key: &str, default: u64| {
-        std::env::var(key)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    };
+    let var = |key: &str, default: u64| std::env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(default);
     crate::settings::use_defaults();
     let first = var("FUZZ_SEED", 1);
     for seed in first..first + var("FUZZ_ITERS", 3000) {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        if let Err(panic) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&mut rng)))
-        {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&mut rng))) {
             eprintln!("fuzz {name}: FUZZ_SEED={seed} FUZZ_ITERS=1 reproduces it");
             std::panic::resume_unwind(panic);
         }

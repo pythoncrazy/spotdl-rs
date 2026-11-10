@@ -11,17 +11,7 @@ fn sample_files(dir: &Path) -> Vec<Vec<u8>> {
         .filter_map(|ext| {
             let file = dir.join(format!("sample.{ext}"));
             let made = Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "quiet",
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=duration=1",
-                    "-metadata",
-                    "title=Sample",
-                ])
+                .args(["-v", "quiet", "-y", "-f", "lavfi", "-i", "sine=duration=1", "-metadata", "title=Sample"])
                 .arg(&file)
                 .status();
             made.ok()?.success().then(|| fs::read(&file).ok()).flatten()
@@ -29,8 +19,7 @@ fn sample_files(dir: &Path) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Flips, drops, repeats and adds bytes, and cuts the end off, as a bad download or a failing disk
-/// does.
+/// Flips, drops, repeats and adds bytes, and cuts the end off, as a bad download or a failing disk does.
 fn damaged(rng: &mut crate::gen::Rng, original: &[u8]) -> Vec<u8> {
     let mut bytes = original.to_vec();
     for _ in 0..1 + rng.below(6) {
@@ -57,17 +46,10 @@ fn damaged_audio_files_fail_or_work_but_never_panic() {
             return;
         }
         let original = rng.pick(&samples);
-        let file = dir.join(format!(
-            "damaged.{}",
-            ["opus", "mp3", "m4a", "flac", "ogg", "wav"][rng.below(6)]
-        ));
+        let file = dir.join(format!("damaged.{}", ["opus", "mp3", "m4a", "flac", "ogg", "wav"][rng.below(6)]));
         fs::write(&file, damaged(rng, original)).unwrap();
         let s = song(rng);
-        let _ = (
-            write_tags(&file, &s),
-            write_lyrics(&file, s.lyrics.clone()),
-            write_lyrics(&file, None),
-        );
+        let _ = (write_tags(&file, &s), write_lyrics(&file, s.lyrics.clone()), write_lyrics(&file, None));
         if let Ok(audio) = audio(&file) {
             let _ = audio.primary_tag().map(source_url);
         }
@@ -75,8 +57,7 @@ fn damaged_audio_files_fail_or_work_but_never_panic() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// `lofty` 0.22 panics on an Opus header with no channels ("Channel count is valid"), which aborted
-/// a whole run.
+/// `lofty` 0.22 panics on an Opus header with no channels ("Channel count is valid"), which aborted a whole run.
 #[test]
 fn an_opus_file_without_channels_fails_the_song_instead_of_ending_the_run() {
     let dir = std::env::temp_dir().join(format!("spotdl-opus-{}", std::process::id()));
@@ -84,20 +65,11 @@ fn an_opus_file_without_channels_fails_the_song_instead_of_ending_the_run() {
     let Some(mut bytes) = sample_files(&dir).into_iter().next() else {
         return;
     };
-    let head = bytes
-        .windows(8)
-        .position(|window| window == b"OpusHead")
-        .unwrap();
+    let head = bytes.windows(8).position(|window| window == b"OpusHead").unwrap();
     bytes[head + 9] = 0;
     let file = dir.join("no-channels.opus");
     fs::write(&file, bytes).unwrap();
-    let error = audio(&file)
-        .err()
-        .expect("a file without channels is damaged")
-        .to_string();
-    assert!(
-        error.contains("damaged") || error.contains("hannel"),
-        "{error}"
-    );
+    let error = audio(&file).err().expect("a file without channels is damaged").to_string();
+    assert!(error.contains("damaged") || error.contains("hannel"), "{error}");
     fs::remove_dir_all(&dir).unwrap();
 }

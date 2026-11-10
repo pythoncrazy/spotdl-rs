@@ -29,13 +29,7 @@ fn any_command_line_gives_settings_or_an_error() {
     ];
     runs("settings", |rng| {
         let args: Vec<String> = (0..rng.below(8))
-            .map(|_| {
-                if rng.below(2) == 0 {
-                    rng.pick(OPTIONS).to_string()
-                } else {
-                    text(rng, 3)
-                }
-            })
+            .map(|_| if rng.below(2) == 0 { rng.pick(OPTIONS).to_string() } else { text(rng, 3) })
             .filter(|arg| !arg.starts_with("--config") && !arg.contains("load"))
             .collect();
         let _ = load(&args);

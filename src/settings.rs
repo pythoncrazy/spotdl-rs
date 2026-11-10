@@ -29,18 +29,11 @@ const ALIASES: [(&str, &str); 4] = [
     ("dont_filter_results", "filter_results"),
 ];
 const PROVIDERS: [(&str, &[&str]); 2] = [
-    (
-        "audio_providers",
-        &["youtube-music", "youtube", "soundcloud"],
-    ),
-    (
-        "lyrics_providers",
-        &["genius", "synced", "azlyrics", "musixmatch"],
-    ),
+    ("audio_providers", &["youtube-music", "youtube", "soundcloud"]),
+    ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
 ];
 
-/// Every setting. A key that is not a setting is an error on the command line and ignored in
-/// `config.json`.
+/// Every setting. A key that is not a setting is an error on the command line and ignored in `config.json`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Settings {
     // Where songs go and how they are encoded.
@@ -133,53 +126,32 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
             queries.push(args[i - 1].clone());
             continue;
         };
-        let (raw, inline) = option
-            .split_once('=')
-            .map_or((option, None), |(name, value)| (name, Some(value)));
+        let (raw, inline) = option.split_once('=').map_or((option, None), |(name, value)| (name, Some(value)));
         let name = raw.replace('-', "_");
-        let key = ALIASES
-            .iter()
-            .find(|alias| alias.0 == name)
-            .map_or(name.as_str(), |alias| alias.1);
+        let key = ALIASES.iter().find(|alias| alias.0 == name).map_or(name.as_str(), |alias| alias.1);
         let rest: Vec<&str> = match inline {
             Some(value) => vec![value],
-            None => args[i..]
-                .iter()
-                .map(String::as_str)
-                .take_while(|arg| !arg.starts_with("--"))
-                .collect(),
+            None => args[i..].iter().map(String::as_str).take_while(|arg| !arg.starts_with("--")).collect(),
         };
         let (taken, value) = match (cfg.get(key), rest.first().copied()) {
             _ if key == "config" => {
-                config = Some(PathBuf::from(
-                    rest.first().ok_or("--config requires a file path")?,
-                ));
+                config = Some(PathBuf::from(rest.first().ok_or("--config requires a file path")?));
                 i += usize::from(inline.is_none());
                 continue;
             }
             (Some(Value::Array(_)), _) => {
-                let items = rest
-                    .iter()
-                    .flat_map(|value| value.split(','))
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty());
+                let items = rest.iter().flat_map(|value| value.split(',')).map(str::trim).filter(|v| !v.is_empty());
                 (rest.len(), json!(items.collect::<Vec<_>>()))
             }
             (Some(Value::Bool(_)), value) => {
                 let on = name != "dont_filter_results" && value != Some("false");
-                (
-                    usize::from(matches!(value, Some("true" | "false"))),
-                    json!(on),
-                )
+                (usize::from(matches!(value, Some("true" | "false"))), json!(on))
             }
             (Some(Value::Number(_)), Some(value)) => (1, json!(value.parse::<u64>()?)),
             (Some(Value::String(_) | Value::Number(_)), None) => {
                 return Err(format!("missing value for --{raw}").into());
             }
-            (Some(_), value) => (
-                usize::from(value.is_some()),
-                json!(value.unwrap_or_default()),
-            ),
+            (Some(_), value) => (usize::from(value.is_some()), json!(value.unwrap_or_default())),
             (None, _) => return Err(format!("unknown option --{raw}").into()),
         };
         cli.insert(key.to_string(), value);
@@ -192,23 +164,14 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
     if path.is_file() {
         let file: serde_json::Map<String, Value> = serde_json::from_slice(&fs::read(&path)?)?;
         if config.is_some() || file.get("load_config") != Some(&json!(false)) {
-            file.into_iter()
-                .filter(|(_, value)| !value.is_null())
-                .for_each(|(key, value)| cfg[key] = value);
+            file.into_iter().filter(|(_, value)| !value.is_null()).for_each(|(key, value)| cfg[key] = value);
         }
     }
     cli.into_iter().for_each(|(key, value)| cfg[key] = value);
     for (key, known) in PROVIDERS {
         let names = cfg[key].as_array().into_iter().flatten();
-        if let Some(name) = names
-            .filter_map(Value::as_str)
-            .find(|name| !known.contains(name))
-        {
-            return Err(format!(
-                "unknown {} provider: {name}",
-                key.trim_end_matches("_providers")
-            )
-            .into());
+        if let Some(name) = names.filter_map(Value::as_str).find(|name| !known.contains(name)) {
+            return Err(format!("unknown {} provider: {name}", key.trim_end_matches("_providers")).into());
         }
     }
     // `--m3u` as a flag, or `"m3u": true` in the file, is the default name.
@@ -217,16 +180,10 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
         Value::Bool(false) => cfg["m3u"] = Value::Null,
         _ => {}
     }
-    SETTINGS
-        .set(serde_json::from_value(cfg)?)
-        .map_err(|_| "settings were already loaded")?;
-    let op = ["download", "save", "sync", "url", "meta"]
-        .into_iter()
-        .find(|op| queries.first().is_some_and(|q| q == op));
-    Ok((
-        op.map_or_else(|| "download".into(), |_| queries.remove(0)),
-        queries,
-    ))
+    SETTINGS.set(serde_json::from_value(cfg)?).map_err(|_| "settings were already loaded")?;
+    let op =
+        ["download", "save", "sync", "url", "meta"].into_iter().find(|op| queries.first().is_some_and(|q| q == op));
+    Ok((op.map_or_else(|| "download".into(), |_| queries.remove(0)), queries))
 }
 
 #[cfg(test)]

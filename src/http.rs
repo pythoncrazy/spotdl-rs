@@ -1,5 +1,4 @@
-//! HTTP: requests that retry and pace themselves, and [`Service`], a website that is asked
-//! politely.
+//! HTTP: requests that retry and pace themselves, and [`Service`], a website that is asked politely.
 
 use crate::settings::settings;
 use crate::{log, R};
@@ -62,14 +61,11 @@ impl Pace {
         std::thread::sleep(slot.saturating_duration_since(Instant::now()));
     }
 
-    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow
-    /// down. Returns whether this lengthened the wait: a thread that was told the same moment finds
-    /// it held already.
+    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down. Returns
+    /// whether this lengthened the wait: a thread that was told the same moment finds it held already.
     pub fn hold(&self, pause: Duration) -> bool {
         let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let until = next
-            .unwrap_or_else(Instant::now)
-            .max(Instant::now() + pause);
+        let until = next.unwrap_or_else(Instant::now).max(Instant::now() + pause);
         let longer = next.is_none_or(|slot| until > slot);
         *next = Some(until);
         longer
@@ -81,8 +77,7 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .max_idle_connections_per_host(64)
-        // `--proxy`, or else the usual HTTPS_PROXY / ALL_PROXY variables, as Python spotDL's
-        // requests reads them.
+        // `--proxy`, or else the usual HTTPS_PROXY / ALL_PROXY variables, as Python spotDL's requests reads them.
         .proxy(
             settings()
                 .proxy
@@ -110,25 +105,20 @@ pub(crate) fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)])
 }
 
 /// POSTs `body`, as [`get`] does, and parses the reply as JSON.
-pub(crate) fn post_json<T: DeserializeOwned>(
-    url: &str,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> R<T> {
+pub(crate) fn post_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body: &str) -> R<T> {
     let reply = request(url, headers, Some(body), settings().max_retries, None)?;
     Ok(serde_json::from_slice(&reply)?)
 }
 
-/// The pause before retry `attempt`: the server's Retry-After, else doubling. Capped, so that a
-/// dead host or a long ban under a high `--max-retries` fails within minutes rather than hanging
-/// each request for half an hour.
+/// The pause before retry `attempt`: the server's Retry-After, else doubling. Capped, so that a dead host or a long ban
+/// under a high `--max-retries` fails within minutes rather than hanging each request for half an hour.
 fn backoff(attempt: u64, retry_after: Option<u64>) -> Duration {
     Duration::from_secs(retry_after.unwrap_or(1 << attempt.min(5)).min(60))
 }
 
-/// GET (or POST, given a `body`) with `retries` retries of connection errors, 429 and 5xx, spaced
-/// by `pace`: a 429 holds it, so that every thread waits the pause out together rather than each
-/// asking again at its own time and keeping the limit on.
+/// GET (or POST, given a `body`) with `retries` retries of connection errors, 429 and 5xx, spaced by `pace`: a 429
+/// holds it, so that every thread waits the pause out together rather than each asking again at its own time and
+/// keeping the limit on.
 pub(crate) fn request(
     url: &str,
     headers: &[(&str, &str)],
@@ -143,22 +133,14 @@ pub(crate) fn request(
         }
         let method = if body.is_some() { "POST" } else { "GET" };
         let request = ureq::http::Request::builder().method(method).uri(url);
-        let request = headers.iter().fold(request, |request, (key, value)| {
-            request.header(*key, *value)
-        });
+        let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
         let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
         let status = reply.as_ref().map(|reply| reply.status()).ok();
         let retry = status.is_none_or(|status| status == 429 || status.is_server_error());
         if retry && attempt < retries {
             attempt += 1;
-            let after = reply
-                .as_ref()
-                .ok()
-                .and_then(|reply| reply.headers().get("retry-after"));
-            let pause = backoff(
-                attempt,
-                after.and_then(|after| after.to_str().ok()?.trim().parse().ok()),
-            );
+            let after = reply.as_ref().ok().and_then(|reply| reply.headers().get("retry-after"));
+            let pause = backoff(attempt, after.and_then(|after| after.to_str().ok()?.trim().parse().ok()));
             match pace {
                 Some(pace) if status.is_some_and(|status| status == 429) => drop(pace.hold(pause)),
                 _ => std::thread::sleep(pause),
@@ -169,24 +151,19 @@ pub(crate) fn request(
         if !reply.status().is_success() {
             return Err(HttpError::Status(reply.status().as_u16(), url.into()).into());
         }
-        return Ok(reply
-            .body_mut()
-            .with_config()
-            .limit(1 << 28)
-            .read_to_vec()?);
+        return Ok(reply.body_mut().with_config().limit(1 << 28).read_to_vec()?);
     }
 }
 
 /// How often [`Service::get`] asks before it gives up.
 const ATTEMPTS: u64 = 12;
 
-/// How many times a request waits out "too many requests": the first pause, then twice and four
-/// times as long and so on. A banned run so fails each song within a few minutes and says so,
-/// instead of waiting silently for an hour.
+/// How many times a request waits out "too many requests": the first pause, then twice and four times as long and so
+/// on. A banned run so fails each song within a few minutes and says so, instead of waiting silently for an hour.
 const BUSY_TRIES: u64 = 4;
 
-/// A website that is asked politely: all threads share one pace, wait together when it says "too
-/// many requests" or that it is overloaded, and stop asking when it blocks this client.
+/// A website that is asked politely: all threads share one pace, wait together when it says "too many requests" or that
+/// it is overloaded, and stop asking when it blocks this client.
 pub(crate) struct Service {
     name: &'static str,
     pace: Pace,
@@ -200,13 +177,7 @@ pub(crate) struct Service {
 impl Service {
     pub const fn new(name: &'static str, interval_ms: u64, blocks_on_forbidden: bool) -> Self {
         let busy = Duration::from_secs(15);
-        Self {
-            name,
-            pace: Pace::new(interval_ms),
-            blocks_on_forbidden,
-            blocked: AtomicBool::new(false),
-            busy,
-        }
+        Self { name, pace: Pace::new(interval_ms), blocks_on_forbidden, blocked: AtomicBool::new(false), busy }
     }
 
     #[cfg(test)]
@@ -215,8 +186,8 @@ impl Service {
         self
     }
 
-    /// Whether the site blocked this client: it is not asked again in this run (asking again would
-    /// be working around a block, not waiting out a limit).
+    /// Whether the site blocked this client: it is not asked again in this run (asking again would be working around a
+    /// block, not waiting out a limit).
     pub fn blocked(&self) -> bool {
         self.blocked.load(Relaxed)
     }
@@ -224,10 +195,7 @@ impl Service {
     /// Stops asking the site in this run, and says why, once.
     pub fn block(&self, reason: &str) {
         if !self.blocked.swap(true, Relaxed) {
-            log(
-                "WARNING",
-                &format!("{}: {reason}: it is not asked again in this run", self.name),
-            );
+            log("WARNING", &format!("{}: {reason}: it is not asked again in this run", self.name));
         }
     }
 
@@ -236,12 +204,11 @@ impl Service {
         self.pace.wait();
     }
 
-    /// The body of `url`, or nothing: the site has no such page (404, said nowhere), blocks us (see
-    /// [`blocked`]), or still fails after the waits (a warning says so). A request the site refuses
-    /// as too frequent waits for every thread, [`BUSY_TRIES`] times and longer each time; an
-    /// overloaded site (5xx) is asked again after a short wait, a lost connection after a longer
-    /// one. Only this loop retries: [`request`]'s own retries would ask again within seconds,
-    /// unpaced and during a hold, and so keep the limit on.
+    /// The body of `url`, or nothing: the site has no such page (404, said nowhere), blocks us (see [`blocked`]), or
+    /// still fails after the waits (a warning says so). A request the site refuses as too frequent waits for every
+    /// thread, [`BUSY_TRIES`] times and longer each time; an overloaded site (5xx) is asked again after a short wait, a
+    /// lost connection after a longer one. Only this loop retries: [`request`]'s own retries would ask again within
+    /// seconds, unpaced and during a hold, and so keep the limit on.
     ///
     /// [`blocked`]: Self::blocked
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Option<Vec<u8>> {
@@ -260,20 +227,11 @@ impl Service {
                     self.block(&error.to_string());
                     return None;
                 }
-                Some(429) if attempt >= BUSY_TRIES => {
-                    return self.give_up(url, "still too many requests")
-                }
+                Some(429) if attempt >= BUSY_TRIES => return self.give_up(url, "still too many requests"),
                 Some(429) => {
                     let pause = self.busy * (1 << attempt);
                     if self.pace.hold(pause) {
-                        log(
-                            "WARNING",
-                            &format!(
-                                "{}: too many requests, waiting {} s",
-                                self.name,
-                                pause.as_secs()
-                            ),
-                        );
+                        log("WARNING", &format!("{}: too many requests, waiting {} s", self.name, pause.as_secs()));
                     }
                 }
                 Some(500..) => drop(self.pace.hold(Duration::from_secs(2 + 2 * attempt.min(10)))),
@@ -311,8 +269,8 @@ mod tests {
         crate::settings::use_defaults();
     }
 
-    /// A local server that answers the n-th request with `replies[n]` (the last one after that),
-    /// and how many requests it got.
+    /// A local server that answers the n-th request with `replies[n]` (the last one after that), and how many requests
+    /// it got.
     fn serve(replies: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", server.local_addr().unwrap());
@@ -323,10 +281,7 @@ mod tests {
                 let mut stream = stream.unwrap();
                 let _ = stream.read(&mut [0; 4096]);
                 let reply = replies[seen.fetch_add(1, Relaxed).min(replies.len() - 1)];
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {reply}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                );
+                let _ = write!(stream, "HTTP/1.1 {reply}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             }
         });
         (url, count)
@@ -354,11 +309,7 @@ mod tests {
         });
         assert_eq!(request(&url, &[], None, 3, Some(&PACE)).unwrap(), b"ok");
         // One second as the server asked, not the two of the doubling pause.
-        assert!(
-            (900..1900).contains(&start.elapsed().as_millis()),
-            "{:?}",
-            start.elapsed()
-        );
+        assert!((900..1900).contains(&start.elapsed().as_millis()), "{:?}", start.elapsed());
         // Another thread that asks during the hold waits it out too.
         assert!(other.join().unwrap() >= Duration::from_millis(900));
     }
@@ -374,8 +325,8 @@ mod tests {
         assert_eq!(HttpError::status(&*error), None);
     }
 
-    /// A banned run waited about 40 minutes for each Genius request, saying nothing: a request
-    /// waits four times, and then gives up.
+    /// A banned run waited about 40 minutes for each Genius request, saying nothing: a request waits four times, and
+    /// then gives up.
     #[test]
     fn a_service_that_stays_busy_is_waited_out_four_times_and_then_given_up() {
         settings();
