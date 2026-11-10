@@ -1,4 +1,8 @@
-use crate::{cached, http, http_json, http_paced, number, on, search, url_encode, Pace, Song, HOME, R};
+use crate::{
+    cached,
+    http::{self, HttpError, Pace},
+    number, on, search, url_encode, Song, HOME, R,
+};
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -40,7 +44,7 @@ fn totp(secret: &[u8]) -> String {
 
 /// Persisted-query hashes from the web player's main bundle and its search and artist route chunks.
 fn hashes() -> R<Value> {
-    let get = |url: &str| -> R<String> { Ok(String::from_utf8(http(url, &[UA], None)?)?) };
+    let get = |url: &str| -> R<String> { Ok(String::from_utf8(http::get(url, &[UA])?)?) };
     let html = get("https://open.spotify.com")?;
     let main = html.split('"').find(|s| s.contains("/web-player/web-player.") && s.ends_with(".js"));
     let js = get(main.ok_or("no web-player bundle")?)?;
@@ -84,12 +88,12 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
         *slot = Some(state.clone());
         return Ok(state);
     }
-    let secrets: HashMap<String, Vec<u8>> = http_json(SECRETS, &[UA], None)?;
+    let secrets: HashMap<String, Vec<u8>> = http::get_json(SECRETS, &[UA])?;
     let (version, secret) =
         secrets.iter().max_by_key(|(k, _)| k.parse::<u32>().unwrap_or(0)).ok_or("no TOTP secret")?;
     let code = totp(secret);
     let url = format!("https://open.spotify.com/api/token?reason=init&productType=web-player&totp={code}&totpVer={version}&totpServer={code}");
-    let token: Value = http_json(&url, &[UA], None)?;
+    let token: Value = http::get_json(&url, &[UA])?;
     let token = token["accessToken"].as_str().map(|t| (t, &token["accessTokenExpirationTimestampMs"]));
     let (token, expires) = token.ok_or("Spotify token missing")?;
     let state = Arc::new(json!({"token": token, "exp": expires, "hashes": hashes()?}));
@@ -122,7 +126,7 @@ fn query(op: &str, variables: Value) -> R<Value> {
             let (variables, extensions) = (url_encode(&variables.to_string()), url_encode(&extensions));
             let url = format!("https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}");
             let headers = [UA, ("Authorization", &format!("Bearer {token}"))];
-            let reply = http_paced(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
+            let reply = http::request(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
             match reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?)) {
                 // A GraphQL failure comes as `"data": null` (or with every field null), with "errors": it is no
                 // answer, and must not be cached as one ("Stay - 2016 Remix" then resolved to no song for a week).
@@ -130,7 +134,7 @@ fn query(op: &str, variables: Value) -> R<Value> {
                     return Ok(reply)
                 }
                 Ok(reply) => last = format!("{op}: {}", reply["errors"]),
-                Err(error) if error.to_string().starts_with("HTTP 401") => last = error.to_string(),
+                Err(error) if HttpError::status(&*error) == Some(401) => last = error.to_string(),
                 // Lost connections, 429 and 5xx were retried above: asking again here would square the requests.
                 Err(error) => return Err(error),
             }
@@ -415,7 +419,7 @@ pub fn resolve(text: &str) -> R<Vec<Song>> {
         return search::source(text, !text.contains("soundcloud.com/"));
     }
     let text = match text.contains("spotify.link") {
-        true => ureq::ResponseExt::get_uri(&crate::AGENT.get(text).call()?).to_string(),
+        true => http::final_url(text)?,
         false => text.into(),
     };
     let link = text.split('?').next().unwrap_or_default().trim_end_matches('/');
@@ -447,7 +451,7 @@ fn deezer_error(reply: &Value) -> Option<(bool, String)> {
 fn deezer(url: &str) -> R<Value> {
     for attempt in 0..6 {
         DEEZER.wait();
-        let reply: Value = http_json(url, &[], None)?;
+        let reply: Value = http::get_json(url, &[])?;
         match deezer_error(&reply) {
             None => return Ok(reply),
             Some((false, error)) => return Err(format!("Deezer: {error} for {url}").into()),

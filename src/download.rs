@@ -1,4 +1,7 @@
-use crate::{http, http_retrying, list, log, number, on, search, spotify, text, url_encode, Pace, Song, R};
+use crate::{
+    http::{self, HttpError, Service},
+    list, log, number, on, search, spotify, text, url_encode, Song, R,
+};
 use lofty::{
     config::WriteOptions,
     picture::{MimeType, Picture, PictureInformation, PictureType},
@@ -29,11 +32,18 @@ static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
 /// The files `meta --redownload` downloads again, by song URL.
 static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
-static LRCLIB: Pace = Pace::new(750);
-static GENIUS: Pace = Pace::new(500);
+static LRCLIB: Service = Service::new("LRCLIB", 750, false);
+/// Genius's website answers 403 when it blocks this client; the lyrics pages are on the website, so without it Genius
+/// cannot be asked at all.
+static GENIUS: Service = Service::new("Genius", 500, true);
 /// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
-static AZLYRICS: Pace = Pace::new(1500);
-static MUSIXMATCH: Pace = Pace::new(1500);
+static AZLYRICS: Service = Service::new("azlyrics", 1500, false);
+static MUSIXMATCH: Service = Service::new("musixmatch", 1500, false);
+
+/// The page at `url` as text, asked of `service`.
+fn page(service: &Service, url: &str) -> Option<String> {
+    String::from_utf8(service.get(url, &[])?).ok()
+}
 /// The file's audio and tags. `lofty` panics on some damaged files (an Opus header with no channels, an M4A whose
 /// atoms end early); that fails the song, as an unreadable file does, and does not end the run.
 fn audio(file: &Path) -> R<lofty::file::TaggedFile> {
@@ -263,49 +273,10 @@ fn plain_title(title: &str) -> String {
     search::slug(&title[..end], "")
 }
 
-/// How many times a request waits out "too many requests" before it gives up: 15, 30, 60 and 120 seconds, so a
-/// banned run fails each song within four minutes and says so, instead of waiting silently for most of an hour.
-const BUSY_TRIES: u64 = 4;
-
-/// Holds `pace` for a service that answered "too many requests" for the `attempt`th time, and says so once for all
-/// threads. Whether the request has had its [`BUSY_TRIES`].
-fn gave_up(pace: &Pace, service: &str, attempt: u64) -> bool {
-    let pause = std::time::Duration::from_secs(15 << attempt.min(BUSY_TRIES));
-    if attempt < BUSY_TRIES && pace.hold(pause) {
-        log("WARNING", &format!("{service}: too many requests, waiting {} s", pause.as_secs()));
-    }
-    attempt >= BUSY_TRIES
-}
-
-/// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy, so that a busy moment does not
-/// replace synced lyrics with plain ones, all threads wait and then try again: long after 429 (too many requests
-/// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests). Only this loop
-/// retries: [`http`]'s own retries would ask again within seconds, unpaced and during a hold, and keep the limit on.
+/// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy; [`Service::get`] waits and asks again,
+/// so that a busy moment does not replace synced lyrics with plain ones.
 fn lrclib_search(url: &str) -> Option<Vec<Value>> {
-    for attempt in 0..12 {
-        LRCLIB.wait();
-        match http_retrying(url, &[], None, 0) {
-            Ok(bytes) => return serde_json::from_slice(&bytes).ok(),
-            Err(error) if error.to_string().contains("HTTP 429") => {
-                if gave_up(&LRCLIB, "LRCLIB", attempt) {
-                    break;
-                }
-            }
-            Err(error) if error.to_string().contains("HTTP 503") => {
-                LRCLIB.hold(std::time::Duration::from_secs(2 + 2 * attempt.min(10)));
-            }
-            // A timeout, a lost connection or another server error passes; a refused request does not.
-            Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
-                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
-            }
-            Err(error) => {
-                log("WARNING", &format!("LRCLIB: {error}"));
-                return None;
-            }
-        }
-    }
-    log("WARNING", &format!("LRCLIB: still too many requests for {url}"));
-    None
+    serde_json::from_slice(&LRCLIB.get(url, &[])?).ok()
 }
 
 /// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones; `""` when
@@ -439,7 +410,7 @@ fn released_on(song: &Song, page: &Page) -> Option<bool> {
     }
     let url = format!("https://genius.com/api/songs/{}", page.id);
     let album = plain_title(&song.album_name);
-    let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok();
+    let reply = serde_json::from_str::<Value>(&genius_get(&url)?).ok();
     let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
     Some(albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
         !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
@@ -468,10 +439,6 @@ fn genius_titled(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     Some(pages)
 }
 
-/// Genius's website answered 403: it blocks this client, so it is not asked again in this run (asking again would
-/// not be waiting out a limit but working around a block). The lyrics pages are on the website, so without it
-/// Genius cannot be asked at all.
-static GENIUS_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// The API's token is out of requests (the shared docs client has 100 an hour): the website's search is asked.
 static GENIUS_API_SPENT: AtomicBool = AtomicBool::new(false);
 /// The songs whose lyrics were left unchecked because Genius could not be asked, for [`report_unchecked`].
@@ -510,40 +477,9 @@ fn genius_answered(song: &Song) -> bool {
     })
 }
 
-/// A Genius page or search. Genius answers 429 when it is asked too often; so that the check of a library does not
-/// skip the songs of that moment (no page would leave their lyrics unchecked), all threads wait, longer each time,
-/// and then try again. A timeout or a server error is tried again a few times.
-fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
-    for attempt in 0..12 {
-        if GENIUS_BLOCKED.load(Relaxed) {
-            return None;
-        }
-        GENIUS.wait();
-        match http_retrying(url, headers, None, 0) {
-            Ok(bytes) => return String::from_utf8(bytes).ok(),
-            Err(error) if error.to_string().contains("HTTP 429") => {
-                if gave_up(&GENIUS, "Genius", attempt) {
-                    break;
-                }
-            }
-            Err(error) if error.to_string().contains("HTTP 403") => {
-                if !GENIUS_BLOCKED.swap(true, Relaxed) {
-                    log("WARNING", &format!("Genius: {error}: it is not asked again in this run"));
-                }
-                return None;
-            }
-            // A timeout, a lost connection or a server error passes; a page that is not there does not.
-            Err(error) if attempt < 4 && !error.to_string().contains("HTTP 4") => {
-                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
-            }
-            Err(error) => {
-                log("WARNING", &format!("Genius: {error} ({url})"));
-                return None;
-            }
-        }
-    }
-    log("WARNING", &format!("Genius: still too many requests for {url}"));
-    None
+/// A Genius page or search.
+fn genius_get(url: &str) -> Option<String> {
+    page(&GENIUS, url)
 }
 
 /// Whether the artist `name` is one of `names` ("¥$" of "¥$, Kanye West & Ty Dolla $ign"): its slug is a run of
@@ -571,7 +507,7 @@ fn genius_account(primary: &str, artist: &str) -> bool {
 
 /// The pages, or nothing when Genius could not be asked.
 fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
-    if GENIUS_BLOCKED.load(Relaxed) {
+    if GENIUS.blocked() {
         return None;
     }
     let title = lyrics_title(song);
@@ -585,11 +521,8 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
         let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
             GENIUS.wait();
             let url = format!("https://api.genius.com/search?q={query}");
-            let reply = http_retrying(&url, &[("Authorization", &auth)], None, 0);
-            if reply
-                .as_ref()
-                .is_err_and(|error| ["HTTP 429", "HTTP 401"].iter().any(|code| error.to_string().contains(code)))
-            {
+            let reply = http::request(&url, &[("Authorization", &auth)], None, 0, None);
+            if reply.as_ref().is_err_and(|error| matches!(HttpError::status(&**error), Some(429 | 401))) {
                 GENIUS_API_SPENT.store(true, Relaxed);
             }
             serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
@@ -598,7 +531,7 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
             Some(hits) => Some(hits),
             None => {
                 let url = format!("https://genius.com/api/search/song?q={query}");
-                let reply = serde_json::from_str::<Value>(&genius_get(&url, &[])?).ok()?;
+                let reply = serde_json::from_str::<Value>(&genius_get(&url)?).ok()?;
                 Some(reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default())
             }
         }
@@ -661,7 +594,7 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     for hit in hits.iter().take(max) {
         let (Some(url), Some(id)) = (hit["result"]["url"].as_str(), hit["result"]["id"].as_u64()) else { continue };
         // An instrumental's page has no lyrics blocks, only "This song is an instrumental", and the API says so too.
-        let page = genius_get(url, &[])?;
+        let page = genius_get(url)?;
         let said =
             hit["result"]["instrumental"].as_bool() == Some(true) || page.contains("This song is an instrumental");
         let Some(lyrics) = genius_lyrics(&page).or_else(|| said.then(|| "[Instrumental]".into())) else { continue };
@@ -670,10 +603,6 @@ fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
     Some(pages)
 }
 
-/// azlyrics answered with its "request for access" page (a redirect to b.azlyrics.com, with status 200) instead of
-/// lyrics: it takes this client for a bot, so it is not asked again in this run (asking again would be working
-/// around the check). Without this, every song found "no lyrics" there and nothing said why.
-static AZLYRICS_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// An azlyrics page came without the marker before its lyrics: its layout changed, which is said once.
 static AZLYRICS_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -681,9 +610,9 @@ static AZLYRICS_CHANGED: AtomicBool = AtomicBool::new(false);
 /// lays out as expected.
 fn azlyrics(page: &str) -> Option<String> {
     if page.contains("AZLyrics - request for access") {
-        if !AZLYRICS_BLOCKED.swap(true, Relaxed) {
-            log("WARNING", "azlyrics asks for access (a bot check): it is not asked again in this run");
-        }
+        // A page (a redirect to b.azlyrics.com, with status 200) instead of lyrics: azlyrics takes this client for a
+        // bot. Without this, every song found "no lyrics" there and nothing said why.
+        AZLYRICS.block("asks for access (a bot check)");
         return None;
     }
     let lyrics = html(page, "<!-- Usage of azlyrics.com", "</div>");
@@ -695,7 +624,6 @@ fn azlyrics(page: &str) -> Option<String> {
 
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
 fn provider(name: &str, song: &Song) -> Option<String> {
-    let get = |url: &str, headers: &[(&str, &str)]| String::from_utf8(http(url, headers, None).ok()?).ok();
     let (artist, title) = (&song.artist, lyrics_title(song));
     let lyrics = match name {
         // LRCLIB's lyrics are checked against Genius's; without an answer from Genius, they are left for a later run.
@@ -733,17 +661,12 @@ fn provider(name: &str, song: &Song) -> Option<String> {
                 search::slug(artist, ""),
                 search::slug(title, "")
             );
-            if AZLYRICS_BLOCKED.load(Relaxed) {
-                return None;
-            }
-            AZLYRICS.wait();
-            azlyrics(&get(&url, &[])?)?
+            azlyrics(&page(&AZLYRICS, &url)?)?
         }
         _ => {
-            MUSIXMATCH.wait();
             let url =
                 format!("https://www.musixmatch.com/lyrics/{}/{}", search::slug(artist, "-"), search::slug(title, "-"));
-            let body = get(&url, &[])?.split_once("\"body\":")?.1.to_string();
+            let body = page(&MUSIXMATCH, &url)?.split_once("\"body\":")?.1.to_string();
             serde_json::Deserializer::from_str(&body).into_iter::<String>().next()?.ok()?
         }
     };
@@ -1272,7 +1195,7 @@ fn art(url: &str) -> Option<Vec<u8>> {
     let hash = url.strip_prefix("https://i.scdn.co/image/ab67616d").and_then(|rest| rest.get(8..));
     let original = hash.map(|hash| format!("https://i.scdn.co/image/ab67616d000082c1{hash}"));
     let larger = |bytes: &Vec<u8>| PictureInformation::from_jpeg(bytes).is_ok_and(|info| info.width > 640);
-    original.and_then(|original| http(&original, &[], None).ok().filter(larger)).or_else(|| http(url, &[], None).ok())
+    original.and_then(|original| http::get(&original, &[]).ok().filter(larger)).or_else(|| http::get(url, &[]).ok())
 }
 
 /// The images that `--folder-art` puts next to the songs, which music servers (Navidrome, Jellyfin) show:
@@ -1906,11 +1829,10 @@ mod fuzz;
 #[cfg(test)]
 mod tests {
     use super::{
-        album_dirs, among, art, azlyrics, compilation, folder_images, gave_up, genius_account, genius_lyrics,
-        instrumental_title, is_synced, lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path,
-        provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id,
-        template_path, timed_for, track_gain, unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED,
-        LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
+        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics,
+        instrumental_title, is_synced, lrclib_agrees, lrclib_lyrics, lrclib_tracks, out_path, path, provider,
+        rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id, template_path,
+        timed_for, track_gain, unlisted, write_tags, Song, AZLYRICS, GENIUS, LRCLIB_FOUND, LRCLIB_KEPT, REDOWNLOADS,
     };
     use std::path::PathBuf;
 
@@ -2167,7 +2089,7 @@ mod tests {
     #[test]
     fn lyrics_are_not_checked_against_a_genius_that_cannot_be_asked() {
         let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
-        GENIUS_BLOCKED.store(true, Relaxed);
+        GENIUS.block("test");
         let artists = vec!["¥$".to_string(), "Kanye West".to_string()];
         let song = Song { name: "KING".into(), artist: "¥$".into(), artists, year: 2026, ..Song::default() };
         assert_eq!(reference(&song, None), None);
@@ -2184,52 +2106,14 @@ mod tests {
         let lyrics = "<div class=\"ringtone\"></div><div>\n<!-- Usage of azlyrics.com content by any third-party \
             lyrics provider is prohibited. -->\nIs this the real life?<br>\nIs this just fantasy?\n</div>";
         assert_eq!(azlyrics(lyrics).as_deref(), Some("Is this the real life?\nIs this just fantasy?"));
-        assert!(!AZLYRICS_BLOCKED.load(Relaxed));
+        assert!(!AZLYRICS.blocked());
         let gate =
             "<html><head><title>AZLyrics - request for access</title></head><body><form>...</form></body></html>";
         assert_eq!(azlyrics(gate), None);
-        assert!(AZLYRICS_BLOCKED.load(Relaxed));
+        assert!(AZLYRICS.blocked());
         // Not asked again: no request is sent.
         let song = Song { name: "Creep".into(), artist: "Radiohead".into(), ..Song::default() };
         assert_eq!(provider("azlyrics", &song), None);
-    }
-
-    /// LRCLIB is asked again only through the paced loop: `http`'s own retries came 2, 4 and 8 seconds after a
-    /// 503 or 429, from each thread, ignoring the hold that told every thread to wait.
-    #[test]
-    fn lrclib_retries_wait_for_the_shared_hold() {
-        use std::io::{Read, Write};
-        use std::time::{Duration, Instant};
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
-        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/api/search", server.local_addr().unwrap());
-        let (sent, asked) = std::sync::mpsc::channel();
-        let (go, held) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for (n, stream) in server.incoming().take(2).enumerate() {
-                let mut stream = stream.unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0];
-                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
-                    request.push(byte[0]);
-                }
-                sent.send(Instant::now()).unwrap();
-                // The reply waits for the other thread's hold: a busy machine otherwise lets the 503's own short hold run out first.
-                held.recv().unwrap();
-                let (status, body) = if n == 0 { ("503 Service Unavailable", "") } else { ("200 OK", "[]") };
-                let reply =
-                    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                stream.write_all(reply.as_bytes()).unwrap();
-            }
-        });
-        let search = std::thread::spawn(move || lrclib_search(&url));
-        let first = asked.recv().unwrap();
-        // Another thread was told to slow down.
-        super::LRCLIB.hold(Duration::from_secs(5));
-        go.send(()).unwrap();
-        go.send(()).unwrap();
-        assert_eq!(search.join().unwrap(), Some(Vec::new()));
-        assert!(asked.recv().unwrap() - first >= Duration::from_secs(4));
     }
 
     /// An artist is matched by whole words: "¥$" (slug "y") took Genius Ukrainian Translations' "CARNIVAL" as its
@@ -2348,15 +2232,5 @@ mod tests {
         }
         // Short ids stay as they were, so earlier runs' temporary files are still found and removed.
         assert_eq!(temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")), "4uLU6hMCjMI75M1A2tKUQC");
-    }
-
-    /// A banned run waited about 40 minutes for each Genius request, saying nothing: a request waits four times,
-    /// 15 seconds and doubling, and then gives up.
-    #[test]
-    fn a_service_that_stays_busy_is_waited_out_four_times_and_then_given_up() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
-        let pace = crate::Pace::new(0);
-        assert!((0..4).all(|attempt| !gave_up(&pace, "Test", attempt)));
-        assert!(gave_up(&pace, "Test", 4) && gave_up(&pace, "Test", 99));
     }
 }

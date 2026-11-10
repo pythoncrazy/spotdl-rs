@@ -1,4 +1,4 @@
-use crate::{cached, download, http_json, list, log, now, number, on, spotify, text, Song, R};
+use crate::{cached, download, http, list, log, now, number, on, spotify, text, Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -371,7 +371,7 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
     let reply = cached(&format!("ytm{body}"), 7, || {
         let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
         let reply: Value = youtube(|| {
-            http_json(url, &[("Content-Type", "application/json")], Some(&body)).map_err(|error| error.to_string())
+            http::post_json(url, &[("Content-Type", "application/json")], &body).map_err(|error| error.to_string())
         })?;
         reply.get("contents").is_some().then_some(reply).ok_or_else(|| "unexpected YouTube Music response".into())
     })?;

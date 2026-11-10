@@ -1,17 +1,18 @@
 mod download;
+mod http;
 mod search;
 mod spotify;
 
 use rayon::prelude::*;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex, OnceLock, PoisonError},
-    time::{Duration, Instant, UNIX_EPOCH},
+    sync::{LazyLock, OnceLock},
+    time::UNIX_EPOCH,
 };
 
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -110,104 +111,6 @@ pub fn number(key: &str) -> u64 {
 
 pub fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
-}
-
-/// Spaces the requests to one site `ms` apart, across all threads.
-pub struct Pace(Mutex<Option<Instant>>, u64);
-
-impl Pace {
-    pub const fn new(ms: u64) -> Self {
-        Self(Mutex::new(None), ms)
-    }
-
-    pub fn wait(&self) {
-        let slot = {
-            let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            let slot = next.map_or(Instant::now(), |next| next.max(Instant::now()));
-            *next = Some(slot + Duration::from_millis(self.1));
-            slot
-        };
-        std::thread::sleep(slot.saturating_duration_since(Instant::now()));
-    }
-
-    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down. Whether
-    /// this lengthened the wait: a thread that was told the same moment finds it held already.
-    pub fn hold(&self, pause: Duration) -> bool {
-        let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let until = next.unwrap_or_else(Instant::now).max(Instant::now() + pause);
-        let longer = next.is_none_or(|slot| until > slot);
-        *next = Some(until);
-        longer
-    }
-}
-
-pub static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .http_status_as_error(false)
-        .max_idle_connections_per_host(64)
-        // `--proxy`, or else the usual HTTPS_PROXY / ALL_PROXY variables, as Python spotDL's requests reads them.
-        .proxy(text("proxy").and_then(|proxy| ureq::Proxy::new(proxy).ok()).or_else(ureq::Proxy::try_from_env))
-        .build();
-    ureq::Agent::new_with_config(config)
-});
-
-/// GET (or POST, given a body), retrying connection errors, 429 and 5xx with exponential backoff.
-pub fn http(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<Vec<u8>> {
-    http_paced(url, headers, body, number("max_retries"), None)
-}
-
-/// [`http`] with `retries` retries; 0 for a caller that paces its own retries.
-pub fn http_retrying(url: &str, headers: &[(&str, &str)], body: Option<&str>, retries: u64) -> R<Vec<u8>> {
-    http_paced(url, headers, body, retries, None)
-}
-
-/// The pause before retry `attempt`: the server's Retry-After, else doubling. Capped, so that a dead host or a long
-/// ban under a high `--max-retries` fails within minutes rather than hanging each request for half an hour.
-fn backoff(attempt: u64, retry_after: Option<u64>) -> Duration {
-    Duration::from_secs(retry_after.unwrap_or(1 << attempt.min(5)).min(60))
-}
-
-/// [`http_retrying`], spaced by `pace`: a 429 holds it, so that every thread waits the pause out together rather
-/// than each asking again at its own time and keeping the limit on.
-pub fn http_paced(
-    url: &str,
-    headers: &[(&str, &str)],
-    body: Option<&str>,
-    retries: u64,
-    pace: Option<&Pace>,
-) -> R<Vec<u8>> {
-    let mut attempt = 0;
-    loop {
-        if let Some(pace) = pace {
-            pace.wait();
-        }
-        let method = if body.is_some() { "POST" } else { "GET" };
-        let request = ureq::http::Request::builder().method(method).uri(url);
-        let request = headers.iter().fold(request, |request, (key, value)| request.header(*key, *value));
-        let reply = AGENT.run(request.body(body.unwrap_or_default().as_bytes().to_vec())?);
-        let status = reply.as_ref().map(|reply| reply.status()).ok();
-        let retry = status.is_none_or(|status| status == 429 || status.is_server_error());
-        if retry && attempt < retries {
-            attempt += 1;
-            let after = reply.as_ref().ok().and_then(|reply| reply.headers().get("retry-after"));
-            let pause = backoff(attempt, after.and_then(|after| after.to_str().ok()?.trim().parse().ok()));
-            match pace {
-                Some(pace) if status.is_some_and(|status| status == 429) => drop(pace.hold(pause)),
-                _ => std::thread::sleep(pause),
-            }
-            continue;
-        }
-        let mut reply = reply?;
-        if !reply.status().is_success() {
-            return Err(format!("HTTP {} for {url}", reply.status()).into());
-        }
-        return Ok(reply.body_mut().with_config().limit(1 << 28).read_to_vec()?);
-    }
-}
-
-pub fn http_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> R<T> {
-    Ok(serde_json::from_slice(&http(url, headers, body)?)?)
 }
 
 /// The longest time a [`cached`] entry is read, but for those kept for good.
@@ -542,12 +445,10 @@ mod fuzz;
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff, http_paced, prune_cache, Pace};
+    use super::prune_cache;
     use std::{
         fs,
-        io::{Read, Write},
-        net::TcpListener,
-        time::{Duration, Instant, SystemTime},
+        time::{Duration, SystemTime},
     };
 
     #[test]
@@ -565,41 +466,5 @@ mod tests {
         let left = ["old", "new", "keep/old"].map(|name| dir.join(name).exists());
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(left, [false, true, true]);
-    }
-
-    #[test]
-    fn retry_pauses_are_capped() {
-        assert_eq!(backoff(1, None), Duration::from_secs(2));
-        // `--max-retries 10` against a dead host: not 1024 s for the last retry.
-        assert_eq!(backoff(10, None), Duration::from_secs(32));
-        assert_eq!(backoff(1, Some(5)), Duration::from_secs(5));
-        assert_eq!(backoff(1, Some(86_400)), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn a_429_holds_every_thread_for_its_retry_after() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", server.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for (i, stream) in server.incoming().enumerate() {
-                let mut stream = stream.unwrap();
-                let _ = stream.read(&mut [0; 4096]);
-                let reply = if i == 0 { "429 Too Many Requests\r\nRetry-After: 1" } else { "200 OK" };
-                let _ = write!(stream, "HTTP/1.1 {reply}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-            }
-        });
-        static PACE: Pace = Pace::new(0);
-        let start = Instant::now();
-        let other = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            PACE.wait();
-            start.elapsed()
-        });
-        assert_eq!(http_paced(&url, &[], None, 3, Some(&PACE)).unwrap(), b"ok");
-        // One second as the server asked, not the two of the doubling pause.
-        assert!((900..1900).contains(&start.elapsed().as_millis()), "{:?}", start.elapsed());
-        // Another thread that asks during the hold waits it out too.
-        assert!(other.join().unwrap() >= Duration::from_millis(900));
     }
 }
