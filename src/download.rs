@@ -1,10 +1,10 @@
 //! Downloading songs and tagging them, and `meta`, which tags the files that are already there.
 
 use crate::files::{audio_files, folder_images, output_root, path, skip_path, write_folder_art};
-use crate::genius::{genius_same, genius_titled, released_on, Page};
+use crate::genius::{genius_same, genius_titled, released_on, Asked, Page};
 use crate::lyrics::{
     clean_lrc, find_lyrics, found_lyrics, genius_answered, instrumental_title, is_synced, plain_lyrics,
-    report_unchecked, same_lyrics, timed_for, unlisted, words, write_lrc,
+    report_unchecked, same_lyrics, timed_for, unlisted, words, write_lrc, Lyrics,
 };
 use crate::replaygain::{album_gains, write_track_gain};
 use crate::tags::{advisory_key, audio, no_lyrics_key, source_url, write_lyrics, write_tags};
@@ -477,11 +477,11 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     let mut cleared = false;
     song.lyrics = if force {
         match found_lyrics(&song) {
-            Some(None) => {
+            Some(Lyrics::Instrumental) => {
                 cleared = lyrics.is_some();
                 None
             }
-            found => found.flatten().or(lyrics.clone()),
+            found => found.and_then(Lyrics::into_words).or(lyrics.clone()),
         }
     } else {
         lyrics.clone().or_else(|| look.then(|| find_lyrics(&song)).flatten())
@@ -492,10 +492,12 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     if replace && !force && genius {
         // Genius's page is asked for its albums only when the lyrics differ.
         let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
-        let page =
-            song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist).flatten()));
+        let page = song
+            .lyrics
+            .as_ref()
+            .and_then(|_| artists.clone().find_map(|artist| genius_same(&song, artist).ok().flatten()));
         let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
-        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page) == Some(true)) {
+        if let Some(page) = page.filter(|page| differ(page) && released_on(&song, page) == Ok(true)) {
             cleared = words(&page.lyrics).is_empty();
             if !cleared {
                 log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
@@ -504,8 +506,8 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
         } else if let Some(old) = song.lyrics.clone().filter(|_| instrumental_title(&song.name)) {
             // An instrumental's lyrics are those of its own page ("Big Poppa (Instrumental)", the studio talk of a
             // Beatles take), or none; the sung song's words are another recording's.
-            let pages: Option<Vec<Vec<Page>>> = artists.clone().map(|artist| genius_titled(&song, artist, 1)).collect();
-            let pages = pages.map(|pages| pages.concat());
+            let pages: Asked<Vec<Vec<Page>>> = artists.clone().map(|artist| genius_titled(&song, artist, 1)).collect();
+            let pages = pages.ok().map(|pages| pages.concat());
             if let Some(pages) = pages.filter(|pages| !pages.iter().any(|page| same_lyrics(&old, &page.lyrics))) {
                 let page = pages.into_iter().find(|page| !words(&page.lyrics).is_empty());
                 cleared = page.is_none();

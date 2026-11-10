@@ -1,6 +1,6 @@
 //! LRCLIB, a crowd's uploads of lyrics, and the synced lyrics among them.
 
-use crate::lyrics::{is_synced, lyrics_title, plain_title, same_lyrics, timed_for};
+use crate::lyrics::{is_synced, lyrics_title, plain_title, same_lyrics, timed_for, Lyrics};
 use crate::{http::Service, url_encode, Song};
 use serde_json::Value;
 use std::{
@@ -16,9 +16,40 @@ fn lrclib_search(url: &str) -> Option<Vec<Value>> {
     serde_json::from_slice(&LRCLIB.get(url, &[])?).ok()
 }
 
-/// LRCLIB's lyrics for versions as long as the song: those of the song's album first, then synced ones; `""` when
-/// LRCLIB says that the song is an instrumental. `keep`: the `.lrc` writer will search again (see [`lrclib_tracks`]).
-pub(crate) fn lrclib(song: &Song, keep: bool) -> Vec<String> {
+/// What LRCLIB has for a song, among the versions as long as it.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Versions {
+    /// Every version says that the song has no words.
+    pub(crate) instrumental: bool,
+    /// The lyrics of the versions: those of the song's album first, then synced ones.
+    pub(crate) lyrics: Vec<String>,
+}
+
+impl Versions {
+    fn is_empty(&self) -> bool {
+        !self.instrumental && self.lyrics.is_empty()
+    }
+
+    /// The lyrics that the `synced` provider takes, synced ones first: [`lrclib`] puts the song's album first, and
+    /// that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while others as long as
+    /// the song are synced. They must agree with the Genius lyrics `checks`. Without those, only synced lyrics (timed
+    /// to a recording as long as the song) and LRCLIB's word that the song is an instrumental count: plain lyrics are
+    /// anyone's text filed under any title, and all 7 LRCLIB versions of Lee Fields's "Funky Screw", which has no
+    /// Genius page, have the plain words of a Japanese comic song.
+    pub(crate) fn pick(self, checks: Option<&str>) -> Option<Lyrics> {
+        if self.instrumental {
+            return checks.is_none().then_some(Lyrics::Instrumental);
+        }
+        let agrees = |lyrics: &&String| checks.map_or_else(|| is_synced(lyrics), |by| same_lyrics(lyrics, by));
+        let best = self.lyrics.iter().find(|lyrics| is_synced(lyrics) && agrees(lyrics));
+        let best = best.or_else(|| self.lyrics.iter().find(agrees))?;
+        Some(Lyrics::Words(best.trim().to_string()))
+    }
+}
+
+/// LRCLIB's lyrics for versions as long as the song. `keep`: the `.lrc` writer will search again (see
+/// [`lrclib_tracks`]).
+pub(crate) fn lrclib(song: &Song, keep: bool) -> Versions {
     // LRCLIB files a song under one of its artists ("KING" of ¥$ is under Kanye West).
     let mut artists = vec![&song.artist];
     artists.extend(song.artists.iter().filter(|artist| **artist != song.artist));
@@ -30,13 +61,13 @@ pub(crate) fn lrclib(song: &Song, keep: bool) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn lrclib_by(song: &Song, artist: &str, keep: bool) -> Vec<String> {
+fn lrclib_by(song: &Song, artist: &str, keep: bool) -> Versions {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         url_encode(artist),
         url_encode(lyrics_title(song))
     );
-    let Some(tracks) = lrclib_tracks(&url, keep, lrclib_search) else { return vec![] };
+    let Some(tracks) = lrclib_tracks(&url, keep, lrclib_search) else { return Versions::default() };
     lrclib_lyrics(song, &tracks)
 }
 
@@ -71,16 +102,16 @@ fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) 
     Some(tracks)
 }
 
-/// [`lrclib_by`]'s lyrics of LRCLIB's search results. When every version as long as the song is marked
-/// instrumental, LRCLIB answers that the song has no words: that answer is `""`, so that the lyrics providers stop
-/// and do not take another song's words from a site that goes by the title alone.
-pub(crate) fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
+/// [`lrclib_by`]'s versions of LRCLIB's search results. When every version as long as the song is marked
+/// instrumental, LRCLIB answers that the song has no words, so that the lyrics providers stop and do not take another
+/// song's words from a site that goes by the title alone.
+pub(crate) fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Versions {
     let near: Vec<&Value> = tracks
         .iter()
         .filter(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)
         .collect();
     if !near.is_empty() && near.iter().all(|track| track["instrumental"].as_bool() == Some(true)) {
-        return vec![String::new()];
+        return Versions { instrumental: true, lyrics: vec![] };
     }
     let album = plain_title(&song.album_name);
     let text =
@@ -98,26 +129,8 @@ pub(crate) fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Vec<String> {
         .collect();
     found.sort_by_key(|(other_album, plain, _)| (*other_album, *plain));
     let mut seen = HashSet::new();
-    found.into_iter().map(|(_, _, lyrics)| lyrics).filter(|lyrics| seen.insert(lyrics.clone())).collect()
-}
-
-/// The first of LRCLIB's lyrics that `agrees`, synced ones first: [`lrclib`] puts the song's album first, and
-/// that album's version often has plain lyrics only ("Lucid Dreams" on Hits To The Head) while others as long as
-/// the song are synced.
-pub(crate) fn synced_first(found: Vec<String>, agrees: impl Fn(&String) -> bool) -> Option<String> {
-    let at = found.iter().position(|lyrics| is_synced(lyrics) && agrees(lyrics));
-    at.or_else(|| found.iter().position(&agrees)).map(|at| found[at].clone())
-}
-
-/// Whether the `synced` provider takes LRCLIB's `lyrics`: they agree with the Genius lyrics `checks`, or without
-/// those, they are synced (timed to a recording as long as the song) or LRCLIB's word that the song has none (`""`).
-/// Plain lyrics are anyone's text filed under any title: all 7 LRCLIB versions of Lee Fields's "Funky Screw", which
-/// has no Genius page, have the plain words of a Japanese comic song.
-pub(crate) fn lrclib_agrees(lyrics: &str, checks: Option<&String>) -> bool {
-    match checks {
-        Some(by) => !lyrics.is_empty() && same_lyrics(lyrics, by),
-        None => lyrics.is_empty() || is_synced(lyrics),
-    }
+    let lyrics = found.into_iter().map(|(_, _, lyrics)| lyrics).filter(|lyrics| seen.insert(lyrics.clone()));
+    Versions { instrumental: false, lyrics: lyrics.collect() }
 }
 
 #[cfg(test)]
@@ -150,10 +163,10 @@ mod tests {
             track("Hits To The Head", "plainLyrics", "Lucid dreams"),
         ];
         let found = lrclib_lyrics(&song, &tracks);
-        assert_eq!(found[0], "Lucid dreams");
-        assert_eq!(synced_first(found.clone(), |_| true).as_deref(), Some("[00:12.00] Lucid dreams"));
-        // Plain lyrics are taken when no synced ones agree.
-        assert_eq!(synced_first(found, |lyrics| !is_synced(lyrics)).as_deref(), Some("Lucid dreams"));
+        assert_eq!(found.lyrics[0], "Lucid dreams");
+        let words = |text: &str| Some(Lyrics::Words(text.into()));
+        // Genius's lyrics are those of the plain version: the synced one still agrees by its words.
+        assert_eq!(found.pick(Some("Lucid dreams")), words("[00:12.00] Lucid dreams"));
     }
 
     /// Without Genius lyrics to check them by, LRCLIB's plain lyrics are not taken (Lee Fields's "Funky Screw" got a
@@ -162,14 +175,16 @@ mod tests {
     fn unchecked_lrclib_lyrics_must_be_synced() {
         let song = Song { name: "Funky Screw".into(), duration: 211.0, ..Song::default() };
         let plain = serde_json::json!({"duration": 210.6, "syncedLyrics": "", "plainLyrics": "半チャーハン 一升半"});
-        let unchecked = |found| synced_first(found, |lyrics: &String| lrclib_agrees(lyrics, None));
-        assert_eq!(unchecked(lrclib_lyrics(&song, std::slice::from_ref(&plain))), None);
+        assert_eq!(lrclib_lyrics(&song, std::slice::from_ref(&plain)).pick(None), None);
         let synced = serde_json::json!({"duration": 211.0, "syncedLyrics": "[00:12.00] Screw"});
-        assert_eq!(unchecked(lrclib_lyrics(&song, &[plain, synced])).as_deref(), Some("[00:12.00] Screw"));
-        assert_eq!(unchecked(vec![String::new()]).as_deref(), Some(""));
-        // Genius's lyrics still check plain ones.
-        assert!(lrclib_agrees(BULLY_KING, Some(&BULLY_KING.to_string())));
-        assert!(!lrclib_agrees("", Some(&BULLY_KING.to_string())));
+        let found = lrclib_lyrics(&song, &[plain, synced]);
+        assert_eq!(found.pick(None), Some(Lyrics::Words("[00:12.00] Screw".into())));
+        let instrumental = Versions { instrumental: true, lyrics: vec![] };
+        assert_eq!(instrumental.pick(None), Some(Lyrics::Instrumental));
+        // Genius's lyrics still check plain ones, and an instrumental's word does not stand against them.
+        let agreeing = Versions { instrumental: false, lyrics: vec![BULLY_KING.into()] };
+        assert_eq!(agreeing.pick(Some(BULLY_KING)), Some(Lyrics::Words(BULLY_KING.into())));
+        assert_eq!(Versions { instrumental: true, lyrics: vec![] }.pick(Some(BULLY_KING)), None);
     }
 
     /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while:
@@ -194,16 +209,16 @@ mod tests {
         assert!(!kept("test:untaken 0") && kept(&format!("test:untaken {LRCLIB_KEPT}")));
     }
 
-    /// LRCLIB's word that a song is an instrumental is an answer (`""`), but only when every version as long as the
+    /// LRCLIB's word that a song is an instrumental is an answer, but only when every version as long as the
     /// song says so: all 20 results for Pink Floyd's "Interstellar Overdrive" are instrumental.
     #[test]
     fn lrclib_instrumentals_are_an_answer() {
         let song = Song { name: "Interstellar Overdrive".into(), duration: 581.0, ..Song::default() };
         let track = |d: f64, i: bool, p: &str| serde_json::json!({"duration": d, "instrumental": i, "plainLyrics": p});
         let instrumental = [track(582.0, true, ""), track(580.0, true, ""), track(300.0, false, "Marigolds")];
-        assert_eq!(lrclib_lyrics(&song, &instrumental), vec![String::new()]);
+        assert_eq!(lrclib_lyrics(&song, &instrumental), Versions { instrumental: true, lyrics: vec![] });
         let mixed = [track(582.0, true, ""), track(580.0, false, "Some words")];
-        assert_eq!(lrclib_lyrics(&song, &mixed), vec!["Some words".to_string()]);
+        assert_eq!(lrclib_lyrics(&song, &mixed).lyrics, vec!["Some words".to_string()]);
         assert!(lrclib_lyrics(&song, &[track(300.0, true, "")]).is_empty());
     }
 }

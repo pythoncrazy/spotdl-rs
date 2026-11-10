@@ -48,26 +48,34 @@ pub(crate) struct Page {
     pub(crate) same_year: bool,
 }
 
+/// Genius could not be asked: it blocks this client, or still fails after the waits. That is not "no page": no page
+/// lets LRCLIB's lyrics in unchecked, while a Genius that cannot be asked leaves them for a later run that can check
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unavailable;
+
+/// What Genius answered, if it could be asked.
+pub(crate) type Asked<T> = Result<T, Unavailable>;
+
 /// Genius's page of the song, only one with the song's title: the check that replaces lyrics must not take
-/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh"). The outer `None`: Genius
-/// could not be asked.
-pub(crate) fn genius_same(song: &Song, artist: &str) -> Option<Option<Page>> {
-    Some(genius_titled(song, artist, 1)?.into_iter().next().filter(|page| page.titled))
+/// another song with a like title ("In the Flesh?" for The Wall's other "In the Flesh").
+pub(crate) fn genius_same(song: &Song, artist: &str) -> Asked<Option<Page>> {
+    Ok(genius_titled(song, artist, 1)?.into_iter().next().filter(|page| page.titled))
 }
 
 /// Whether the page is the song's recording and not another of the artist's songs with that title: Genius dates it
 /// to the release's year or has it on the release's album. Spotify calls Until the End of Time's "When I Get Free
 /// II (Remix)" "When I Get Free", the title of a song from R U Still Down; Genius has that song on R U Still Down
-/// and Euthanasia. `None` when Genius could not be asked.
-pub(crate) fn released_on(song: &Song, page: &Page) -> Option<bool> {
+/// and Euthanasia.
+pub(crate) fn released_on(song: &Song, page: &Page) -> Asked<bool> {
     if page.same_year {
-        return Some(true);
+        return Ok(true);
     }
     let url = format!("https://genius.com/api/songs/{}", page.id);
     let album = plain_title(&song.album_name);
     let reply = serde_json::from_str::<Value>(&genius_get(&url)?).ok();
     let albums = reply.as_ref().and_then(|reply| reply["response"]["song"]["albums"].as_array());
-    Some(albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
+    Ok(albums.into_iter().flatten().filter_map(|other| other["name"].as_str()).map(plain_title).any(|other| {
         !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other))
     }))
 }
@@ -82,24 +90,23 @@ pub(crate) fn genius_key(song: &Song, artist: &str, max: usize) -> String {
 }
 
 /// Genius's pages for the song's title by `artist`: up to `max` hits with that artist and title (a song can have
-/// several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)"). `None` (Genius could not be asked) is not "no page": no page lets LRCLIB's lyrics in
-/// unchecked, while a Genius that cannot be asked leaves them for a later run that can check them.
-pub(crate) fn genius_titled(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
+/// several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
+pub(crate) fn genius_titled(song: &Song, artist: &str, max: usize) -> Asked<Vec<Page>> {
     let key = genius_key(song, artist, max);
     if let Some(pages) = GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-        return Some(pages.clone());
+        return Ok(pages.clone());
     }
     let pages = genius_pages(song, artist, max)?;
     GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
-    Some(pages)
+    Ok(pages)
 }
 
 /// The API's token is out of requests (the shared docs client has 100 an hour): the website's search is asked.
 static GENIUS_API_SPENT: AtomicBool = AtomicBool::new(false);
 
 /// A Genius page or search.
-fn genius_get(url: &str) -> Option<String> {
-    page(&GENIUS, url)
+fn genius_get(url: &str) -> Asked<String> {
+    page(&GENIUS, url).ok_or(Unavailable)
 }
 
 /// Whether the artist `name` is one of `names` ("¥$" of "¥$, Kanye West & Ty Dolla $ign"): its slug is a run of
@@ -125,109 +132,150 @@ fn genius_account(primary: &str, artist: &str) -> bool {
     primary.starts_with("Genius ") && !among(primary, artist)
 }
 
-/// The pages, or nothing when Genius could not be asked.
-fn genius_pages(song: &Song, artist: &str, max: usize) -> Option<Vec<Page>> {
+/// The song's hits among Genius's search hits: the same artist and the same title. The artist's first hit can be
+/// another of the artist's songs, and the artist may be one of several on the page ("¥$, Kanye West & Ty Dolla $ign").
+fn is_song(hit: &Value, song: &Song, artist: &str) -> bool {
+    let artists = hit["result"]["artist_names"].as_str().unwrap_or_default();
+    let full_title = hit_title(hit);
+    let (hit_plain, song_plain) = (plain_title(full_title), plain_title(lyrics_title(song)));
+    // An instrumental ("Big Poppa - Instrumental", "Girl (Take 2 - Instrumental Backing Track)") takes only a page of
+    // an instrumental version (Genius has the studio talk of the Beatles' takes), never the sung song's words.
+    let wordless = instrumental_title(&song.name);
+    (among(artist, artists) || among(primary(hit), artist))
+        && !genius_account(primary(hit), artist)
+        && !hit_plain.is_empty()
+        && (hit_plain.contains(&song_plain) || song_plain.contains(&hit_plain))
+        && (!wordless || instrumental_title(full_title) || hit["result"]["instrumental"].as_bool() == Some(true))
+}
+
+fn primary(hit: &Value) -> &str {
+    hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default()
+}
+
+fn hit_title(hit: &Value) -> &str {
+    hit["result"]["title"].as_str().unwrap_or_default()
+}
+
+/// How Genius's hits for a song are ordered. The page of the song's whole title goes first: "WHISKEY (RELEASE ME)"
+/// before Maroon 5's "Whiskey" (feat. A$AP Rocky), and "For No One" before "For No One (Take 10 / Backing Track)", a
+/// session take from the 2022 box set whose "For No One - 2022 Mix" is the song. Then the artist's own page, then the
+/// same title without notes ("Intro" before "Intro (Skit)"), and as an artist can have two songs with one title
+/// ("KING" on VULTURES 1 in 2024 and on BULLY in 2026), the song of the release's year.
+struct Ranking<'a> {
+    artist: &'a str,
+    year: u32,
+    title: String,
+    whole_title: String,
+    artists: Vec<String>,
+    marks: String,
+}
+
+impl<'a> Ranking<'a> {
+    fn new(song: &Song, artist: &'a str) -> Self {
+        // Artists' names are taken out of titles, but not names of a letter or two: "¥$" would take out every "y".
+        let artists: Vec<String> = song.artists.iter().filter(|a| search::slug(a, "").len() >= 3).cloned().collect();
+        let whole_title = search::clean_name(search::versionless(&song.name), &artists);
+        Self {
+            artist,
+            year: song.year,
+            title: plain_title(lyrics_title(song)),
+            whole_title,
+            artists,
+            marks: marks(search::versionless(&song.name)),
+        }
+    }
+
+    fn whole(&self, hit: &Value) -> bool {
+        search::clean_name(hit_title(hit), &self.artists) == self.whole_title
+    }
+
+    /// The hit has the song's whole title and its question and exclamation marks, which tell two titles apart where
+    /// the words are the same ("In the Flesh?").
+    fn titled(&self, hit: &Value) -> bool {
+        self.whole(hit) && marks(hit_title(hit)) == self.marks
+    }
+
+    fn same_year(&self, hit: &Value) -> bool {
+        let year = hit["result"]["release_date_components"]["year"].as_u64();
+        self.year != 0 && year == Some(u64::from(self.year))
+    }
+
+    fn key(&self, hit: &Value) -> (bool, bool, bool, bool, bool) {
+        (
+            !self.titled(hit),
+            !self.whole(hit),
+            !among(primary(hit), self.artist),
+            plain_title(hit_title(hit)) != self.title,
+            !self.same_year(hit),
+        )
+    }
+}
+
+/// The question and exclamation marks of a title, without its notes.
+fn marks(title: &str) -> String {
+    let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
+    title[..end].chars().filter(|c| matches!(c, '?' | '!')).collect()
+}
+
+/// Genius's search hits for `artist` and `title`. With a `genius_token`, Genius's API (as spotDL asks it); it counts
+/// requests apart from the website's search, which is asked when the API cannot answer (a token that many people use is
+/// often out of requests). A token out of requests stays so for the hour, and a rejected one (401) for good: neither is
+/// asked again in this run.
+fn search_hits(artist: &str, title: &str) -> Asked<Vec<Value>> {
+    let query = url_encode(&format!("{artist} {title}"));
+    let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
+    if let Some(hits) = token.and_then(|token| api_hits(&query, token)) {
+        return Ok(hits);
+    }
+    let reply = serde_json::from_str::<Value>(&genius_get(&format!("https://genius.com/api/search/song?q={query}"))?)
+        .map_err(|_| Unavailable)?;
+    Ok(reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default())
+}
+
+fn api_hits(query: &str, token: &str) -> Option<Vec<Value>> {
+    GENIUS.wait();
+    let url = format!("https://api.genius.com/search?q={query}");
+    let reply = http::request(&url, &[("Authorization", &format!("Bearer {token}"))], None, 0, None);
+    if reply.as_ref().is_err_and(|error| matches!(HttpError::status(&**error), Some(429 | 401))) {
+        GENIUS_API_SPENT.store(true, Relaxed);
+    }
+    serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
+}
+
+/// The page of a search hit, or nothing for a hit without a page or lyrics.
+fn page_of(hit: &Value, ranking: &Ranking) -> Asked<Option<Page>> {
+    let (Some(url), Some(id)) = (hit["result"]["url"].as_str(), hit["result"]["id"].as_u64()) else { return Ok(None) };
+    // An instrumental's page has no lyrics blocks, only "This song is an instrumental", and the API says so too.
+    let page = genius_get(url)?;
+    let said = hit["result"]["instrumental"].as_bool() == Some(true) || page.contains("This song is an instrumental");
+    let lyrics = genius_lyrics(&page).or_else(|| said.then(|| "[Instrumental]".into()));
+    Ok(lyrics.map(|lyrics| Page { lyrics, id, titled: ranking.titled(hit), same_year: ranking.same_year(hit) }))
+}
+
+fn genius_pages(song: &Song, artist: &str, max: usize) -> Asked<Vec<Page>> {
     if GENIUS.blocked() {
-        return None;
+        return Err(Unavailable);
     }
     let title = lyrics_title(song);
-    // With a `genius_token`, Genius's API (as spotDL asks it); it counts requests apart from the website's search,
-    // which is asked when the API cannot answer (a token that many people use is often out of requests).
-    // A token out of requests stays so for the hour, and a rejected one (401) for good: neither is asked again in
-    // this run.
-    let search = |title: &str| -> Option<Vec<Value>> {
-        let query = url_encode(&format!("{artist} {title}"));
-        let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
-        let from_api = token.map(|token| format!("Bearer {token}")).and_then(|auth| {
-            GENIUS.wait();
-            let url = format!("https://api.genius.com/search?q={query}");
-            let reply = http::request(&url, &[("Authorization", &auth)], None, 0, None);
-            if reply.as_ref().is_err_and(|error| matches!(HttpError::status(&**error), Some(429 | 401))) {
-                GENIUS_API_SPENT.store(true, Relaxed);
-            }
-            serde_json::from_slice::<Value>(&reply.ok()?).ok()?["response"]["hits"].as_array().cloned()
-        });
-        match from_api {
-            Some(hits) => Some(hits),
-            None => {
-                let url = format!("https://genius.com/api/search/song?q={query}");
-                let reply = serde_json::from_str::<Value>(&genius_get(&url)?).ok()?;
-                Some(reply["response"]["sections"][0]["hits"].as_array().cloned().unwrap_or_default())
-            }
-        }
-    };
-    let song_title = plain_title(title);
-    fn primary(hit: &Value) -> &str {
-        hit["result"]["primary_artist"]["name"].as_str().unwrap_or_default()
-    }
-    // An instrumental ("Big Poppa - Instrumental", "Girl (Take 2 - Instrumental Backing Track)") takes only a page
-    // of an instrumental version (Genius has the studio talk of the Beatles' takes), never the sung song's words.
-    let wordless = instrumental_title(&song.name);
-    // The same artist and the same title: the artist's first hit can be another of the artist's songs. The
-    // artist may be one of several on the page ("¥$, Kanye West & Ty Dolla $ign").
-    let same = |hit: &Value| {
-        let artists = hit["result"]["artist_names"].as_str().unwrap_or_default();
-        let full_title = hit["result"]["title"].as_str().unwrap_or_default();
-        let hit_title = plain_title(full_title);
-        (among(artist, artists) || among(primary(hit), artist))
-            && !genius_account(primary(hit), artist)
-            && !hit_title.is_empty()
-            && (hit_title.contains(&song_title) || song_title.contains(&hit_title))
-            && (!wordless || instrumental_title(full_title) || hit["result"]["instrumental"].as_bool() == Some(true))
-    };
-    let mut hits = search(title)?;
-    hits.retain(same);
+    let mut hits = search_hits(artist, title)?;
+    hits.retain(|hit| is_song(hit, song, artist));
     // A title with a note after " - " ("Robbery - Live from the Sydney Opera House") has no page of its own: the
     // song's page has its words.
     let base = title.split(" - ").next().unwrap_or(title).trim();
     if hits.is_empty() && base != title && !base.is_empty() {
-        hits = search(base)?;
-        hits.retain(same);
+        hits = search_hits(artist, base)?;
+        hits.retain(|hit| is_song(hit, song, artist));
     }
-    // The page of the song's whole title goes first: "WHISKEY (RELEASE ME)" before Maroon 5's "Whiskey" (feat.
-    // A$AP Rocky), and "For No One" before "For No One (Take 10 / Backing Track)", a session take from the 2022 box
-    // set whose "For No One - 2022 Mix" is the song. Then the artist's own page, then the same title without notes
-    // ("Intro" before "Intro (Skit)"), and as an artist can have two songs with one title ("KING" on VULTURES 1 in
-    // 2024 and on BULLY in 2026), the song of the release's year.
-    let year = |hit: &Value| hit["result"]["release_date_components"]["year"].as_u64();
-    fn hit_title(hit: &Value) -> &str {
-        hit["result"]["title"].as_str().unwrap_or_default()
-    }
-    // Artists' names are taken out of titles, but not names of a letter or two: "¥$" would take out every "y".
-    let artists: Vec<String> = song.artists.iter().filter(|a| search::slug(a, "").len() >= 3).cloned().collect();
-    let whole_title = search::clean_name(search::versionless(&song.name), &artists);
-    let whole = |hit: &Value| search::clean_name(hit_title(hit), &artists) == whole_title;
-    // A question or exclamation mark tells two titles apart where the words are the same ("In the Flesh?").
-    let marks = |title: &str| -> String {
-        let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
-        title[..end].chars().filter(|c| matches!(c, '?' | '!')).collect()
-    };
-    let song_marks = marks(search::versionless(&song.name));
-    let titled = |hit: &Value| whole(hit) && marks(hit_title(hit)) == song_marks;
-    let own = |hit: &Value| among(primary(hit), artist);
-    let exact = |hit: &Value| plain_title(hit_title(hit)) == song_title;
-    hits.sort_by_key(|hit| {
-        (!titled(hit), !whole(hit), !own(hit), !exact(hit), song.year == 0 || year(hit) != Some(u64::from(song.year)))
-    });
-    let same_year = |hit: &Value| song.year != 0 && year(hit) == Some(u64::from(song.year));
-    let mut pages = vec![];
-    for hit in hits.iter().take(max) {
-        let (Some(url), Some(id)) = (hit["result"]["url"].as_str(), hit["result"]["id"].as_u64()) else { continue };
-        // An instrumental's page has no lyrics blocks, only "This song is an instrumental", and the API says so too.
-        let page = genius_get(url)?;
-        let said =
-            hit["result"]["instrumental"].as_bool() == Some(true) || page.contains("This song is an instrumental");
-        let Some(lyrics) = genius_lyrics(&page).or_else(|| said.then(|| "[Instrumental]".into())) else { continue };
-        pages.push(Page { lyrics, id, titled: titled(hit), same_year: same_year(hit) });
-    }
-    Some(pages)
+    let ranking = Ranking::new(song, artist);
+    hits.sort_by_key(|hit| ranking.key(hit));
+    hits.iter().take(max).filter_map(|hit| page_of(hit, &ranking).transpose()).collect()
 }
 
 /// Whether Genius's page is the song's own (see [`genius_same`] and [`released_on`]) and has no words, only
 /// section names ("[Instrumental]"): the song is an instrumental. A page of another song with a like title
 /// ("Bohemian Rhapsody (Instrumental)") says nothing about the song.
 pub(crate) fn instrumental(song: &Song, page: &Page) -> bool {
-    page.titled && words(&page.lyrics).is_empty() && released_on(song, page) == Some(true)
+    page.titled && words(&page.lyrics).is_empty() && released_on(song, page) == Ok(true)
 }
 
 #[cfg(test)]
