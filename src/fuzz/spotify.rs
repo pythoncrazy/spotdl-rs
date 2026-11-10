@@ -1,5 +1,5 @@
-//! Fuzz tests for the reply and title code of `spotify.rs`: replies of any shape must give a value or nothing, never
-//! a panic, since one panic aborts a whole run.
+//! Fuzz tests for the reply and title code of `spotify.rs`: replies of any shape must give a value or nothing, never a
+//! panic, since one panic aborts a whole run.
 
 use super::*;
 use crate::gen::{json, runs, song, text};

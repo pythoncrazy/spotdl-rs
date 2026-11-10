@@ -1,4 +1,9 @@
-use crate::{cached, http, http_json, http_paced, number, on, search, url_encode, Pace, Song, HOME, R};
+use crate::settings::settings;
+use crate::{
+    cached,
+    http::{self, HttpError, Pace},
+    search, url_encode, Song, HOME, R,
+};
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -12,7 +17,8 @@ use std::{
 
 const UA: (&str, &str) = (
     "User-Agent",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+    Chrome/131.0 Safari/537.36",
 );
 const SECRETS: &str = "https://code.thetadev.de/ThetaDev/spotify-secrets/raw/branch/main/secrets/secretDict.json";
 const QUERIES: [&str; 6] =
@@ -40,7 +46,7 @@ fn totp(secret: &[u8]) -> String {
 
 /// Persisted-query hashes from the web player's main bundle and its search and artist route chunks.
 fn hashes() -> R<Value> {
-    let get = |url: &str| -> R<String> { Ok(String::from_utf8(http(url, &[UA], None)?)?) };
+    let get = |url: &str| -> R<String> { Ok(String::from_utf8(http::get(url, &[UA])?)?) };
     let html = get("https://open.spotify.com")?;
     let main = html.split('"').find(|s| s.contains("/web-player/web-player.") && s.ends_with(".js"));
     let js = get(main.ok_or("no web-player bundle")?)?;
@@ -73,7 +79,7 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
     let mut slot = SESSION.lock().map_err(|error| error.to_string())?;
     let path = HOME.join("anon.json");
     let disk = || {
-        let state = serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !on("no_cache"));
+        let state = serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !settings().no_cache);
         state.filter(complete).map(Arc::new)
     };
     let fresh = |state: &Arc<Value>| {
@@ -84,17 +90,20 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
         *slot = Some(state.clone());
         return Ok(state);
     }
-    let secrets: HashMap<String, Vec<u8>> = http_json(SECRETS, &[UA], None)?;
+    let secrets: HashMap<String, Vec<u8>> = http::get_json(SECRETS, &[UA])?;
     let (version, secret) =
         secrets.iter().max_by_key(|(k, _)| k.parse::<u32>().unwrap_or(0)).ok_or("no TOTP secret")?;
     let code = totp(secret);
-    let url = format!("https://open.spotify.com/api/token?reason=init&productType=web-player&totp={code}&totpVer={version}&totpServer={code}");
-    let token: Value = http_json(&url, &[UA], None)?;
+    let url = format!(
+        "https://open.spotify.com/api/token?reason=init&productType=web-player\
+        &totp={code}&totpVer={version}&totpServer={code}"
+    );
+    let token: Value = http::get_json(&url, &[UA])?;
     let token = token["accessToken"].as_str().map(|t| (t, &token["accessTokenExpirationTimestampMs"]));
     let (token, expires) = token.ok_or("Spotify token missing")?;
     let state = Arc::new(json!({"token": token, "exp": expires, "hashes": hashes()?}));
     // A partial set is kept for this run only, so the next run looks for the missing hashes again.
-    if !on("no_cache") && complete(&state) {
+    if !settings().no_cache && complete(&state) {
         fs::create_dir_all(&*HOME)?;
         fs::write(path, state.to_string())?;
     }
@@ -104,13 +113,13 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
 
 fn query(op: &str, variables: Value) -> R<Value> {
     let days = match op {
-        "getTrack" if on("use_cache_file") => u64::MAX,
+        "getTrack" if settings().use_cache_file => u64::MAX,
         "getTrack" | "getAlbum" | "queryArtistOverview" => 7,
         _ => 0,
     };
     cached(&format!("{op}{variables}"), days, || {
         let (mut rejected, mut last) = (None::<String>, String::new());
-        for _ in 0..=number("max_retries") {
+        for _ in 0..=settings().max_retries {
             let state = session(rejected.as_deref())?;
             let token = state["token"].as_str().unwrap_or_default();
             // A hash the bundles did not yield is asked of a new session, as for a rejected token.
@@ -120,17 +129,20 @@ fn query(op: &str, variables: Value) -> R<Value> {
             };
             let extensions = json!({"persistedQuery": {"version": 1, "sha256Hash": hash}}).to_string();
             let (variables, extensions) = (url_encode(&variables.to_string()), url_encode(&extensions));
-            let url = format!("https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}");
+            let url = format!(
+                "https://api-partner.spotify.com/pathfinder/v1/query\
+                ?operationName={op}&variables={variables}&extensions={extensions}"
+            );
             let headers = [UA, ("Authorization", &format!("Bearer {token}"))];
-            let reply = http_paced(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
+            let reply = http::request(&url, &headers, None, settings().max_retries, Some(&SPOTIFY));
             match reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?)) {
-                // A GraphQL failure comes as `"data": null` (or with every field null), with "errors": it is no
-                // answer, and must not be cached as one ("Stay - 2016 Remix" then resolved to no song for a week).
+                // A GraphQL failure comes as `"data": null` (or with every field null), with "errors": it is no answer,
+                // and must not be cached as one ("Stay - 2016 Remix" then resolved to no song for a week).
                 Ok(reply) if reply["data"].as_object().is_some_and(|data| data.values().any(|v| !v.is_null())) => {
                     return Ok(reply)
                 }
                 Ok(reply) => last = format!("{op}: {}", reply["errors"]),
-                Err(error) if error.to_string().starts_with("HTTP 401") => last = error.to_string(),
+                Err(error) if HttpError::status(&*error) == Some(401) => last = error.to_string(),
                 // Lost connections, 429 and 5xx were retried above: asking again here would square the requests.
                 Err(error) => return Err(error),
             }
@@ -145,7 +157,10 @@ fn query(op: &str, variables: Value) -> R<Value> {
 /// All items of a paged list (album tracks, playlist items, discography), with the list's own data.
 fn pages(op: &str, uri: &str, list: &str, limit: usize) -> R<(Value, Vec<Value>)> {
     let page = |offset: usize| {
-        let variables = json!({"uri": uri, "locale": "", "offset": offset, "limit": limit, "order": "DATE_DESC", "enableWatchFeedEntrypoint": false});
+        let variables = json!({
+            "uri": uri, "locale": "", "offset": offset, "limit": limit, "order": "DATE_DESC",
+            "enableWatchFeedEntrypoint": false,
+        });
         let mut reply = query(op, variables)?;
         let items = reply.pointer_mut(&format!("{list}/items")).map(Value::take);
         R::Ok((reply, serde_json::from_value::<Vec<Value>>(items.unwrap_or_default()).unwrap_or_default()))
@@ -167,7 +182,7 @@ fn cover(value: &Value) -> Option<String> {
 }
 
 /// The URL of the artist's largest picture.
-pub fn artist_image(artist_id: &str) -> Option<String> {
+pub(crate) fn artist_image(artist_id: &str) -> Option<String> {
     let uri = format!("spotify:artist:{artist_id}");
     let reply = query("queryArtistOverview", json!({"uri": uri, "locale": "", "includePrerelease": true})).ok()?;
     cover(&reply["data"]["artistUnion"]["visuals"]["avatarImage"])
@@ -184,8 +199,8 @@ fn album_meta(uri: &str) -> R<Arc<Value>> {
     Ok(ALBUMS.lock().map_err(|error| error.to_string())?.entry(uri.into()).or_insert(Arc::new(album)).clone())
 }
 
-/// Spotify dates some albums by year or month only and pads its isoString with 1 January ("1994-01-01T00:00:00Z"
-/// for The Division Bell, out on 28 March 1994), so only the part its precision gives is the date.
+/// Spotify dates some albums by year or month only and pads its isoString with 1 January ("1994-01-01T00:00:00Z" for
+/// The Division Bell, out on 28 March 1994), so only the part its precision gives is the date.
 fn release_date(date: &Value) -> String {
     let known = match date["precision"].as_str() {
         Some("YEAR") => 4,
@@ -195,9 +210,9 @@ fn release_date(date: &Value) -> String {
     date["isoString"].as_str().and_then(|iso| iso.get(..known)).unwrap_or_default().into()
 }
 
-/// The number of tracks on the song's disc, as TRACKTOTAL and ID3's TRCK "n/total" count them: track numbers
-/// start again on each disc, so disc 2 of a 12+5 album is "1 of 5", not "1 of 17". The album's total is the
-/// fallback when Spotify lists no discs.
+/// The number of tracks on the song's disc, as TRACKTOTAL and ID3's TRCK "n/total" count them: track numbers start
+/// again on each disc, so disc 2 of a 12+5 album is "1 of 5", not "1 of 17". The album's total is the fallback when
+/// Spotify lists no discs.
 fn disc_tracks(album: &Value, disc: u64) -> u32 {
     let discs = album["discs"]["items"].as_array().into_iter().flatten();
     let on_disc =
@@ -281,8 +296,8 @@ fn track(uri: &str) -> R<Value> {
 fn artist(uri: &str) -> R<Vec<Song>> {
     let releases = pages("queryArtistDiscographyAll", uri, "/data/artistUnion/discography/all", 50)?.1;
     let mut releases: Vec<&Value> = releases.iter().map(|release| &release["releases"]["items"][0]).collect();
-    // Releases in this order: albums, EPs, singles, then compilations; originals before reissues. Albums and EPs
-    // are kept whole; singles and compilations add only the songs that no earlier release has.
+    // Releases in this order: albums, EPs, singles, then compilations; originals before reissues. Albums and EPs are
+    // kept whole; singles and compilations add only the songs that no earlier release has.
     let kind =
         |release: &Value| ["ALBUM", "EP", "SINGLE", "COMPILATION"].iter().position(|kind| release["type"] == *kind);
     let date = |release: &Value| release["date"]["isoString"].as_str().unwrap_or_default().to_string();
@@ -296,9 +311,9 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     let key = |song: &Song| (song_key(&song.name), song.artists.clone());
     let names: Vec<&str> = releases.iter().map(|release| release["name"].as_str().unwrap_or_default()).collect();
     let kept = editions(&names, &albums);
-    // Albums and EPs keep every track, also songs that another album or EP has: the "She's A Riot" EP keeps its
-    // title track, which is also on "Learn To Exist". Singles and compilations add only new titles, not their
-    // edits of album songs.
+    // Albums and EPs keep every track, also songs that another album or EP has: the "She's A Riot" EP keeps its title
+    // track, which is also on "Learn To Exist". Singles and compilations add only new titles, not their edits of album
+    // songs.
     let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
     let mut songs = Vec::new();
     for i in kept {
@@ -310,11 +325,11 @@ fn artist(uri: &str) -> R<Vec<Song>> {
     Ok(songs)
 }
 
-/// The releases to keep, in the order their songs are taken. A bigger edition of the same album (same base title,
-/// or one that starts with it) that has at least 90% of a smaller edition's songs is kept whole, and the smaller
-/// edition is skipped. "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist.
-/// Titles are compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its
-/// "(2026 Mix)" songs replaces the 2009 remaster.
+/// The releases to keep, in the order their songs are taken. A bigger edition of the same album (same base title, or
+/// one that starts with it) that has at least 90% of a smaller edition's songs is kept whole, and the smaller edition
+/// is skipped. "BULLY - DELUXE" replaces "BULLY", even though one of its songs gained a featured artist. Titles are
+/// compared without featured artists and version notes, so "Rubber Soul (Super Deluxe)" with its "(2026 Mix)" songs
+/// replaces the 2009 remaster.
 fn editions(names: &[&str], albums: &[Vec<Song>]) -> Vec<usize> {
     let titles: Vec<HashSet<String>> =
         albums.iter().map(|songs| songs.iter().map(|song| search::edition_title(&song.name)).collect()).collect();
@@ -327,14 +342,14 @@ fn editions(names: &[&str], albums: &[Vec<Song>]) -> Vec<usize> {
         // "Revenge Of The Dreamers III: Director's Cut" is an edition of "Revenge Of The Dreamers III".
         long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
     };
-    // A clean edition never replaces one with explicit songs. Of two editions with the same songs, the explicit
-    // one, then the one titled only with the album's title, then the first, is kept: "Animals (2018 Remix)",
-    // which Spotify dates two days before "Animals", is not the album.
+    // A clean edition never replaces one with explicit songs. Of two editions with the same songs, the explicit one,
+    // then the one titled only with the album's title, then the first, is kept: "Animals (2018 Remix)", which Spotify
+    // dates two days before "Animals", is not the album.
     let rank = |k: usize| (explicit[k] > 0, titles[k].len(), explicit[k], names[k] == base_title(names[k]));
     let replaces = |j: usize, i: usize| {
         let shared = titles[i].intersection(&titles[j]).count();
-        // The clean edit's censored titles ("****** Wit The Wrong Nigga") and clean-only remixes leave it sharing
-        // only most of its songs with the explicit edition, which still replaces it.
+        // The clean edit's censored titles ("****** Wit The Wrong Nigga") and clean-only remixes leave it sharing only
+        // most of its songs with the explicit edition, which still replaces it.
         let edit = explicit[j] > 0 && explicit[i] == 0;
         j != i
             && same_title(&title(j), &title(i))
@@ -343,8 +358,8 @@ fn editions(names: &[&str], albums: &[Vec<Song>]) -> Vec<usize> {
     };
     let n = names.len();
     let mut kept: Vec<usize> = (0..n).filter(|&i| !(0..n).any(|j| replaces(j, i))).collect();
-    // The bigger edition takes the place of the first edition it replaces, so that no release in between takes
-    // its songs.
+    // The bigger edition takes the place of the first edition it replaces, so that no release in between takes its
+    // songs.
     kept.sort_by_key(|&j| (0..n).filter(|&i| i == j || replaces(j, i)).min());
     kept
 }
@@ -370,7 +385,11 @@ fn search(text: &str) -> R<String> {
         .iter()
         .find_map(|kind| Some((&kind[..kind.len() - 1], text.strip_prefix(kind)?)));
     let (kind, term) = prefix.map_or(("track", text.replace(" - ", " ")), |(kind, term)| (kind, term.trim().into()));
-    let variables = json!({"searchTerm": term, "offset": 0, "limit": 10, "numberOfTopResults": 5, "includeAudiobooks": false, "includeArtistHasConcertsField": false, "includePreReleases": false, "includeLocalConcertsField": false});
+    let variables = json!({
+        "searchTerm": term, "offset": 0, "limit": 10, "numberOfTopResults": 5,
+        "includeAudiobooks": false, "includeArtistHasConcertsField": false,
+        "includePreReleases": false, "includeLocalConcertsField": false,
+    });
     let results = query("searchDesktop", variables)?;
     let list = if kind == "track" || kind == "album" { format!("{kind}sV2") } else { format!("{kind}s") };
     let first = &results["data"]["searchV2"][list]["items"][0];
@@ -403,7 +422,7 @@ fn paired(youtube: &str, spotify: &str) -> R<Vec<Song>> {
 }
 
 /// Songs for one query: a Spotify URL or URI, a save file, a YouTube or SoundCloud URL, or search text.
-pub fn resolve(text: &str) -> R<Vec<Song>> {
+pub(crate) fn resolve(text: &str) -> R<Vec<Song>> {
     if text.ends_with(".spotdl") {
         let mut file: Value = serde_json::from_slice(&fs::read(text)?)?;
         return Ok(serde_json::from_value(file.get_mut("songs").map(Value::take).unwrap_or(file))?);
@@ -415,7 +434,7 @@ pub fn resolve(text: &str) -> R<Vec<Song>> {
         return search::source(text, !text.contains("soundcloud.com/"));
     }
     let text = match text.contains("spotify.link") {
-        true => ureq::ResponseExt::get_uri(&crate::AGENT.get(text).call()?).to_string(),
+        true => http::final_url(text)?,
         false => text.into(),
     };
     let link = text.split('?').next().unwrap_or_default().trim_end_matches('/');
@@ -447,7 +466,7 @@ fn deezer_error(reply: &Value) -> Option<(bool, String)> {
 fn deezer(url: &str) -> R<Value> {
     for attempt in 0..6 {
         DEEZER.wait();
-        let reply: Value = http_json(url, &[], None)?;
+        let reply: Value = http::get_json(url, &[])?;
         match deezer_error(&reply) {
             None => return Ok(reply),
             Some((false, error)) => return Err(format!("Deezer: {error} for {url}").into()),
@@ -457,8 +476,8 @@ fn deezer(url: &str) -> R<Value> {
     Err(format!("Deezer: still busy for {url}").into())
 }
 
-/// The value in `cell`, fetched by the first song of the album that asks. A failure is not kept, so that a later
-/// song asks again, but at most 3 times: a Deezer that is down is not asked once for every song.
+/// The value in `cell`, fetched by the first song of the album that asks. A failure is not kept, so that a later song
+/// asks again, but at most 3 times: a Deezer that is down is not asked once for every song.
 fn fetch_once(cell: &Mutex<Result<Value, (u8, String)>>, fetch: impl FnOnce() -> R<Value>) -> Result<Value, String> {
     let mut cell = cell.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err((tries @ 0..3, _)) = *cell {
@@ -467,9 +486,9 @@ fn fetch_once(cell: &Mutex<Result<Value, (u8, String)>>, fetch: impl FnOnce() ->
     cell.clone().map_err(|(_, error)| error)
 }
 
-/// The title that a song has on every release: without a " - Remastered 2009" suffix, and slugged, because box sets
-/// and compilations write "Nowhere Man (First Version - Take 2)" as "Nowhere Man - First Version - Take 2". The
-/// take, demo and mix words stay: "Take 2" and "Take 5" are other recordings.
+/// The title that a song has on every release: without a " - Remastered 2009" suffix, and slugged, because box sets and
+/// compilations write "Nowhere Man (First Version - Take 2)" as "Nowhere Man - First Version - Take 2". The take, demo
+/// and mix words stay: "Take 2" and "Take 5" are other recordings.
 fn song_key(name: &str) -> String {
     search::slug(search::versionless(name), "-")
 }
@@ -491,11 +510,11 @@ fn version_note(title: &str) -> bool {
     words.split('-').any(|word| search::altered(word) || other.contains(&word))
 }
 
-/// The ids of the Deezer albums that can be the Spotify album, best first, each with whether it fits in every
-/// way. A single, its album, the clean and explicit editions and a deluxe edition share a title, so hits rank by
-/// the same title, then a title close to it, then the same record type, track count (unknown in a discography)
-/// and explicit flag, then Deezer's order. A hit with only the base title ("Fever Ray" for "Fever Ray (Deluxe)")
-/// must be the same kind of release, and is never taken for a remix or sped-up release of the base title's song.
+/// The ids of the Deezer albums that can be the Spotify album, best first, each with whether it fits in every way. A
+/// single, its album, the clean and explicit editions and a deluxe edition share a title, so hits rank by the same
+/// title, then a title close to it, then the same record type, track count (unknown in a discography) and explicit
+/// flag, then Deezer's order. A hit with only the base title ("Fever Ray" for "Fever Ray (Deluxe)") must be the same
+/// kind of release, and is never taken for a remix or sped-up release of the base title's song.
 fn ranked(hits: &[Value], title: &str, kind: &str, count: u64, explicit: bool) -> Vec<(u64, bool)> {
     let slug = |text: &str| search::slug(text, "-");
     let close = |a: &str, b: &str| search::ratio(&slug(a), &slug(b)) > 80.0;
@@ -518,9 +537,8 @@ fn ranked(hits: &[Value], title: &str, kind: &str, count: u64, explicit: bool) -
     best.map(|(fits, _, id)| (id, fits == (true, true, true, true, true))).collect()
 }
 
-/// Whether Deezer's tracks are the Spotify album's: at least half the positions of the longer list have a song as
-/// long (within 3 s). A title can still be another release's: a 2-song single's album, another recording of
-/// an opera.
+/// Whether Deezer's tracks are the Spotify album's: at least half the positions of the longer list have a song as long
+/// (within 3 s). A title can still be another release's: a 2-song single's album, another recording of an opera.
 fn agrees(lengths: &HashMap<String, f64>, tracks: &serde_json::Map<String, Value>) -> bool {
     let same = lengths.iter().filter(|(position, length)| {
         tracks.get(*position).and_then(|track| track["duration"].as_f64()).is_some_and(|d| (d - **length).abs() <= 3.0)
@@ -529,10 +547,10 @@ fn agrees(lengths: &HashMap<String, f64>, tracks: &serde_json::Map<String, Value
 }
 
 /// Deezer's copy of the song's album: genres, UPC, label, release date and its tracks' titles and ISRCs. Deezer's
-/// search misses some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)") or
-/// returns only the clean edition (GNX), so unless a search hit fits in every way the album is also looked for in
-/// the artist's discography. An album whose tracks are not the Spotify album's gives only its genres. When no album
-/// matches, the genres come from the album that has the song, or else from the artist's most common genre.
+/// search misses some albums and often names an edition differently ("Fever Ray" for "Fever Ray (Deluxe)") or returns
+/// only the clean edition (GNX), so unless a search hit fits in every way the album is also looked for in the artist's
+/// discography. An album whose tracks are not the Spotify album's gives only its genres. When no album matches, the
+/// genres come from the album that has the song, or else from the artist's most common genre.
 fn deezer_album(song: &Song) -> R<Value> {
     cached(&format!("deezer6:{}", song.album_id), 7, || {
         let same = |a: &str, b: &Value| {
@@ -587,8 +605,7 @@ fn deezer_album(song: &Song) -> R<Value> {
                 );
             }
         }
-        // Another release of the same title by the artist still has the album's genres, but not its UPC, label or
-        // date.
+        // Another release of the same title by the artist still has the album's genres, but not its UPC, label or date.
         if let Some((id, _)) = ids.first() {
             return Ok(json!({"genres": genres(&deezer(&format!("https://api.deezer.com/album/{id}"))?)}));
         }
@@ -606,17 +623,19 @@ fn deezer_album(song: &Song) -> R<Value> {
             *counts.entry(genre).or_insert(0) += 1;
         }
         Ok(match counts.into_iter().max_by_key(|(id, count)| (*count, -id)) {
-            Some((id, _)) => json!({"genres": [deezer(&format!("https://api.deezer.com/genre/{id}"))?["name"]]}),
+            Some((id, _)) => {
+                json!({"genres": [deezer(&format!("https://api.deezer.com/genre/{id}"))?["name"]]})
+            }
             None => Value::Null,
         })
     })
 }
 
-/// The release date and original date from Spotify's date and Deezer's date of the album. Deezer pads dates it
-/// knows only by year with 1 January too (29 of 894 cached albums, over ten times the real share), so that is read as
-/// the year. Deezer's album is found by title, so it can be a reissue: its day is taken for a Spotify date of
-/// only a year or month when it is in that year or month. Dates are compared only as far as both go, so a year
-/// is not earlier than a day in it. Deezer dates albums it has no date for 1900-01-01 (or 0000-00-00): no date.
+/// The release date and original date from Spotify's date and Deezer's date of the album. Deezer pads dates it knows
+/// only by year with 1 January too (29 of 894 cached albums, over ten times the real share), so that is read as the
+/// year. Deezer's album is found by title, so it can be a reissue: its day is taken for a Spotify date of only a year
+/// or month when it is in that year or month. Dates are compared only as far as both go, so a year is not earlier than
+/// a day in it. Deezer dates albums it has no date for 1900-01-01 (or 0000-00-00): no date.
 fn dates(spotify: &str, deezer: &str) -> (String, String) {
     let deezer = if deezer.get(..4).is_some_and(|year| year > "1900") { deezer } else { "" };
     let deezer = deezer.strip_suffix("-01-01").unwrap_or(deezer);
@@ -634,12 +653,12 @@ fn dates(spotify: &str, deezer: &str) -> (String, String) {
     (date.into(), original.into())
 }
 
-/// Adds Deezer's genres, label (when Spotify has none), UPC, original date, ISRC, BPM and gain. An error is Deezer's failure (not a song
-/// that Deezer does not have): the song then has only what Spotify gives.
-pub fn enrich(song: &mut Song) -> Result<(), String> {
+/// Adds Deezer's genres, label (when Spotify has none), UPC, original date, ISRC, BPM and gain. An error is Deezer's
+/// failure (not a song that Deezer does not have): the song then has only what Spotify gives.
+pub(crate) fn enrich(song: &mut Song) -> Result<(), String> {
     let release = song.extra.release.as_deref().cloned().unwrap_or_else(|| song.clone());
-    // A save file written with a playlist option has only the playlist's album fields: a search by them finds
-    // no album (and would be cached as the real album's), and the track at the playlist position is another song.
+    // A save file written with a playlist option has only the playlist's album fields: a search by them finds no album
+    // (and would be cached as the real album's), and the track at the playlist position is another song.
     let listed = release.list_name.as_ref() == Some(&release.album_name)
         && release.list_position == Some(release.track_number as usize)
         && release.disc_number == 1;
@@ -658,17 +677,17 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
         song.genres =
             album["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
         song.extra.upc = album["upc"].as_str().unwrap_or_default().into();
-        // Spotify's label is the downloaded release's; Deezer names labels its own way ("Young" for "Young
-        // Turks") and its album can be another edition, so its label only fills a gap.
+        // Spotify's label is the downloaded release's; Deezer names labels its own way ("Young" for "Young Turks") and
+        // its album can be another edition, so its label only fills a gap.
         if song.publisher.is_empty() {
             song.publisher = album["label"].as_str().unwrap_or_default().into();
         }
         (song.date, song.extra.original_date) = dates(&song.date, album["release_date"].as_str().unwrap_or_default());
-        // The album is found by title, so it can be another edition (clean, remaster, other order): only trust
-        // the track at this position when it has the same length and explicit flag. Deezer may number the album
-        // otherwise (M83's two discs as one, a deluxe edition's bonus songs in between): then only the one track
-        // that also has the song's full title, version note included, since an instrumental, remix or live take
-        // is as long as the song and has its own ISRC.
+        // The album is found by title, so it can be another edition (clean, remaster, other order): only trust the
+        // track at this position when it has the same length and explicit flag. Deezer may number the album otherwise
+        // (M83's two discs as one, a deluxe edition's bonus songs in between): then only the one track that also has
+        // the song's full title, version note included, since an instrumental, remix or live take is as long as the
+        // song and has its own ISRC.
         if song.isrc.as_deref().is_none_or(str::is_empty) {
             let same = |track: &Value| {
                 track["duration"].as_f64().is_some_and(|length| (length - song.duration).abs() <= 3.0)
@@ -794,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_session_without_a_querys_hash_is_built_again() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         // As if the search route chunk had failed to load: a live token, but no searchDesktop hash.
         let partial = json!({"token": "partial", "exp": u64::MAX, "hashes": {"getTrack": "0".repeat(64)}});
         assert!(!complete(&partial));

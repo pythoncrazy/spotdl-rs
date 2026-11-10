@@ -1,4 +1,5 @@
-use crate::{cached, download, http_json, list, log, now, number, on, spotify, text, Song, R};
+use crate::settings::settings;
+use crate::{cached, files, http, log, now, spotify, Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -7,12 +8,14 @@ use std::{
     time::Duration,
 };
 
-const REJECTED: &str = "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks live concert remix acoustic extended clean mashup originally reversed reverse amv";
+const REJECTED: &str = "bassboost bassboosted boosted 8d 8daudio 3d 16d slowed sped spedup speedup nightcore \
+    daycore reverb karaoke cover tribute instrumental acapella drumless chipmunk chipmunks \
+    live concert remix acoustic extended clean mashup originally reversed reverse amv";
 const PENALIZED: &str = "remaster remastered lyrics lyric visualizer video edit";
-// "album", "lp", "edited" and "explicit" make " - Album Version (Edited)" and " - LP Version" version notes: kept
-// in the title, they sank the exact clean track below the explicit one. The explicit badge tells the edits apart.
-const SUFFIXES: &str = "remaster remastered mono stereo mix version edit edited explicit single radio album lp deluxe \
-    anniversary original bonus";
+// "album", "lp", "edited" and "explicit" make " - Album Version (Edited)" and " - LP Version" version notes: kept in
+// the title, they sank the exact clean track below the explicit one. The explicit badge tells the edits apart.
+const SUFFIXES: &str = "remaster remastered mono stereo mix version edit edited explicit single radio album lp \
+    deluxe anniversary original bonus";
 
 /// Until when (Unix seconds) every thread holds off YouTube after it blocked us.
 static PAUSE: AtomicU64 = AtomicU64::new(0);
@@ -56,7 +59,7 @@ fn hit(url: String, name: String, artists: Vec<String>, album: String, duration:
 }
 
 /// Runs a YouTube step, retrying transient errors; when YouTube blocks us, every thread pauses.
-pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
+pub(crate) fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
     let mut attempt = 0;
     loop {
         let wait = PAUSE.load(Relaxed).saturating_sub(now());
@@ -72,7 +75,7 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
         let blocked =
             has(&["not a bot", "HTTP Error 403", "HTTP 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]);
         let transient = has(&["Requested format is not available", "Failed to extract any player response"]);
-        if attempt >= number("max_retries") || !(blocked || transient) {
+        if attempt >= settings().max_retries || !(blocked || transient) {
             return Err(error.into());
         }
         if blocked && attempt > 0 {
@@ -84,30 +87,31 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
     }
 }
 
-pub fn yt_dlp() -> Command {
-    let mut command = Command::new(text("yt_dlp").unwrap_or("yt-dlp"));
+pub(crate) fn yt_dlp() -> Command {
+    let settings = settings();
+    let mut command = Command::new(&settings.yt_dlp);
     // Deno is on by default; these are used when it is missing.
     command.args(["--js-runtimes", "node", "--js-runtimes", "bun"]);
-    for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
-        command.args(text(key).map(|value| [flag, value]).into_iter().flatten());
+    for (value, flag) in [(&settings.cookie_file, "--cookies"), (&settings.proxy, "--proxy")] {
+        command.args(value.iter().flat_map(|value| [flag, value.as_str()]));
     }
-    command.args(text("yt_dlp_args").unwrap_or_default().split_whitespace());
+    command.args(settings.yt_dlp_args.as_deref().unwrap_or_default().split_whitespace());
     command
 }
 
-/// Runs `command`, naming the program when it cannot be started: the OS error alone ("No such file or directory")
-/// does not say that yt-dlp or FFmpeg is missing.
-pub fn run(command: &mut Command) -> Result<Output, String> {
+/// Runs `command`, naming the program when it cannot be started: the OS error alone ("No such file or directory") does
+/// not say that yt-dlp or FFmpeg is missing.
+pub(crate) fn run(command: &mut Command) -> Result<Output, String> {
     command.output().map_err(|error| format!("cannot run {}: {error}", command.get_program().to_string_lossy()))
 }
 
-pub fn slug(s: &str, sep: &str) -> String {
+pub(crate) fn slug(s: &str, sep: &str) -> String {
     let s = deunicode::deunicode(s).to_lowercase();
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(sep)
 }
 
 /// Similarity in percent: twice the longest common subsequence over the total length.
-pub fn ratio(a: &str, b: &str) -> f64 {
+pub(crate) fn ratio(a: &str, b: &str) -> f64 {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let row = a.iter().fold(vec![0usize; b.len() + 1], |row, x| {
         b.iter().enumerate().fold(vec![0], |mut next, (j, y)| {
@@ -137,7 +141,7 @@ fn words(song: &Song, album: bool) -> HashSet<String> {
 }
 
 /// A word that names another recording: "remix", "live", "sped", "432hz".
-pub fn altered(word: &str) -> bool {
+pub(crate) fn altered(word: &str) -> bool {
     let hertz = word.strip_suffix("hz").is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
     hertz || REJECTED.split(' ').any(|version| version == word)
 }
@@ -154,17 +158,17 @@ fn is_note(text: &str) -> bool {
 }
 
 /// The title without a " - Remastered 2011" or " - From "Black Panther"" suffix.
-pub fn versionless(name: &str) -> &str {
+pub(crate) fn versionless(name: &str) -> &str {
     let suffix = |(_, suffix): &(&str, &str)| is_version_suffix(suffix) || is_note(suffix);
     name.rsplit_once(" - ").filter(suffix).map_or(name, |(title, _)| title)
 }
 
-/// The slugged title without version notes, featured artists or a " - Remix" suffix, to compare the editions of
-/// an album: "Getting Better - Remix", "Getting Better - 2017 Mix" and "Getting Better - Remastered 2009" are all
+/// The slugged title without version notes, featured artists or a " - Remix" suffix, to compare the editions of an
+/// album: "Getting Better - Remix", "Getting Better - 2017 Mix" and "Getting Better - Remastered 2009" are all
 /// "getting-better", and "Norwegian Wood (This Bird Has Flown) [2026 Mix]" is "norwegian-wood-this-bird-has-flown".
 /// Remix editions date their remix: "Dogs - 2018 Remix" and "Sorrow - Remix 2019" are "dogs" and "sorrow". They also
 /// write "Pt." as "Part": "A New Machine Part 1 - Remix 2019" is "A New Machine, Pt. 1".
-pub fn edition_title(name: &str) -> String {
+pub(crate) fn edition_title(name: &str) -> String {
     let name = clean_name(versionless(name), &[]);
     let mut words: Vec<&str> = name.split('-').map(|word| if word == "part" { "pt" } else { word }).collect();
     let year = |word: &str| word.len() == 4 && word.bytes().all(|b| b.is_ascii_digit());
@@ -178,10 +182,12 @@ pub fn edition_title(name: &str) -> String {
 }
 
 /// The slugged title without featured artists, soundtrack notes and version groups.
-pub fn clean_name(name: &str, artists: &[String]) -> String {
+pub(crate) fn clean_name(name: &str, artists: &[String]) -> String {
     let (mut clean, mut rest) = (String::new(), name);
     while let Some(open) = rest.find(['(', '[']) {
-        let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else { break };
+        let Some(close) = rest[open..].find([')', ']']).map(|close| open + close) else {
+            break;
+        };
         clean.push_str(&rest[..open]);
         let group = &rest[open + 1..close];
         if !is_note(group) && !is_version_suffix(group) {
@@ -238,9 +244,9 @@ fn score(s: &Song, h: &Hit) -> f64 {
         (&bare, &stripped),
         (&tail, &stripped),
     ];
-    // "Side 2, Pt. 2: Skins" and "Side 4, Pt. 3: Surfacing" share most of their letters, so the ratio passed
-    // another part: a marker that both titles number must have the same first number ("Take 2 With Solo From
-    // Take 1" is take 2).
+    // "Side 2, Pt. 2: Skins" and "Side 4, Pt. 3: Surfacing" share most of their letters, so the ratio passed another
+    // part: a marker that both titles number must have the same first number ("Take 2 With Solo From Take 1" is take
+    // 2).
     let (song_markers, hit_markers) = (markers(&s.name), markers(&hit.name));
     let first = |markers: &[(&str, usize)], kind| markers.iter().find(|m| m.0 == kind).map(|m| m.1);
     let misnumbered =
@@ -291,8 +297,8 @@ fn score(s: &Song, h: &Hit) -> f64 {
     // A long shared note (" - Live At The BBC For "Pop Go The Beatles" / 23rd July, 1963") lifted the name ratio of
     // another song ("And Here We Are Again" for "Lower 5E"): the title before such a note must be in the result's.
     // Featured artists are left out on both sides: YouTube Music writes "Hustler's Story [Instrumental] (feat. Akon,
-    // Big Gee & Scarface)" for "Hustler's Story (feat. Scarface, Akon & Big Gee) - Instrumental". An ISRC hit has
-    // the song's title and length already.
+    // Big Gee & Scarface)" for "Hustler's Story (feat. Scarface, Akon & Big Gee) - Instrumental". An ISRC hit has the
+    // song's title and length already.
     let title = clean_name(s.name.split(" - ").next().unwrap_or_default(), &s.artists);
     let parts = hit.name.split(" - ").flat_map(|part| part.split(['(', ')', '[', ']']));
     let titled = isrc
@@ -342,11 +348,13 @@ fn ytm_hits(reply: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
         let artists = Some(linked("ARTIST"))
             .filter(|a| !a.is_empty())
             .or_else(|| Some(vec![meta.first()?["text"].as_str()?.into()]))?;
-        let config = "/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType";
-        let paths = [
-            format!("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint{config}"),
-            format!("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint{config}"),
-        ];
+        let config = "/watchEndpoint/watchEndpointMusicSupportedConfigs\
+            /watchEndpointMusicConfig/musicVideoType";
+        let overlay = "/overlay/musicItemThumbnailOverlayRenderer/content\
+            /musicPlayButtonRenderer/playNavigationEndpoint";
+        let first_column = "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0\
+            /navigationEndpoint";
+        let paths = [format!("{overlay}{config}"), format!("{first_column}{config}")];
         let kind = match paths.iter().find_map(|path| r.pointer(path)?.as_str()) {
             Some("MUSIC_VIDEO_TYPE_ATV") => Kind::Atv,
             Some("MUSIC_VIDEO_TYPE_OMV") => Kind::Omv,
@@ -366,12 +374,14 @@ fn ytm_hits(reply: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
 /// YouTube Music's song results (`songs`) or video results for a query.
 fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
     let params = if songs { "EgWKAQIIAWoMEAMQBBAJEA4QChAF" } else { "EgWKAQIQAWoMEA4QChADEAQQCRAF" };
-    let client = json!({"clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US"});
+    let client = json!({
+        "clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US",
+    });
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
     let reply = cached(&format!("ytm{body}"), 7, || {
         let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
         let reply: Value = youtube(|| {
-            http_json(url, &[("Content-Type", "application/json")], Some(&body)).map_err(|error| error.to_string())
+            http::post_json(url, &[("Content-Type", "application/json")], &body).map_err(|error| error.to_string())
         })?;
         reply.get("contents").is_some().then_some(reply).ok_or_else(|| "unexpected YouTube Music response".into())
     })?;
@@ -403,8 +413,8 @@ fn ytdlp(target: &str) -> R<Vec<Hit>> {
     Ok(entries.iter().filter_map(parse).collect())
 }
 
-/// The ISRC search's hits that are the song, ranked above every text hit. YouTube Music fills an ISRC search it has
-/// no match for with unrelated songs ("Purple Reign" for "Swimming Pools (Drank)"), so they are scored even when
+/// The ISRC search's hits that are the song, ranked above every text hit. YouTube Music fills an ISRC search it has no
+/// match for with unrelated songs ("Purple Reign" for "Swimming Pools (Drank)"), so they are scored even when
 /// `--dont-filter-results` turns scoring off for text hits; they must also be the same length and edit.
 fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)> + '_ {
     let same = |h: &Hit| (h.song.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
@@ -412,11 +422,11 @@ fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)
 }
 
 /// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
-pub fn find(song: &Song) -> R<Vec<String>> {
-    let query = download::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
-    let filter = crate::cfg()["filter_results"] != false;
+pub(crate) fn find(song: &Song) -> R<Vec<String>> {
+    let query = files::fill(settings().search_query.as_deref().unwrap_or("{artists} - {title}"), song);
+    let filter = settings().filter_results;
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
-    let verified = on("only_verified_results");
+    let verified = settings().only_verified_results;
     let (mut found, mut error) = (Vec::<(f64, String)>::new(), None::<String>);
     let mut note = |result: R<Vec<Hit>>| {
         result.unwrap_or_else(|e| {
@@ -424,7 +434,7 @@ pub fn find(song: &Song) -> R<Vec<String>> {
             Vec::new()
         })
     };
-    for provider in list("audio_providers") {
+    for provider in settings().audio_providers.iter().map(String::as_str) {
         let mut hits = match provider {
             "youtube-music" => note(ytm(&query, true, false)),
             "youtube" => note(ytdlp(&format!("ytsearch10:{query}"))),
@@ -451,8 +461,8 @@ pub fn find(song: &Song) -> R<Vec<String>> {
 }
 
 /// The Spotify song with a video's URL, and with its title, artists and length when `ytm_data` is on.
-pub fn with_video(song: Song, video: Song) -> Song {
-    let song = match on("ytm_data") {
+pub(crate) fn with_video(song: Song, video: Song) -> Song {
+    let song = match settings().ytm_data {
         true => Song {
             name: video.name,
             artist: video.artist,
@@ -467,7 +477,7 @@ pub fn with_video(song: Song, video: Song) -> Song {
 }
 
 /// Songs for a YouTube or SoundCloud URL; YouTube Music songs get Spotify metadata when `lookup` is set.
-pub fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
+pub(crate) fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
     let single = url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?"));
     let lookup = lookup && url.contains("music.youtube.com");
     let song = |hit: Hit| match lookup {
@@ -545,8 +555,8 @@ mod tests {
 
     #[test]
     fn official_tracks_with_other_credits() {
-        // YouTube Music credits 2Pac's live album to "Tupac": its ISRC hit and its track on the song's album count,
-        // but unrelated ISRC hits and a Tupac track on another album do not.
+        // YouTube Music credits 2Pac's live album to "Tupac": its ISRC hit and its track on the song's album count, but
+        // unrelated ISRC hits and a Tupac track on another album do not.
         let ridah = track("Ambitionz Az A Ridah - Live", &["2Pac", "Outlawz"], "Live at the House Of Blues", 133.5);
         let tupac = |album, isrc| result("Ambitionz Az A Ridah (Live) (feat. Outlawz)", &["Tupac"], album, 134.0, isrc);
         assert!(score(&ridah, &tupac("Tupac: Live At The House Of Blues", true)) > 0.0);
@@ -575,8 +585,8 @@ mod tests {
         let lower = track(&note("Lower 5E", "10th September"), &["Rodney Burke", "Paul McCartney"], "On Air", 23.3);
         assert!(score(&lower, &hit("Lower 5E", "10th September", &["Paul McCartney"], 24.0)) > 0.0);
         assert_eq!(score(&lower, &hit("And Here We Are Again", "23rd July", &["Rodney Burke"], 16.0)), 0.0);
-        // A title with featured artists before its version note keeps its official track, from the ISRC search or
-        // from the text search, where YouTube Music writes the version in brackets and orders the features otherwise.
+        // A title with featured artists before its version note keeps its official track, from the ISRC search or from
+        // the text search, where YouTube Music writes the version in brackets and orders the features otherwise.
         let story = track(
             "Hustler's Story (feat. Scarface, Akon & Big Gee) - Instrumental",
             &["The Notorious B.I.G.", "Scarface", "Akon", "Big Gee"],

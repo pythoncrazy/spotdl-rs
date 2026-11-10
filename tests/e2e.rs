@@ -1,5 +1,5 @@
-//! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer services.
-//! The download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to; enable it with
+//! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer services. The
+//! download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to; enable it with
 //! `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the yt-dlp binary).
 use lofty::{
     config::WriteOptions,
@@ -170,8 +170,8 @@ fn sync_moves_and_removes_files() {
     assert!(!file(TAXMAN).exists() && !file(TAXMAN).with_extension("opus.skip").exists());
 }
 
-/// A song whose Spotify URL changed (a re-released album gives its songs new IDs) but whose file did not keeps
-/// its file: it is not deleted before a download that can fail. Needs no network: the songs come from files.
+/// A song whose Spotify URL changed (a re-released album gives its songs new IDs) but whose file did not keeps its
+/// file: it is not deleted before a download that can fail. Needs no network: the songs come from files.
 #[test]
 fn sync_keeps_the_files_of_songs_whose_url_changed() {
     let dir = dir("relink");
@@ -195,8 +195,8 @@ fn sync_keeps_the_files_of_songs_whose_url_changed() {
     assert!(dir.join("Art - A.opus").exists() && dir.join("Art - B.opus").exists());
 }
 
-/// A renamed album's songs move with their `.lrc` files into its new folder, which does not exist yet, and get
-/// its name in their tags; the old folder, left with only its cover, goes. Needs no download.
+/// A renamed album's songs move with their `.lrc` files into its new folder, which does not exist yet, and get its name
+/// in their tags; the old folder, left with only its cover, goes. Needs no download.
 #[test]
 fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
     let dir = dir("move");
@@ -229,9 +229,9 @@ fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
     assert_eq!(tagged.primary_tag().unwrap().album().as_deref(), Some("Alb (Remastered)"));
 }
 
-/// A song whose tags cannot be written leaves no file at its path, which a later run would skip and archive as
-/// done, and an interrupted download's temporary files go when the song is downloaded again. Needs no download:
-/// a fake yt-dlp gives first audio that cannot be tagged, then a silent song.
+/// A song whose tags cannot be written leaves no file at its path, which a later run would skip and archive as done,
+/// and an interrupted download's temporary files go when the song is downloaded again. Needs no download: a fake yt-dlp
+/// gives first audio that cannot be tagged, then a silent song.
 #[test]
 fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
     let dir = dir("untagged");
