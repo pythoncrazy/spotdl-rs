@@ -1,6 +1,7 @@
 //! HTTP: requests that retry and pace themselves, and [`Service`], a website that is asked politely.
 
-use crate::{log, number, text, R};
+use crate::settings::settings;
+use crate::{log, R};
 use serde::de::DeserializeOwned;
 use std::{
     error::Error,
@@ -77,14 +78,20 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .http_status_as_error(false)
         .max_idle_connections_per_host(64)
         // `--proxy`, or else the usual HTTPS_PROXY / ALL_PROXY variables, as Python spotDL's requests reads them.
-        .proxy(text("proxy").and_then(|proxy| ureq::Proxy::new(proxy).ok()).or_else(ureq::Proxy::try_from_env))
+        .proxy(
+            settings()
+                .proxy
+                .as_deref()
+                .and_then(|proxy| ureq::Proxy::new(proxy).ok())
+                .or_else(ureq::Proxy::try_from_env),
+        )
         .build();
     ureq::Agent::new_with_config(config)
 });
 
 /// GET, retrying connection errors, 429 and 5xx with exponential backoff (`--max-retries` times).
 pub fn get(url: &str, headers: &[(&str, &str)]) -> R<Vec<u8>> {
-    request(url, headers, None, number("max_retries"), None)
+    request(url, headers, None, settings().max_retries, None)
 }
 
 /// Where `url` leads after its redirects.
@@ -99,7 +106,7 @@ pub fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)]) -> R<T
 
 /// POSTs `body`, as [`get`] does, and parses the reply as JSON.
 pub fn post_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body: &str) -> R<T> {
-    let reply = request(url, headers, Some(body), number("max_retries"), None)?;
+    let reply = request(url, headers, Some(body), settings().max_retries, None)?;
     Ok(serde_json::from_slice(&reply)?)
 }
 
@@ -259,7 +266,7 @@ mod tests {
     };
 
     fn settings() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
     }
 
     /// A local server that answers the n-th request with `replies[n]` (the last one after that), and how many

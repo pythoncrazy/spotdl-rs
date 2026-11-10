@@ -3,7 +3,8 @@
 use crate::files::art;
 use crate::lyrics::genius_answered;
 use crate::replaygain::track_gain;
-use crate::{on, text, Song, R};
+use crate::settings::settings;
+use crate::{Song, R};
 use lofty::{
     config::WriteOptions,
     picture::{MimeType, Picture, PictureType},
@@ -114,7 +115,7 @@ pub(crate) fn write_tags(file: &Path, s: &Song) -> R<()> {
     let gain = if peak.is_empty() && measured { String::new() } else { gain };
     let has_lyrics = s.lyrics.as_deref().is_some_and(|lyrics| !lyrics.is_empty());
     tag.set_title(s.name.clone());
-    tag.set_artist(s.artists.join(text("id3_separator").unwrap_or("/")));
+    tag.set_artist(s.artists.join(settings().id3_separator.as_str()));
     tag.set_album(s.album_name.clone());
     tag.set_track(s.track_number);
     tag.set_track_total(s.tracks_count);
@@ -175,7 +176,7 @@ pub(crate) fn write_tags(file: &Path, s: &Song) -> R<()> {
             }
         }
     }
-    let cover = s.cover_url.as_deref().filter(|_| !on("skip_album_art")).and_then(art);
+    let cover = s.cover_url.as_deref().filter(|_| !settings().skip_album_art).and_then(art);
     if let Some(cover) = cover {
         tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, cover));
@@ -200,7 +201,7 @@ mod tests {
     /// The release type was written as a plain `RELEASETYPE` key, which lofty silently drops from M4A files.
     #[test]
     fn release_type_is_written_to_every_format() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let dir = std::env::temp_dir().join(format!("spotdl-release-type-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let song = Song { name: "Song".into(), album_type: "single".into(), ..Song::default() };

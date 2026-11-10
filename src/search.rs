@@ -1,4 +1,5 @@
-use crate::{cached, files, http, list, log, now, number, on, spotify, text, Song, R};
+use crate::settings::settings;
+use crate::{cached, files, http, log, now, spotify, Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -72,7 +73,7 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
         let blocked =
             has(&["not a bot", "HTTP Error 403", "HTTP 403", "HTTP Error 429", "HTTP 429", "Too Many Requests"]);
         let transient = has(&["Requested format is not available", "Failed to extract any player response"]);
-        if attempt >= number("max_retries") || !(blocked || transient) {
+        if attempt >= settings().max_retries || !(blocked || transient) {
             return Err(error.into());
         }
         if blocked && attempt > 0 {
@@ -85,13 +86,14 @@ pub fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
 }
 
 pub fn yt_dlp() -> Command {
-    let mut command = Command::new(text("yt_dlp").unwrap_or("yt-dlp"));
+    let settings = settings();
+    let mut command = Command::new(&settings.yt_dlp);
     // Deno is on by default; these are used when it is missing.
     command.args(["--js-runtimes", "node", "--js-runtimes", "bun"]);
-    for (key, flag) in [("cookie_file", "--cookies"), ("proxy", "--proxy")] {
-        command.args(text(key).map(|value| [flag, value]).into_iter().flatten());
+    for (value, flag) in [(&settings.cookie_file, "--cookies"), (&settings.proxy, "--proxy")] {
+        command.args(value.iter().flat_map(|value| [flag, value.as_str()]));
     }
-    command.args(text("yt_dlp_args").unwrap_or_default().split_whitespace());
+    command.args(settings.yt_dlp_args.as_deref().unwrap_or_default().split_whitespace());
     command
 }
 
@@ -413,10 +415,10 @@ fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)
 
 /// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
 pub fn find(song: &Song) -> R<Vec<String>> {
-    let query = files::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
-    let filter = crate::cfg()["filter_results"] != false;
+    let query = files::fill(settings().search_query.as_deref().unwrap_or("{artists} - {title}"), song);
+    let filter = settings().filter_results;
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
-    let verified = on("only_verified_results");
+    let verified = settings().only_verified_results;
     let (mut found, mut error) = (Vec::<(f64, String)>::new(), None::<String>);
     let mut note = |result: R<Vec<Hit>>| {
         result.unwrap_or_else(|e| {
@@ -424,7 +426,7 @@ pub fn find(song: &Song) -> R<Vec<String>> {
             Vec::new()
         })
     };
-    for provider in list("audio_providers") {
+    for provider in settings().audio_providers.iter().map(String::as_str) {
         let mut hits = match provider {
             "youtube-music" => note(ytm(&query, true, false)),
             "youtube" => note(ytdlp(&format!("ytsearch10:{query}"))),
@@ -452,7 +454,7 @@ pub fn find(song: &Song) -> R<Vec<String>> {
 
 /// The Spotify song with a video's URL, and with its title, artists and length when `ytm_data` is on.
 pub fn with_video(song: Song, video: Song) -> Song {
-    let song = match on("ytm_data") {
+    let song = match settings().ytm_data {
         true => Song {
             name: video.name,
             artist: video.artist,

@@ -3,8 +3,9 @@
 use crate::files::{audio_files, output_root, path, skip_path, write_folder_art};
 use crate::lyrics::{find_lyrics, write_lrc};
 use crate::meta::REDOWNLOADS;
+use crate::settings::settings;
 use crate::tags::{audio, source_url, write_tags};
-use crate::{list, log, on, search, spotify, text, Song, R};
+use crate::{log, search, spotify, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use sha1::{Digest, Sha1};
 use std::{
@@ -26,7 +27,7 @@ static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
 
 fn archive(url: &str) -> R<()> {
-    if let Some(path) = text("archive") {
+    if let Some(path) = settings().archive.as_deref() {
         let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
         std::io::Write::write_all(&mut file, format!("{url}\n").as_bytes())?;
     }
@@ -36,7 +37,7 @@ fn archive(url: &str) -> R<()> {
 /// Downloads one video's audio next to `out`, converting with FFmpeg unless it is already in the right format;
 /// returns the temporary file, which becomes `out` only once it is tagged.
 fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
-    let (format, bitrate) = (text("format").unwrap_or("opus"), text("bitrate").unwrap_or("auto"));
+    let (format, bitrate) = (settings().format.as_str(), settings().bitrate.as_str());
     let selector = match format {
         "m4a" => "bestaudio[ext=m4a]/bestaudio",
         "opus" => "bestaudio[ext=webm]/bestaudio",
@@ -50,7 +51,7 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
         command.args(["-f", selector, "--no-playlist", "--no-warnings", "--force-overwrites", "-q"]);
         // The source's bitrate (`NA` when unknown) is what `--bitrate auto` encodes at.
         command.args(["--print", "after_move:%(abr)s %(filepath)s", "-o"]).arg(&template);
-        if on("sponsor_block") {
+        if settings().sponsor_block {
             command.args(["--sponsorblock-remove", "all"]);
         }
         let output = search::run(command.arg(url))?;
@@ -76,13 +77,15 @@ fn fetch(url: &str, out: &Path, id: &str) -> R<PathBuf> {
             "m4a" => "aac",
             _ => "pcm_s16le",
         };
-        let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
+        let mut ffmpeg = Command::new(settings().ffmpeg.as_str());
         ffmpeg.args(["-nostdin", "-y", "-loglevel", "error", "-i"]).arg(&got);
         ffmpeg.args(["-vn", "-map_metadata", "-1", "-c:a", codec]);
         if codec != "copy" {
             ffmpeg.args(rate_args(bitrate, format, abr));
         }
-        let output = search::run(ffmpeg.args(text("ffmpeg_args").unwrap_or_default().split_whitespace()).arg(&temp))?;
+        let output = search::run(
+            ffmpeg.args(settings().ffmpeg_args.as_deref().unwrap_or_default().split_whitespace()).arg(&temp),
+        )?;
         match output.status.success() {
             true => Ok(()),
             false => Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()).into()),
@@ -165,7 +168,7 @@ fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
 /// duplicate.
 pub(crate) fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
     match REDOWNLOADS.get().filter(|_| op == "redownload").and_then(|files| files.get(&s.url)) {
-        Some(file) => (file.with_extension(text("format").unwrap_or("opus")), Some(file)),
+        Some(file) => (file.with_extension(settings().format.as_str()), Some(file)),
         None => (path(s), None),
     }
 }
@@ -173,7 +176,7 @@ pub(crate) fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>
 /// Saves, prints or downloads one song; `redownload` is a download that replaces the file.
 fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if op == "save" {
-        if on("preload") && s.download_url.is_none() {
+        if settings().preload && s.download_url.is_none() {
             // Spotify gives no ISRC; Deezer's is what lets the search find the release's own recording, as a
             // download does. The save file keeps it, so a later download searches by it too.
             enrich(s);
@@ -193,7 +196,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         }
         return Ok(path(s));
     }
-    let early = text("output").is_some_and(|output| ENRICHED.iter().any(|field| output.contains(field)));
+    let early = ENRICHED.iter().any(|field| settings().output.contains(field));
     if early {
         enrich(s);
     }
@@ -205,23 +208,28 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         let tagged = files.into_iter().filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
         tagged.collect()
     };
-    let scanned = on("scan_for_songs").then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
-    let detected = list("detect_formats").map(|format| out.with_extension(format)).find(|path| path.is_file());
+    let scanned = settings().scan_for_songs.then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
+    let detected = settings()
+        .detect_formats
+        .iter()
+        .map(String::as_str)
+        .map(|format| out.with_extension(format))
+        .find(|path| path.is_file());
     let mut target = local
         .cloned()
         .or(scanned)
         .or_else(|| out.is_file().then(|| out.clone()))
         .or(detected)
         .unwrap_or_else(|| out.clone());
-    let archived = text("archive").is_some_and(|file| {
+    let archived = settings().archive.as_deref().is_some_and(|file| {
         let read = || fs::read_to_string(file).unwrap_or_default().lines().map(String::from).collect();
         ARCHIVED.get_or_init(read).contains(&s.url)
     });
-    let skip = on("respect_skip_file") && skip_path(&target).exists();
-    let (exists, overwrite) = (target.is_file(), text("overwrite").unwrap_or("skip"));
+    let skip = settings().respect_skip_file && skip_path(&target).exists();
+    let (exists, overwrite) = (target.is_file(), settings().overwrite.as_str());
     // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
     let moved = exists && MOVED.get().is_some_and(|moved| moved.contains(&target));
-    let keep = archived || skip || exists && overwrite == "skip" && !on("force_update_metadata");
+    let keep = archived || skip || exists && overwrite == "skip" && !settings().force_update_metadata;
     if op != "redownload" && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
@@ -264,7 +272,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     write_folder_art(&target, s)?;
     write_lrc(&target, s)?;
-    if on("create_skip_file") {
+    if settings().create_skip_file {
         fs::write(skip_path(&target), "")?;
     }
     archive(&s.url)?;
@@ -285,11 +293,11 @@ pub fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
     let result = finish(&mut song, op);
     match &result {
         Ok(_) if op == "url" => println!("{}", song.download_url.as_deref().unwrap_or_default()),
-        Ok(path) if on("simple_tui") => println!("{label}: {}", path.display()),
+        Ok(path) if settings().simple_tui => println!("{label}: {}", path.display()),
         Ok(path) => log("INFO", &format!("{label}: {}", path.display())),
         Err(error) => {
             log("ERROR", &format!("{label}: {error}"));
-            if on("add_unavailable") && error.to_string().starts_with("no match for ") {
+            if settings().add_unavailable && error.to_string().starts_with("no match for ") {
                 let _ = archive(&song.url);
             }
         }
@@ -313,7 +321,7 @@ pub fn prune(old: &[Song], new: &[Song]) {
         let to = next.get(song.url.as_str()).map(|song| path(song));
         let targets = to.as_ref().filter(|to| !to.exists()).map(|to| files(to));
         // A moved song's `.lrc` goes with it; `--sync-remove-lrc` decides only whether a removed song's goes.
-        let lrc = to.is_some() || on("sync_remove_lrc");
+        let lrc = to.is_some() || settings().sync_remove_lrc;
         let had = from.is_file();
         for (i, source) in files(&from).iter().enumerate().take(if lrc { 3 } else { 2 }) {
             // Only a missing source is no error: a renamed album's new folder does not exist yet.
@@ -381,7 +389,7 @@ mod tests {
     /// slug: with a 200-byte stem the names went over 255 bytes and FFmpeg failed with "File name too long".
     #[test]
     fn temp_names_fit_the_file_name_limit() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let song = |id: &str, url: &str| Song {
             song_id: id.into(),
             url: url.into(),

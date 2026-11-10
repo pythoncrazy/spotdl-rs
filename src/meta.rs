@@ -7,8 +7,9 @@ use crate::lyrics::{
     timed_for, unlisted, write_lrc, Check, Lyrics,
 };
 use crate::replaygain::{album_gains, write_track_gain};
+use crate::settings::settings;
 use crate::tags::{advisory_key, audio, no_lyrics_key, source_url, write_lyrics, write_tags};
-use crate::{list, log, number, on, search, spotify, text, Song, R};
+use crate::{log, search, spotify, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use rayon::prelude::*;
 use std::{
@@ -33,8 +34,8 @@ struct Mode {
 
 impl Mode {
     fn current() -> Self {
-        let replace = matches!(text("overwrite"), Some("force" | "metadata"));
-        Self { force: on("force_update_metadata"), redownload: on("redownload"), replace }
+        let replace = matches!(settings().overwrite.as_str(), "force" | "metadata");
+        Self { force: settings().force_update_metadata, redownload: settings().redownload, replace }
     }
 }
 
@@ -74,10 +75,13 @@ fn read_tags(file: &Path) -> R<Tagged> {
     let tagged = has(ItemKey::TrackTitle)
         && has(ItemKey::TrackArtist)
         && has(ItemKey::TrackArtists)
-        && (on("skip_album_art") || !tag.pictures().is_empty())
+        && (settings().skip_album_art || !tag.pictures().is_empty())
         && (spotify_url.is_none() || has(advisory_key(tag.tag_type())));
     let no_lyrics = has(no_lyrics_key(tag.tag_type()));
-    let complete = tagged && (list("lyrics_providers").next().is_none() || has(ItemKey::Lyrics) || no_lyrics);
+    let complete = tagged
+        && (settings().lyrics_providers.iter().map(String::as_str).next().is_none()
+            || has(ItemKey::Lyrics)
+            || no_lyrics);
     let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
     let wanted = Song { album_artist, artist_id: "-".into(), cover_url: Some(String::new()), ..Song::default() };
     let stored = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
@@ -112,8 +116,8 @@ fn read_tags(file: &Path) -> R<Tagged> {
         tagged,
         no_lyrics,
         complete,
-        measure: on("replaygain") && !has(ItemKey::ReplayGainTrackPeak),
-        folder_art_missing: on("folder_art") && !folder_images(file, &wanted).is_empty(),
+        measure: settings().replaygain && !has(ItemKey::ReplayGainTrackPeak),
+        folder_art_missing: settings().folder_art && !folder_images(file, &wanted).is_empty(),
     })
 }
 
@@ -127,7 +131,7 @@ fn tidy(file: &Path, state: &Tagged) -> R<bool> {
     if state.stored.is_some() && state.lyrics != state.stored {
         write_lyrics(file, state.lyrics.clone())?;
     }
-    if !on("generate_lrc") || file.with_extension("lrc").exists() || (state.lyrics.is_none() && state.no_lyrics) {
+    if !settings().generate_lrc || file.with_extension("lrc").exists() || (state.lyrics.is_none() && state.no_lyrics) {
         return Ok(true);
     }
     if state.lyrics.as_deref().is_some_and(is_synced) {
@@ -177,7 +181,8 @@ fn look_up_lyrics(file: &Path, song: &mut Song, state: &Tagged, mode: Mode) -> b
         let look = !state.no_lyrics || mode.replace;
         state.lyrics.clone().or_else(|| look.then(|| find_lyrics(song)).flatten())
     };
-    let genius = list("lyrics_providers").any(|name| name == "genius" || name == "synced");
+    let genius =
+        settings().lyrics_providers.iter().map(String::as_str).any(|name| name == "genius" || name == "synced");
     if mode.replace && !mode.force && genius {
         match recheck(song) {
             Check::Keep => {}
@@ -287,7 +292,7 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
         }
     }
     // `threads` files at a time, as downloads: most of the time goes to waiting for lyrics sites.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(number("threads").max(1) as usize).build()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(settings().threads.max(1) as usize).build()?;
     let results: Vec<R<Option<Song>>> = pool.install(|| {
         files
             .par_iter()
@@ -310,7 +315,7 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
     let _ = REDOWNLOADS.set(local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect());
     let mut songs: Vec<Song> = local.into_iter().map(|(_, song)| song).collect();
     let mut lost = 0;
-    if on("fetch_albums") {
+    if settings().fetch_albums {
         let mut albums: Vec<String> = songs
             .iter()
             .filter(|song| !song.album_id.is_empty())
@@ -352,7 +357,7 @@ mod tests {
     /// the same file, and saved songs at the output template's path, leaving the local `.mp3` beside the new `.opus`.
     #[test]
     fn redownloads_replace_local_files_and_download_each_song_once() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let file = PathBuf::from("/music/Artist/Album (2020)/Artist - Album (2020) - 01 - One.mp3");
         let _ = REDOWNLOADS.set([("https://open.spotify.com/track/1".into(), file.clone())].into());
         let song = |id: &str, name: &str| Song {

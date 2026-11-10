@@ -1,7 +1,8 @@
+use crate::settings::settings;
 use crate::{
     cached,
     http::{self, HttpError, Pace},
-    number, on, search, url_encode, Song, HOME, R,
+    search, url_encode, Song, HOME, R,
 };
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
@@ -77,7 +78,7 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
     let mut slot = SESSION.lock().map_err(|error| error.to_string())?;
     let path = HOME.join("anon.json");
     let disk = || {
-        let state = serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !on("no_cache"));
+        let state = serde_json::from_slice(&fs::read(&path).ok()?).ok().filter(|_| !settings().no_cache);
         state.filter(complete).map(Arc::new)
     };
     let fresh = |state: &Arc<Value>| {
@@ -98,7 +99,7 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
     let (token, expires) = token.ok_or("Spotify token missing")?;
     let state = Arc::new(json!({"token": token, "exp": expires, "hashes": hashes()?}));
     // A partial set is kept for this run only, so the next run looks for the missing hashes again.
-    if !on("no_cache") && complete(&state) {
+    if !settings().no_cache && complete(&state) {
         fs::create_dir_all(&*HOME)?;
         fs::write(path, state.to_string())?;
     }
@@ -108,13 +109,13 @@ fn session(rejected: Option<&str>) -> R<Arc<Value>> {
 
 fn query(op: &str, variables: Value) -> R<Value> {
     let days = match op {
-        "getTrack" if on("use_cache_file") => u64::MAX,
+        "getTrack" if settings().use_cache_file => u64::MAX,
         "getTrack" | "getAlbum" | "queryArtistOverview" => 7,
         _ => 0,
     };
     cached(&format!("{op}{variables}"), days, || {
         let (mut rejected, mut last) = (None::<String>, String::new());
-        for _ in 0..=number("max_retries") {
+        for _ in 0..=settings().max_retries {
             let state = session(rejected.as_deref())?;
             let token = state["token"].as_str().unwrap_or_default();
             // A hash the bundles did not yield is asked of a new session, as for a rejected token.
@@ -126,7 +127,7 @@ fn query(op: &str, variables: Value) -> R<Value> {
             let (variables, extensions) = (url_encode(&variables.to_string()), url_encode(&extensions));
             let url = format!("https://api-partner.spotify.com/pathfinder/v1/query?operationName={op}&variables={variables}&extensions={extensions}");
             let headers = [UA, ("Authorization", &format!("Bearer {token}"))];
-            let reply = http::request(&url, &headers, None, number("max_retries"), Some(&SPOTIFY));
+            let reply = http::request(&url, &headers, None, settings().max_retries, Some(&SPOTIFY));
             match reply.and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?)) {
                 // A GraphQL failure comes as `"data": null` (or with every field null), with "errors": it is no
                 // answer, and must not be cached as one ("Stay - 2016 Remix" then resolved to no song for a week).
@@ -798,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_session_without_a_querys_hash_is_built_again() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         // As if the search route chunk had failed to load: a live token, but no searchDesktop hash.
         let partial = json!({"token": "partial", "exp": u64::MAX, "hashes": {"getTrack": "0".repeat(64)}});
         assert!(!complete(&partial));

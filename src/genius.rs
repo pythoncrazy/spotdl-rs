@@ -2,9 +2,10 @@
 
 use crate::html::html;
 use crate::lyrics::{instrumental_title, lyrics_title, page, plain_title, words};
+use crate::settings::settings;
 use crate::{
     http::{self, HttpError, Service},
-    search, text, url_encode, Song,
+    search, url_encode, Song,
 };
 use serde_json::Value;
 use std::{
@@ -223,7 +224,8 @@ fn marks(title: &str) -> String {
 /// asked again in this run.
 fn search_hits(artist: &str, title: &str) -> Asked<Vec<Value>> {
     let query = url_encode(&format!("{artist} {title}"));
-    let token = text("genius_token").filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
+    let token =
+        Some(settings().genius_token.as_str()).filter(|token| !token.is_empty() && !GENIUS_API_SPENT.load(Relaxed));
     if let Some(hits) = token.and_then(|token| api_hits(&query, token)) {
         return Ok(hits);
     }

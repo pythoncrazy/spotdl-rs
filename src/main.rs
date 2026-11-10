@@ -8,9 +8,11 @@ mod lyrics;
 mod meta;
 mod replaygain;
 mod search;
+mod settings;
 mod spotify;
 mod tags;
 
+use crate::settings::settings;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,7 +21,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{LazyLock, OnceLock},
+    sync::LazyLock,
     time::UNIX_EPOCH,
 };
 
@@ -29,18 +31,6 @@ pub static HOME: LazyLock<PathBuf> = LazyLock::new(|| {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     PathBuf::from(home.unwrap_or_default()).join(".spotdl")
 });
-
-const DEFAULTS: &str = r#"{"output":"{artists} - {title}.{output-ext}","format":"opus","bitrate":"disable","overwrite":"skip","threads":16,"meta_threads":128,"ffmpeg":"ffmpeg","yt_dlp":"yt-dlp","audio_providers":["youtube-music"],"lyrics_providers":["genius","synced","azlyrics","musixmatch"],"search_query":null,"cookie_file":null,"proxy":null,"yt_dlp_args":null,"ffmpeg_args":null,"restrict":null,"playlist_numbering":false,"playlist_retain_track_cover":false,"m3u":null,"archive":null,"save_file":null,"filter_results":true,"album_type":null,"print_errors":false,"save_errors":null,"sponsor_block":false,"preload":false,"id3_separator":"/","generate_lrc":false,"force_update_metadata":false,"only_verified_results":false,"sync_without_deleting":false,"sync_remove_lrc":false,"max_filename_length":0,"detect_formats":[],"ignore_albums":[],"skip_explicit":false,"redownload":false,"skip_album_art":false,"replaygain":false,"folder_art":false,"create_skip_file":false,"respect_skip_file":false,"no_cache":false,"genius_token":"","log_level":"INFO","log_format":null,"use_cache_file":false,"max_retries":3,"simple_tui":false,"ytm_data":false,"add_unavailable":false,"fetch_albums":false,"scan_for_songs":false,"load_config":true}"#;
-const ALIASES: [(&str, &str); 4] = [
-    ("audio", "audio_providers"),
-    ("lyrics", "lyrics_providers"),
-    ("genius_access_token", "genius_token"),
-    ("dont_filter_results", "filter_results"),
-];
-const PROVIDERS: [(&str, &[&str]); 2] = [
-    ("audio_providers", &["youtube-music", "youtube", "soundcloud"]),
-    ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
-];
 
 /// One track, in the `.spotdl` save-file format shared with Python spotDL.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -94,29 +84,6 @@ pub struct Extra {
     pub release: Option<Box<Song>>,
 }
 
-static CONFIG: OnceLock<Value> = OnceLock::new();
-
-/// Settings: the defaults, then `config.json`, then the command line.
-pub fn cfg() -> &'static Value {
-    CONFIG.get().expect("settings are loaded before use")
-}
-
-pub fn on(key: &str) -> bool {
-    cfg()[key] == true
-}
-
-pub fn text(key: &str) -> Option<&'static str> {
-    cfg()[key].as_str()
-}
-
-pub fn list(key: &str) -> impl Iterator<Item = &'static str> {
-    cfg()[key].as_array().into_iter().flatten().filter_map(Value::as_str)
-}
-
-pub fn number(key: &str) -> u64 {
-    cfg()[key].as_u64().unwrap_or_default()
-}
-
 pub fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
 }
@@ -129,7 +96,7 @@ pub fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value
     // Entries kept for good go to their own folder, which [`prune_cache`] leaves alone: the names are hashes.
     let dir = if days == u64::MAX { HOME.join("cache/keep") } else { HOME.join("cache") };
     let path = dir.join(&format!("{:x}", Sha1::digest(key))[..16]);
-    let days = if on("no_cache") { 0 } else { days };
+    let days = if settings().no_cache { 0 } else { days };
     let age = fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|time| time.elapsed().ok());
     if age.is_some_and(|age| age.as_secs() / 86_400 < days) {
         if let Some(value) = fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
@@ -168,10 +135,10 @@ pub fn log(level: &str, message: &str) {
         "ERROR" | "CRITICAL" => 3,
         _ => 1,
     };
-    if rank(level) < rank(text("log_level").unwrap_or("INFO")) {
+    if rank(level) < rank(settings().log_level.as_str()) {
         return;
     }
-    let line = text("log_format").map_or_else(
+    let line = settings().log_format.as_deref().map_or_else(
         || format!("{level}: {message}"),
         |format| {
             let format = format.replace("%(asctime)s", &now().to_string()).replace("%(name)s", "spotdl");
@@ -181,74 +148,9 @@ pub fn log(level: &str, message: &str) {
     eprintln!("{line}");
 }
 
-/// Loads the settings into `cfg()` and returns the operation and its queries.
-fn settings(args: &[String]) -> R<(String, Vec<String>)> {
-    let mut cfg: Value = serde_json::from_str(DEFAULTS)?;
-    let (mut cli, mut queries, mut config) = (serde_json::Map::new(), Vec::new(), None);
-    let mut i = 0;
-    while i < args.len() {
-        i += 1;
-        let Some(option) = args[i - 1].strip_prefix("--") else {
-            queries.push(args[i - 1].clone());
-            continue;
-        };
-        let (raw, inline) = option.split_once('=').map_or((option, None), |(name, value)| (name, Some(value)));
-        let name = raw.replace('-', "_");
-        let key = ALIASES.iter().find(|alias| alias.0 == name).map_or(name.as_str(), |alias| alias.1);
-        let rest: Vec<&str> = match inline {
-            Some(value) => vec![value],
-            None => args[i..].iter().map(String::as_str).take_while(|arg| !arg.starts_with("--")).collect(),
-        };
-        let (taken, value) = match (cfg.get(key), rest.first().copied()) {
-            _ if key == "config" => {
-                config = Some(PathBuf::from(rest.first().ok_or("--config requires a file path")?));
-                i += usize::from(inline.is_none());
-                continue;
-            }
-            (Some(Value::Array(_)), _) => {
-                let items = rest.iter().flat_map(|value| value.split(',')).map(str::trim).filter(|v| !v.is_empty());
-                (rest.len(), json!(items.collect::<Vec<_>>()))
-            }
-            (Some(Value::Bool(_)), value) => {
-                let on = name != "dont_filter_results" && value != Some("false");
-                (usize::from(matches!(value, Some("true" | "false"))), json!(on))
-            }
-            (Some(Value::Number(_)), Some(value)) => (1, json!(value.parse::<u64>()?)),
-            (Some(Value::String(_) | Value::Number(_)), None) => {
-                return Err(format!("missing value for --{raw}").into());
-            }
-            (Some(_), value) => (usize::from(value.is_some()), json!(value.unwrap_or_default())),
-            (None, _) => return Err(format!("unknown option --{raw}").into()),
-        };
-        cli.insert(key.to_string(), value);
-        i += if inline.is_some() { 0 } else { taken };
-    }
-    let path = config.clone().unwrap_or_else(|| HOME.join("config.json"));
-    if config.is_some() && !path.is_file() {
-        return Err(format!("config file not found: {}", path.display()).into());
-    }
-    if path.is_file() {
-        let file: serde_json::Map<String, Value> = serde_json::from_slice(&fs::read(&path)?)?;
-        if config.is_some() || file.get("load_config") != Some(&json!(false)) {
-            file.into_iter().filter(|(_, value)| !value.is_null()).for_each(|(key, value)| cfg[key] = value);
-        }
-    }
-    cli.into_iter().for_each(|(key, value)| cfg[key] = value);
-    for (key, known) in PROVIDERS {
-        let names = cfg[key].as_array().into_iter().flatten();
-        if let Some(name) = names.filter_map(Value::as_str).find(|name| !known.contains(name)) {
-            return Err(format!("unknown {} provider: {name}", key.trim_end_matches("_providers")).into());
-        }
-    }
-    CONFIG.set(cfg).map_err(|_| "settings were already loaded")?;
-    let op =
-        ["download", "save", "sync", "url", "meta"].into_iter().find(|op| queries.first().is_some_and(|q| q == op));
-    Ok((op.map_or_else(|| "download".into(), |_| queries.remove(0)), queries))
-}
-
 /// Playlist numbering, and the album, album type and explicit filters.
 fn arrange(mut songs: Vec<Song>) -> Vec<Song> {
-    let (numbering, retain) = (on("playlist_numbering"), on("playlist_retain_track_cover"));
+    let (numbering, retain) = (settings().playlist_numbering, settings().playlist_retain_track_cover);
     for song in songs.iter_mut().filter(|song| (numbering || retain) && song.list_name.is_some()) {
         song.extra.release = Some(Box::new(song.clone()));
         song.album_name = song.list_name.clone().unwrap_or_default();
@@ -262,11 +164,11 @@ fn arrange(mut songs: Vec<Song>) -> Vec<Song> {
             }
         }
     }
-    let ignored: Vec<String> = list("ignore_albums").map(str::to_lowercase).collect();
+    let ignored: Vec<String> = settings().ignore_albums.iter().map(String::as_str).map(str::to_lowercase).collect();
     songs.retain(|song| {
         let album = song.album_name.to_lowercase();
-        let wrong_type = text("album_type").is_some_and(|kind| kind != song.album_type);
-        !(on("skip_explicit") && song.explicit) && !wrong_type && !ignored.iter().any(|name| album.contains(name))
+        let wrong_type = settings().album_type.as_deref().is_some_and(|kind| kind != song.album_type);
+        !(settings().skip_explicit && song.explicit) && !wrong_type && !ignored.iter().any(|name| album.contains(name))
     });
     songs
 }
@@ -302,11 +204,7 @@ fn relative(file: &Path, list: &Path) -> R<String> {
 
 /// One `.m3u8` per list name, with every song of every query, including duplicates that were downloaded once.
 fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
-    let pattern = match &cfg()["m3u"] {
-        Value::String(pattern) if op != "url" => pattern.as_str(),
-        Value::Bool(true) if op != "url" => "",
-        _ => return Ok(()),
-    };
+    let Some(pattern) = settings().m3u.as_deref().filter(|_| op != "url") else { return Ok(()) };
     let pattern = match pattern {
         "" | "true" => "{list[0]}.m3u8".into(),
         name if name.ends_with('/') => format!("{name}{{list[0]}}.m3u8"),
@@ -316,7 +214,7 @@ fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
     let first = listed.first().map_or_else(|| "playlist".into(), |(song, _)| files::fill("{list}", song));
     let mut files = BTreeMap::<String, String>::new();
     for (song, result) in listed {
-        if !(op == "save" || on("add_unavailable") || result.as_ref().is_ok_and(|path| path.is_file())) {
+        if !(op == "save" || settings().add_unavailable || result.as_ref().is_ok_and(|path| path.is_file())) {
             continue;
         }
         let path = result.as_ref().map_or_else(|_| files::path(song), Clone::clone);
@@ -337,10 +235,10 @@ fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
 fn report(done: &[(Song, R<PathBuf>)], mut errors: Vec<String>) -> R<()> {
     let failed = done.iter().filter_map(|(song, result)| Some((song, result.as_ref().err()?)));
     errors.extend(failed.map(|(song, error)| format!("{} ({} - {}): {error}", song.url, song.artist, song.name)));
-    if on("print_errors") {
+    if settings().print_errors {
         errors.iter().for_each(|error| eprintln!("{error}"));
     }
-    if let Some(path) = text("save_errors").filter(|_| !errors.is_empty()) {
+    if let Some(path) = settings().save_errors.as_deref().filter(|_| !errors.is_empty()) {
         let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
         std::io::Write::write_all(&mut file, format!("{}\n{}\n", now(), errors.join("\n")).as_bytes())?;
     }
@@ -361,23 +259,26 @@ fn run() -> R<()> {
     }
     if flag("--generate-config") {
         fs::create_dir_all(&*HOME)?;
-        fs::write(HOME.join("config.json"), serde_json::to_vec_pretty(&serde_json::from_str::<Value>(DEFAULTS)?)?)?;
+        fs::write(
+            HOME.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::from_str::<Value>(settings::DEFAULTS)?)?,
+        )?;
         println!("Config file generated at {}", HOME.join("config.json").display());
         return Ok(());
     }
-    let (op, queries) = if flag("--help") || flag("-h") { Default::default() } else { settings(&args)? };
+    let (op, queries) = if flag("--help") || flag("-h") { Default::default() } else { settings::load(&args)? };
     if queries.is_empty() {
         println!("Usage: spotdl [download|save|sync|url|meta] <query>... [--option value]...");
         return Ok(());
     }
-    let save_file = text("save_file");
+    let save_file = settings().save_file.as_deref();
     if save_file.is_some_and(|path| path != "-" && !path.ends_with(".spotdl")) {
         return Err("save file must end with .spotdl or be '-'".into());
     }
     if op == "save" && save_file.is_none() {
         return Err("save file is not specified".into());
     }
-    let meta_threads = number("meta_threads").max(1) as usize;
+    let meta_threads = settings().meta_threads.max(1) as usize;
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
     prune_cache(&HOME.join("cache"), CACHE_DAYS);
     if op == "meta" {
@@ -395,8 +296,8 @@ fn run() -> R<()> {
         None => queries,
     };
     let downloads = matches!(op.as_str(), "download" | "sync");
-    let (songs, errors) = resolve(&queries, downloads && on("fetch_albums"));
-    if let Some(file) = synced.filter(|_| errors.is_empty() && !on("sync_without_deleting")) {
+    let (songs, errors) = resolve(&queries, downloads && settings().fetch_albums);
+    if let Some(file) = synced.filter(|_| errors.is_empty() && !settings().sync_without_deleting) {
         download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs);
     }
     // One job per output file (per URL when nothing is written); a pinned YouTube URL beats a search.
@@ -412,7 +313,7 @@ fn run() -> R<()> {
         }
         index.push(slot);
     }
-    let threads = if op == "save" { meta_threads } else { number("threads").max(1) as usize };
+    let threads = if op == "save" { meta_threads } else { settings().threads.max(1) as usize };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let done: Vec<(Song, R<PathBuf>)> =
         pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());

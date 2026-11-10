@@ -254,7 +254,7 @@ pub fn song(rng: &mut Rng) -> Song {
 /// Runs `test` on `FUZZ_ITERS` inputs, each from its own seed, and says which seed failed.
 pub fn runs(name: &str, test: impl Fn(&mut Rng)) {
     let var = |key: &str, default: u64| std::env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(default);
-    let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+    crate::settings::use_defaults();
     let first = var("FUZZ_SEED", 1);
     for seed in first..first + var("FUZZ_ITERS", 3000) {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);

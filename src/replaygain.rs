@@ -1,8 +1,9 @@
 //! ReplayGain: loudness measured by FFmpeg or taken from Deezer, as track and album gains.
 
 use crate::files::{temp_file, AUDIO};
+use crate::settings::settings;
 use crate::tags::{audio, save};
-use crate::{log, on, search, text, Song, R};
+use crate::{log, search, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use rayon::prelude::*;
 use std::{
@@ -21,7 +22,7 @@ const DEEZER_REFERENCE: f64 = RG_REFERENCE - 0.4;
 
 /// The EBU R128 integrated loudness (LUFS) and true peak (linear) of a file, measured by FFmpeg.
 fn loudness(file: &Path) -> Option<(f64, f64)> {
-    let mut ffmpeg = Command::new(text("ffmpeg").unwrap_or("ffmpeg"));
+    let mut ffmpeg = Command::new(settings().ffmpeg.as_str());
     ffmpeg.args(["-nostats", "-hide_banner", "-i"]).arg(file);
     ffmpeg.args(["-map", "0:a", "-filter:a", "ebur128=peak=true", "-f", "null", "-"]);
     // Without FFmpeg the gain silently fell back to Deezer's, or none.
@@ -36,7 +37,7 @@ fn loudness(file: &Path) -> Option<(f64, f64)> {
 
 /// The track gain and peak tags: measured with `--replaygain`, else from Deezer's gain (no peak).
 pub(crate) fn track_gain(file: &Path, s: &Song) -> (String, String) {
-    match on("replaygain").then(|| loudness(file)).flatten() {
+    match settings().replaygain.then(|| loudness(file)).flatten() {
         Some((lufs, peak)) => (format!("{:.2} dB", RG_REFERENCE - lufs), format!("{peak:.6}")),
         None if s.extra.gain != 0.0 => (format!("{:.2} dB", DEEZER_REFERENCE - s.extra.gain), String::new()),
         None => (String::new(), String::new()),
@@ -48,7 +49,7 @@ pub(crate) fn track_gain(file: &Path, s: &Song) -> (String, String) {
 /// energy over their lengths, and its peak the highest song peak. An album with a song that has no measured gain
 /// is left as it is.
 pub(crate) fn album_gains(files: &[PathBuf]) {
-    if !on("replaygain") {
+    if !settings().replaygain {
         return;
     }
     album_dirs(files).into_par_iter().for_each(|dir| {
@@ -134,7 +135,7 @@ mod tests {
     /// (Deezer's -11.3) measures -7.10 dB, not -6.70, so unmeasured songs played 0.4 dB louder than measured ones.
     #[test]
     fn deezer_gain_is_converted_like_a_measured_one() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let mut song = Song::default();
         song.extra.gain = -11.3;
         assert_eq!(track_gain(&PathBuf::from("no-such-file.opus"), &song), ("-7.10 dB".into(), String::new()));

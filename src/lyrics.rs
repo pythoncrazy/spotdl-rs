@@ -5,8 +5,9 @@ use crate::genius::{
 };
 use crate::html::html;
 use crate::lrclib::lrclib;
+use crate::settings::settings;
 use crate::tags::audio;
-use crate::{http::Service, list, log, on, search, text, Song, R};
+use crate::{http::Service, log, search, Song, R};
 use lofty::prelude::*;
 use std::{
     collections::HashSet,
@@ -65,7 +66,7 @@ pub fn report_unchecked() {
 /// "no lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which must not stop
 /// later runs from looking again.
 pub(crate) fn genius_answered(song: &Song) -> bool {
-    if !list("lyrics_providers").any(|name| name == "genius" || name == "synced") {
+    if !settings().lyrics_providers.iter().map(String::as_str).any(|name| name == "genius" || name == "synced") {
         return false;
     }
     // Only the song's own page without words is "no lyrics": a search with no such page, or one that found
@@ -182,7 +183,7 @@ fn musixmatch_page(song: &Song) -> Option<String> {
 
 /// The lyrics of the first provider that has them.
 pub(crate) fn found_lyrics(song: &Song) -> Option<Lyrics> {
-    list("lyrics_providers").find_map(|name| provider(name, song))
+    settings().lyrics_providers.iter().map(String::as_str).find_map(|name| provider(name, song))
 }
 
 pub(crate) fn find_lyrics(song: &Song) -> Option<String> {
@@ -374,8 +375,8 @@ pub(crate) fn recheck(song: &Song) -> Check {
 /// Genius, nothing can be checked: no `.lrc` is written and none is removed.
 pub(crate) fn write_lrc(file: &Path, song: &Song) -> R<()> {
     let sidecar = file.with_extension("lrc");
-    let replace = matches!(text("overwrite"), Some("force" | "metadata"));
-    if !on("generate_lrc") || (sidecar.exists() && !replace) {
+    let replace = matches!(settings().overwrite.as_str(), "force" | "metadata");
+    if !settings().generate_lrc || (sidecar.exists() && !replace) {
         return Ok(());
     }
     let length = audio(file)?.properties().duration().as_secs_f64();
@@ -520,7 +521,7 @@ mod tests {
     /// would let LRCLIB's lyrics in unchecked: BULLY's "KING" would get VULTURES 1's.
     #[test]
     fn lyrics_are_not_checked_against_a_genius_that_cannot_be_asked() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         GENIUS.block("test");
         let artists = vec!["¥$".to_string(), "Kanye West".to_string()];
         let song = Song { name: "KING".into(), artist: "¥$".into(), artists, year: 2026, ..Song::default() };
@@ -534,7 +535,7 @@ mod tests {
     /// on every song, with nothing logged. It turns azlyrics off for the run; a lyrics page still gives its lyrics.
     #[test]
     fn azlyrics_access_check_turns_it_off() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let lyrics = "<div class=\"ringtone\"></div><div>\n<!-- Usage of azlyrics.com content by any third-party \
             lyrics provider is prohibited. -->\nIs this the real life?<br>\nIs this just fantasy?\n</div>";
         assert_eq!(azlyrics(lyrics).as_deref(), Some("Is this the real life?\nIs this just fantasy?"));

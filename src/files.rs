@@ -1,8 +1,9 @@
 //! Where songs and their cover images go: the `--output` template, and the folder images.
 
+use crate::settings::settings;
 use crate::{
     http::{self},
-    on, search, spotify, text, Song, R,
+    search, spotify, Song, R,
 };
 use lofty::picture::PictureInformation;
 use serde_json::Value;
@@ -39,7 +40,7 @@ pub fn fill(template: &str, s: &Song) -> String {
             },
         ),
         ("duration", (s.duration as u64).to_string()),
-        ("output-ext", text("format").unwrap_or("opus").into()),
+        ("output-ext", settings().format.as_str().into()),
     ];
     let json = serde_json::to_value(s).unwrap_or_default();
     let saved = json.as_object().into_iter().flatten().map(|(key, value)| {
@@ -58,7 +59,7 @@ pub fn fill(template: &str, s: &Song) -> String {
 
 /// The output file for the `--output` template.
 pub fn path(s: &Song) -> PathBuf {
-    template_path(text("output").unwrap_or_default(), s)
+    template_path(settings().output.as_str(), s)
 }
 
 /// The output file: each template part with a `{field}` filled, made path-safe and cut to `max_filename_length` (and
@@ -70,13 +71,13 @@ fn template_path(output: &str, s: &Song) -> PathBuf {
         output if output.contains('{') => output.to_string(),
         dir => format!("{dir}/{{artists}} - {{title}}"),
     };
-    let max = crate::number("max_filename_length");
+    let max = crate::settings().max_filename_length;
     let part = |part: &str| {
         if !part.contains('{') {
             return part.to_string();
         }
         let value = fill(part, s);
-        let value = match text("restrict") {
+        let value = match settings().restrict.as_deref() {
             Some("strict") => search::slug(&value, "_"),
             Some("ascii") => deunicode::deunicode(&value),
             _ => value,
@@ -98,13 +99,13 @@ fn template_path(output: &str, s: &Song) -> PathBuf {
     };
     let parts = template.trim_start_matches('/').trim_end_matches(".{output-ext}").split('/').map(part);
     let mut out = Path::new(if template.starts_with('/') { "/" } else { "" }).join(parts.collect::<PathBuf>());
-    out.as_mut_os_string().push(format!(".{}", text("format").unwrap_or("opus")));
+    out.as_mut_os_string().push(format!(".{}", settings().format.as_str()));
     out
 }
 
 /// The fixed folder of the output template, the part before its first `{field}`.
 pub(crate) fn output_root() -> PathBuf {
-    let output = Path::new(text("output").unwrap_or_default());
+    let output = Path::new(settings().output.as_str());
     output.components().take_while(|part| !part.as_os_str().to_string_lossy().contains('{')).collect()
 }
 
@@ -156,7 +157,7 @@ pub(crate) fn folder_images(file: &Path, s: &Song) -> Vec<(PathBuf, Option<Strin
 }
 
 pub(crate) fn write_folder_art(file: &Path, s: &Song) -> R<()> {
-    if !on("folder_art") {
+    if !settings().folder_art {
         return Ok(());
     }
     for (image, url) in folder_images(file, s) {
@@ -189,7 +190,7 @@ mod tests {
     /// Covers were the 640 px image that Spotify lists, though it serves the same cover at 1500 px.
     #[test]
     fn album_covers_are_taken_in_their_original_size() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let cover = art("https://i.scdn.co/image/ab67616d0000b273b694e89ba937dd2631ff584c").unwrap();
         assert_eq!(lofty::picture::PictureInformation::from_jpeg(&cover).unwrap().width, 1500);
     }
@@ -214,7 +215,7 @@ mod tests {
     /// became `My Music 50 Off`, so songs went elsewhere than `--scan-for-songs` looked.
     #[test]
     fn output_folders_stay_as_written() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let song = Song { name: "Song: A".into(), artists: vec!["Art".into()], ..Song::default() };
         let out = |template: &str| template_path(template, &song);
         assert_eq!(out("../lib/{artists} - {title}.{output-ext}"), PathBuf::from("../lib/Art - Song A.opus"));
@@ -233,7 +234,7 @@ mod tests {
     /// `.5`, which Navidrome's scanner and file browsers skip, so the album never showed up.
     #[test]
     fn leading_dot_names_are_not_hidden() {
-        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        crate::settings::use_defaults();
         let album = |name: &str| Song {
             name: "Song A".into(),
             artists: vec!["Slipknot".into()],
