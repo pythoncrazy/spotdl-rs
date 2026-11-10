@@ -1,23 +1,29 @@
 //! Lyrics: the providers asked in turn, which words are a song's own, and the `.lrc` file next to it.
 
-use crate::genius::{
-    genius_key, genius_same, genius_titled, instrumental, released_on, Asked, Page, Unavailable, GENIUS_FOUND,
-};
+use crate::genius::{genius_key, genius_page, genius_same, instrumental, released_on, Asked, Page, Unavailable};
 use crate::html::html;
-use crate::lrclib::lrclib;
+use crate::lrclib::{lrclib, Upload};
 use crate::settings::settings;
-use crate::tags::audio;
 use crate::{http::Service, lock, log, search, Song, R};
-use lofty::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Mutex,
+        Arc, Mutex,
     },
 };
+
+/// What Genius and LRCLIB answered for one song. The lyrics provider and the `.lrc` writer ask them the same things,
+/// and both sites are paced, so each is asked once; the answers go when the song is done, not when the run is.
+#[derive(Default)]
+pub(crate) struct Answers {
+    /// Genius's page of the song by an artist, or that it has none (see [`genius_key`]).
+    pub genius: Mutex<HashMap<String, Option<Page>>>,
+    /// LRCLIB's uploads, by search URL.
+    pub lrclib: Mutex<HashMap<String, Arc<Vec<Upload>>>>,
+}
 
 /// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
 static AZLYRICS: Service = Service::new("azlyrics", 1500, false);
@@ -32,15 +38,19 @@ pub(crate) fn page(service: &Service, url: &str) -> Option<String> {
 /// The title that lyrics sites list: without " - Remastered", "(feat. ...)", "(Uncensored)" or other notes.
 pub(crate) fn lyrics_title(song: &Song) -> &str {
     let title = search::versionless(&song.name);
-    let end = [" (", " ["].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
-    title[..end].trim()
+    title[..search::note_at(title, false).unwrap_or(title.len())].trim()
 }
 
 /// A lowercase title of letters and digits, without notes in brackets.
 pub(crate) fn plain_title(title: &str) -> String {
     let title = title.to_lowercase();
-    let end = [" (", " [", " - "].iter().filter_map(|note| title.find(note)).min().unwrap_or(title.len());
-    search::slug(&title[..end], "")
+    search::slug(&title[..search::note_at(&title, true).unwrap_or(title.len())], "")
+}
+
+/// Whether two album titles name one album: one starts with the other, notes aside ("Exodus", "Exodus (Deluxe)").
+pub(crate) fn same_album(a: &str, b: &str) -> bool {
+    let (a, b) = (plain_title(a), plain_title(b));
+    !a.is_empty() && !b.is_empty() && (a.starts_with(&b) || b.starts_with(&a))
 }
 
 /// The songs whose lyrics were left unchecked because Genius could not be asked, for [`report_unchecked`].
@@ -62,20 +72,30 @@ pub(crate) fn report_unchecked() {
     }
 }
 
-/// Whether the lyrics providers asked Genius, the lyrics authority, for the song and it answered: only then is "no
-/// lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which must not stop later runs
-/// from looking again.
-pub(crate) fn genius_answered(song: &Song) -> bool {
-    if !settings().lyrics_providers.iter().map(String::as_str).any(|name| name == "genius" || name == "synced") {
-        return false;
-    }
-    // Only the song's own page without words is "no lyrics": a search with no such page, or one that found nothing,
-    // leaves a vocal song to be looked up again later.
-    let pages = lock(&GENIUS_FOUND).get(&genius_key(song, &song.artist, 1)).cloned();
-    pages.is_some_and(|pages| {
-        pages.iter().any(|page| instrumental(song, page))
-            || (instrumental_title(&song.name) && pages.iter().all(|page| words(&page.lyrics).is_empty()))
-    })
+/// Whether a lyrics provider that checks with Genius is on.
+pub(crate) fn asks_genius() -> bool {
+    settings().lyrics_providers.iter().any(|name| name == "genius" || name == "synced")
+}
+
+/// Whether Genius says that the song has no words: its own page has none, or its title says that it is an
+/// instrumental and Genius has no page with words for it (LRCLIB files the sung song's under its title).
+fn wordless(song: &Song, page: Option<&Page>) -> bool {
+    page.is_some_and(|page| instrumental(song, page))
+        || (instrumental_title(&song.name) && page.is_none_or(|page| words(&page.lyrics).is_empty()))
+}
+
+/// Whether the lyrics providers asked Genius, the lyrics authority, for the song and it answered that the song has no
+/// lyrics: only then is "no lyrics" an answer (an instrumental) and not a failed request (a 403 or a timeout), which
+/// must not stop later runs from looking again. A search that found another song's page, or a page with words, leaves
+/// a vocal song to be looked up again later.
+pub(crate) fn genius_answered(song: &Song, answers: &Answers) -> bool {
+    let page = asks_genius().then(|| lock(&answers.genius).get(&genius_key(song, &song.artist)).cloned()).flatten();
+    page.is_some_and(|page| wordless(song, page.as_ref()))
+}
+
+/// Whether the song got no lyrics because it has none: its tags then say so, and `meta` does not look again.
+pub(crate) fn none_found(song: &Song, answers: &Answers) -> bool {
+    song.lyrics.as_deref().is_none_or(str::is_empty) && genius_answered(song, answers)
 }
 
 /// An azlyrics page came without the marker before its lyrics: its layout changed, which is said once.
@@ -122,10 +142,10 @@ impl Lyrics {
 }
 
 /// Lyrics from one provider: `synced` (LRCLIB), `genius`, `azlyrics` or `musixmatch`.
-pub(crate) fn provider(name: &str, song: &Song) -> Option<Lyrics> {
+pub(crate) fn provider(name: &str, song: &Song, answers: &Answers) -> Option<Lyrics> {
     match name {
-        "synced" => synced(song),
-        "genius" => genius(song),
+        "synced" => synced(song, answers),
+        "genius" => genius(song, answers),
         "azlyrics" => Lyrics::words(azlyrics_page(song)?),
         _ => Lyrics::words(musixmatch_page(song)?),
     }
@@ -133,26 +153,21 @@ pub(crate) fn provider(name: &str, song: &Song) -> Option<Lyrics> {
 
 /// LRCLIB's lyrics, checked against Genius's; without an answer from Genius, they are left for a later run. LRCLIB's
 /// word that the song is an instrumental counts only when Genius has no words to check it by.
-fn synced(song: &Song) -> Option<Lyrics> {
-    let Ok(pages) = genius_titled(song, &song.artist, 1) else {
+fn synced(song: &Song, answers: &Answers) -> Option<Lyrics> {
+    let Ok(page) = genius_page(song, &song.artist, answers) else {
         unchecked(song);
         return None;
     };
-    let page = pages.into_iter().next();
-    // An instrumental without a page of its own has no words: LRCLIB files the sung song's under its title.
-    let wordless = |page: &Page| words(&page.lyrics).is_empty();
-    if page.as_ref().is_some_and(|page| instrumental(song, page))
-        || (instrumental_title(&song.name) && page.as_ref().is_none_or(wordless))
-    {
+    if wordless(song, page.as_ref()) {
         return Some(Lyrics::Instrumental);
     }
     let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
-    lrclib(song, true).find_map(|versions| versions.pick(checks.as_deref()))
+    lrclib(song, answers).find_map(|versions| versions.pick(checks.as_deref()))
 }
 
 /// Genius's lyrics. A page without words is the song's answer that it has none, or else another song's.
-fn genius(song: &Song) -> Option<Lyrics> {
-    let Some(page) = genius_titled(song, &song.artist, 1).ok()?.into_iter().next() else {
+fn genius(song: &Song, answers: &Answers) -> Option<Lyrics> {
+    let Some(page) = genius_page(song, &song.artist, answers).ok()? else {
         return instrumental_title(&song.name).then_some(Lyrics::Instrumental);
     };
     if instrumental(song, &page) {
@@ -181,12 +196,12 @@ fn musixmatch_page(song: &Song) -> Option<String> {
 }
 
 /// The lyrics of the first provider that has them.
-pub(crate) fn found_lyrics(song: &Song) -> Option<Lyrics> {
-    settings().lyrics_providers.iter().map(String::as_str).find_map(|name| provider(name, song))
+pub(crate) fn found_lyrics(song: &Song, answers: &Answers) -> Option<Lyrics> {
+    settings().lyrics_providers.iter().find_map(|name| provider(name, song, answers))
 }
 
-pub(crate) fn find_lyrics(song: &Song) -> Option<String> {
-    found_lyrics(song)?.into_words()
+pub(crate) fn find_lyrics(song: &Song, answers: &Answers) -> Option<String> {
+    found_lyrics(song, answers)?.into_words()
 }
 
 /// Whether the lyrics have `[mm:ss` timestamps.
@@ -249,7 +264,7 @@ pub(crate) fn words(lyrics: &str) -> Vec<String> {
 /// (Take 2 - Instrumental Backing Track)", "Paperback Writer - Takes 1 & 2 / Backing Track". A song called
 /// "Instrumental" is not one.
 pub(crate) fn instrumental_title(title: &str) -> bool {
-    let Some(end) = [" (", " [", " - "].iter().filter_map(|note| title.find(note)).min() else {
+    let Some(end) = search::note_at(title, true) else {
         return false;
     };
     let notes = search::slug(&title[end..], "-");
@@ -321,13 +336,13 @@ pub(crate) fn unlisted(lyrics: &str) -> String {
 /// Genius by default), or else its Genius page. Genius has a page for each song, with the artists and the release date;
 /// LRCLIB is a crowd's uploads and has, for example, "KING" from VULTURES 1 under BULLY's "KING". `Ok(None)`: Genius
 /// has no such page. `Err`: Genius could not be asked, so nothing can be checked.
-pub(crate) fn reference(song: &Song, own: Option<&String>) -> Asked<Option<String>> {
+pub(crate) fn reference(song: &Song, own: Option<&String>, answers: &Answers) -> Asked<Option<String>> {
     if let Some(own) = own.filter(|lyrics| !is_synced(lyrics)) {
         return Ok(Some(own.clone()));
     }
     let mut asked = true;
     for artist in song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty()) {
-        match genius_same(song, artist).map(|page| page.map(|page| (released_on(song, &page), page))) {
+        match genius_same(song, artist, answers).map(|page| page.map(|page| (released_on(song, &page), page))) {
             Ok(Some((Ok(true), page))) => return Ok(Some(page.lyrics)),
             Ok(Some((Err(Unavailable), _))) | Err(Unavailable) => asked = false,
             Ok(_) => {}
@@ -351,11 +366,11 @@ pub(crate) enum Check {
 /// VULTURES 1 under BULLY's) are replaced. Only a Genius page with the song's own title, dated to the release's year or
 /// listed on the release's album, can replace or remove lyrics; when that page has no words (an instrumental), they are
 /// removed.
-pub(crate) fn recheck(song: &Song) -> Check {
+pub(crate) fn recheck(song: &Song, answers: &Answers) -> Check {
     let artists = song.artists.iter().chain([&song.artist]).filter(|artist| !artist.is_empty());
     // Genius's page is asked for its albums only when the lyrics differ.
-    let page =
-        song.lyrics.as_ref().and_then(|_| artists.clone().find_map(|artist| genius_same(song, artist).ok().flatten()));
+    let same = |artist: &String| genius_same(song, artist, answers).ok().flatten();
+    let page = song.lyrics.as_ref().and_then(|_| artists.clone().find_map(same));
     let differ = |page: &Page| song.lyrics.as_ref().is_some_and(|old| !same_lyrics(old, &page.lyrics));
     if let Some(page) = page.filter(|page| differ(page) && released_on(song, page) == Ok(true)) {
         return Check::Replace(Some(page.lyrics).filter(|lyrics| !words(lyrics).is_empty()));
@@ -365,8 +380,8 @@ pub(crate) fn recheck(song: &Song) -> Check {
     let Some(old) = song.lyrics.as_ref().filter(|_| instrumental_title(&song.name)) else {
         return Check::Keep;
     };
-    let pages: Asked<Vec<Vec<Page>>> = artists.map(|artist| genius_titled(song, artist, 1)).collect();
-    let Ok(pages) = pages.map(|pages| pages.concat()) else {
+    let pages: Asked<Vec<Option<Page>>> = artists.map(|artist| genius_page(song, artist, answers)).collect();
+    let Ok(pages) = pages.map(|pages| pages.into_iter().flatten().collect::<Vec<_>>()) else {
         return Check::Keep;
     };
     if pages.iter().any(|page| same_lyrics(old, &page.lyrics)) {
@@ -375,22 +390,21 @@ pub(crate) fn recheck(song: &Song) -> Check {
     Check::Replace(pages.into_iter().find(|page| !words(&page.lyrics).is_empty()).map(|page| page.lyrics))
 }
 
-/// The `.lrc` next to the file. Synced lyrics are timed to one recording: they are used when they were timed to a
+/// The `.lrc` next to the file, whose audio is `length` seconds long. Synced lyrics are timed to one recording: they are used when they were timed to a
 /// recording as long as the file (no line after its end, see [`timed_for`]) and their words are the song's (see
 /// [`reference`]): the song's own, the old `.lrc`, or LRCLIB's for the file's length. Without such lyrics, an old
 /// `.lrc` with the words of another song, or timed to a longer recording, is removed. Without an answer from Genius,
 /// nothing can be checked: no `.lrc` is written and none is removed.
-pub(crate) fn write_lrc(file: &Path, song: &Song) -> R<()> {
+pub(crate) fn write_lrc(file: &Path, song: &Song, length: f64, answers: &Answers) -> R<()> {
     let sidecar = file.with_extension("lrc");
     let replace = settings().overwrite.replaces();
     if !settings().generate_lrc || (sidecar.exists() && !replace) {
         return Ok(());
     }
-    let length = audio(file)?.properties().duration().as_secs_f64();
     let recording = Song { duration: length, ..song.clone() };
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
-    let Ok(reference) = reference(song, own.as_ref()) else {
+    let Ok(reference) = reference(song, own.as_ref(), answers) else {
         unchecked(song);
         return Ok(());
     };
@@ -399,7 +413,7 @@ pub(crate) fn write_lrc(file: &Path, song: &Song) -> R<()> {
     // The old `.lrc` goes before LRCLIB, which is often busy.
     let own_synced = own.filter(|lyrics| fits && timed(lyrics));
     let old = fs::read_to_string(&sidecar).ok();
-    let found = lrclib(&recording, false).flat_map(|versions| versions.lyrics).filter(timed);
+    let found = lrclib(&recording, answers).flat_map(|versions| versions.lyrics).filter(timed);
     let kept = old.clone().filter(timed);
     if let Some(lrc) = own_synced.into_iter().chain(kept).chain(found).find(agrees) {
         if old.as_ref() != Some(&lrc) {
@@ -447,7 +461,7 @@ mod fuzz;
 mod tests {
     use super::*;
     use crate::genius::GENIUS;
-    use crate::lrclib::lrclib_lyrics;
+    use crate::lrclib::{lrclib_lyrics, uploads};
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -507,7 +521,7 @@ mod tests {
         assert!(timed_for("plain words\nno times", 1.0));
         let song = Song { name: "Lucid Dreams".into(), duration: 199.0, ..Song::default() };
         let track = serde_json::json!({"duration": 199.0, "syncedLyrics": "[07:20.00]Lucid dreams", "plainLyrics": "Lucid dreams"});
-        assert_eq!(lrclib_lyrics(&song, &[track]).lyrics, vec!["Lucid dreams".to_string()]);
+        assert_eq!(lrclib_lyrics(&song, &uploads(vec![track])).lyrics, vec!["Lucid dreams".to_string()]);
     }
 
     /// Genius's "You might also like", glued into lyrics by earlier scrapes, is not lyrics.
@@ -531,10 +545,11 @@ mod tests {
         GENIUS.block("test");
         let artists = vec!["¥$".to_string(), "Kanye West".to_string()];
         let song = Song { name: "KING".into(), artist: "¥$".into(), artists, year: 2026, ..Song::default() };
-        assert_eq!(reference(&song, None), Err(Unavailable));
-        assert_eq!(provider("synced", &song), None);
+        let answers = Answers::default();
+        assert_eq!(reference(&song, None, &answers), Err(Unavailable));
+        assert_eq!(provider("synced", &song, &answers), None);
         // The song's own plain lyrics still check synced lyrics.
-        assert_eq!(reference(&song, Some(&BULLY_KING.into())), Ok(Some(BULLY_KING.into())));
+        assert_eq!(reference(&song, Some(&BULLY_KING.into()), &answers), Ok(Some(BULLY_KING.into())));
     }
 
     /// azlyrics's access check comes as a 200 page (from b.azlyrics.com): it was taken for a song without lyrics, on
@@ -552,6 +567,6 @@ mod tests {
         assert!(AZLYRICS.blocked());
         // Not asked again: no request is sent.
         let song = Song { name: "Creep".into(), artist: "Radiohead".into(), ..Song::default() };
-        assert_eq!(provider("azlyrics", &song), None);
+        assert_eq!(provider("azlyrics", &song, &Answers::default()), None);
     }
 }

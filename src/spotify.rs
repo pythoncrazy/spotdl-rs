@@ -490,7 +490,7 @@ fn paired(youtube: &str, spotify: &str) -> R<Vec<Song>> {
         "://music.youtube.com/",
         1,
     );
-    let found = search::source(&url, false)?;
+    let found = search::videos(&url)?;
     if songs.len() != found.len() {
         return Err(
             format!("YouTube ({}) and Spotify ({}) lists have different lengths", found.len(), songs.len()).into()
@@ -541,7 +541,7 @@ fn song_key(name: &str) -> String {
 
 /// The title before a " (Deluxe Edition)", " [Remastered]" or " - Single" note.
 pub(crate) fn base_title(title: &str) -> &str {
-    [" (", " [", " - "].iter().filter_map(|note| title.find(note)).min().map_or(title, |end| &title[..end])
+    search::note_at(title, true).map_or(title, |end| &title[..end])
 }
 
 #[cfg(test)]

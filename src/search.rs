@@ -1,10 +1,16 @@
+//! Finding a song's audio: YouTube Music's and yt-dlp's search results, and how well each matches the song.
+
 use crate::settings::settings;
-use crate::{cached, files, http, log, now, spotify, Song, R};
+use crate::{
+    cached, files,
+    http::{self, Pace},
+    log, spotify, Song, R,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
 
@@ -17,11 +23,11 @@ const PENALIZED: &str = "remaster remastered lyrics lyric visualizer video edit"
 const SUFFIXES: &str = "remaster remastered mono stereo mix version edit edited explicit single radio album lp \
     deluxe anniversary original bonus";
 
-/// Until when (Unix seconds) every thread holds off YouTube after it blocked us.
-static PAUSE: AtomicU64 = AtomicU64::new(0);
+/// Unspaced; held when YouTube blocks us, so that every thread holds off.
+static YOUTUBE: Pace = Pace::new(0);
 
 /// YouTube Music's classification of a video (`musicVideoType`).
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 enum Kind {
     /// Label-provided audio: the exact studio recording.
     Atv,
@@ -32,9 +38,36 @@ enum Kind {
     Other,
 }
 
-#[derive(Default)]
+/// A search result that can be downloaded.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Video {
+    pub url: String,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub album: String,
+    pub duration: f64,
+}
+
+impl Video {
+    /// The song of a video that has no Spotify metadata.
+    fn song(self) -> Song {
+        Song {
+            name: self.name,
+            artist: self.artists.first().cloned().unwrap_or_default(),
+            artists: self.artists,
+            album_name: self.album,
+            duration: self.duration,
+            song_id: self.url.rsplit(['=', '/']).next().unwrap_or_default().to_string(),
+            url: self.url.clone(),
+            download_url: Some(self.url),
+            ..Song::default()
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Hit {
-    song: Song,
+    video: Video,
     verified: bool,
     isrc: bool,
     kind: Kind,
@@ -42,31 +75,11 @@ struct Hit {
     explicit: bool,
 }
 
-fn hit(url: String, name: String, artists: Vec<String>, album: String, duration: f64) -> Song {
-    let song_id = url.rsplit(['=', '/']).next().unwrap_or_default().to_string();
-    let artist = artists.first().cloned().unwrap_or_default();
-    Song {
-        name,
-        artist,
-        artists,
-        album_name: album,
-        duration,
-        song_id,
-        url: url.clone(),
-        download_url: Some(url),
-        ..Song::default()
-    }
-}
-
 /// Runs a YouTube step, retrying transient errors; when YouTube blocks us, every thread pauses.
 pub(crate) fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
     let mut attempt = 0;
     loop {
-        let wait = PAUSE.load(Relaxed).saturating_sub(now());
-        if wait > 0 {
-            log("WARNING", &format!("YouTube is blocking requests; waiting {wait} s"));
-            std::thread::sleep(Duration::from_secs(wait));
-        }
+        YOUTUBE.wait();
         let error = match step() {
             Ok(value) => return Ok(value),
             Err(error) => error,
@@ -79,7 +92,10 @@ pub(crate) fn youtube<T>(mut step: impl FnMut() -> Result<T, String>) -> R<T> {
             return Err(error.into());
         }
         if blocked && attempt > 0 {
-            PAUSE.fetch_max(now() + (30 << attempt.min(2)), Relaxed);
+            let pause = 30 << attempt.min(2);
+            if YOUTUBE.hold(Duration::from_secs(pause)) {
+                log("WARNING", &format!("YouTube is blocking requests; waiting {pause} s"));
+            }
         } else {
             std::thread::sleep(Duration::from_secs(3));
         }
@@ -127,11 +143,10 @@ pub(crate) fn ratio(a: &str, b: &str) -> f64 {
     }
 }
 
-/// Words and joined word pairs of the title, artists and (with `album`) album.
-fn words(song: &Song, album: bool) -> HashSet<String> {
+/// Words and joined word pairs of a title, its artists and (when given) its album.
+fn words(name: &str, album: Option<&String>, artists: &[String]) -> HashSet<String> {
     let mut words = HashSet::new();
-    let album = album.then_some(&song.album_name);
-    for value in [&song.name].into_iter().chain(album).chain(&song.artists) {
+    for value in [name].into_iter().chain(album.map(String::as_str)).chain(artists.iter().map(String::as_str)) {
         let slugged = slug(value, "-");
         let tokens: Vec<&str> = slugged.split('-').filter(|word| !word.is_empty()).collect();
         words.extend(tokens.iter().map(|word| word.to_string()));
@@ -161,6 +176,11 @@ fn is_note(text: &str) -> bool {
 pub(crate) fn versionless(name: &str) -> &str {
     let suffix = |(_, suffix): &(&str, &str)| is_version_suffix(suffix) || is_note(suffix);
     name.rsplit_once(" - ").filter(suffix).map_or(name, |(title, _)| title)
+}
+
+/// Where the first note of a title starts: " (feat. X)", " [Live]" and, with `dash`, " - Remastered".
+pub(crate) fn note_at(title: &str, dash: bool) -> Option<usize> {
+    [" (", " [", " - "].iter().take(if dash { 3 } else { 2 }).filter_map(|note| title.find(note)).min()
 }
 
 /// The slugged title without version notes, featured artists or a " - Remix" suffix, to compare the editions of an
@@ -230,7 +250,7 @@ fn unnumbered(name: &str) -> Option<&str> {
 
 /// How well a result matches the song, 0 for a reject; official audio and the right edit rank first.
 fn score(s: &Song, h: &Hit) -> f64 {
-    let hit = &h.song;
+    let hit = &h.video;
     let (rname, sname) = (slug(&hit.name, "-"), slug(&s.name, "-"));
     let versionless_name = versionless(&s.name);
     let versionless = slug(versionless_name, "-");
@@ -257,7 +277,8 @@ fn score(s: &Song, h: &Hit) -> f64 {
     // presenter Spotify lists first) and on another album ("Best of British (tribute to Coldplay)" for Tyler Ward's
     // "The Scientist"), but also unrelated songs: such a hit needs the same title and length, not the artists.
     let isrc = h.isrc && name > 85.0 && gap <= 3.0;
-    let (result_words, allowed_words) = (words(hit, !isrc), words(s, true));
+    let result_words = words(&hit.name, (!isrc).then_some(&hit.album), &hit.artists);
+    let allowed_words = words(&s.name, Some(&s.album_name), &s.artists);
     let rejected = result_words.iter().any(|word| altered(word) && !allowed_words.contains(word));
     let penalized =
         PENALIZED.split(' ').filter(|w| result_words.contains(*w) && !allowed_words.contains(*w)).count() as f64;
@@ -279,12 +300,13 @@ fn score(s: &Song, h: &Hit) -> f64 {
         let a = slug(a, "-");
         hit.artists.iter().chain([&hit.name, &combined_artists]).map(|r| ratio(&a, &slug(r, "-"))).fold(0.0, f64::max)
     };
-    let album = !hit.album_name.is_empty() && ratio(&slug(&s.album_name, "-"), &slug(&hit.album_name, "-")) > 80.0;
+    let album = !hit.album.is_empty() && ratio(&slug(&s.album_name, "-"), &slug(&hit.album, "-")) > 80.0;
     // Spotify may list a presenter or band member first ("Lee Peters", "Oliver Leimbach") where YouTube Music credits
     // only the act, and YouTube Music may credit an alias ("Tupac" for "2Pac"): a hit as long as the song is theirs
     // when its lead artist is another of Spotify's artists (scored below a full credit, which then wins), or when it
     // has the song's title on the song's album.
-    let lead = gap <= 3.0 && s.artists.iter().any(|a| same_artist(&slug(a, "-"), &slug(&hit.artist, "-")));
+    let first = slug(hit.artists.first().map_or("", String::as_str), "-");
+    let lead = gap <= 3.0 && s.artists.iter().any(|a| same_artist(&slug(a, "-"), &first));
     let artists = if found(&s.artist) {
         artists.max(main(&s.artist)).max(160.0 / count).min(100.0)
     } else if gap <= 3.0 && album && name > 85.0 {
@@ -365,8 +387,8 @@ fn ytm_hits(reply: &Value, songs: bool, isrc: bool) -> Vec<Hit> {
             badges.any(|badge| badge["musicInlineBadgeRenderer"]["icon"]["iconType"] == "MUSIC_EXPLICIT_BADGE");
         let url = format!("https://music.youtube.com/watch?v={}", r["playlistItemData"]["videoId"].as_str()?);
         let album = linked("ALBUM").into_iter().next().unwrap_or_default();
-        let song = hit(url, column(0)[0]["text"].as_str()?.into(), artists, album, time.ok()?);
-        Some(Hit { song, verified: songs, isrc, kind, explicit })
+        let video = Video { url, name: column(0)[0]["text"].as_str()?.into(), artists, album, duration: time.ok()? };
+        Some(Hit { video, verified: songs, isrc, kind, explicit })
     };
     items.filter_map(parse).collect()
 }
@@ -378,14 +400,17 @@ fn ytm(query: &str, songs: bool, isrc: bool) -> R<Vec<Hit>> {
         "clientName": "WEB_REMIX", "clientVersion": "1.20251001.01.00", "hl": "en", "gl": "US",
     });
     let body = json!({"context": {"client": client}, "query": query, "params": params}).to_string();
-    let reply = cached(&format!("ytm{body}"), 7, || {
+    // The hits are kept, not the reply, which is up to 300 KB.
+    cached(&format!("ytm-hits{isrc}{body}"), 7, || {
         let url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
         let reply: Value = youtube(|| {
             http::post_json(url, &[("Content-Type", "application/json")], &body).map_err(|error| error.to_string())
         })?;
-        reply.get("contents").is_some().then_some(reply).ok_or_else(|| "unexpected YouTube Music response".into())
-    })?;
-    Ok(ytm_hits(&reply, songs, isrc))
+        match reply.get("contents") {
+            Some(_) => Ok(ytm_hits(&reply, songs, isrc)),
+            None => Err("unexpected YouTube Music response".into()),
+        }
+    })
 }
 
 /// yt-dlp's flat listing of a search (`ytsearch10:...`), video or playlist.
@@ -405,10 +430,8 @@ fn ytdlp(target: &str) -> R<Vec<Hit>> {
         let url = entry["webpage_url"].as_str().or(entry["url"].as_str())?.into();
         let name = entry["track"].as_str().or(entry["title"].as_str())?.into();
         let album = entry["album"].as_str().unwrap_or_default().into();
-        Some(Hit {
-            song: hit(url, name, vec![artist.into()], album, entry["duration"].as_f64().unwrap_or_default()),
-            ..Hit::default()
-        })
+        let duration = entry["duration"].as_f64().unwrap_or_default();
+        Some(Hit { video: Video { url, name, artists: vec![artist.into()], album, duration }, ..Hit::default() })
     };
     Ok(entries.iter().filter_map(parse).collect())
 }
@@ -417,8 +440,8 @@ fn ytdlp(target: &str) -> R<Vec<Hit>> {
 /// match for with unrelated songs ("Purple Reign" for "Swimming Pools (Drank)"), so they are scored even when
 /// `--dont-filter-results` turns scoring off for text hits; they must also be the same length and edit.
 fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)> + '_ {
-    let same = |h: &Hit| (h.song.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
-    hits.into_iter().filter(same).map(|h| (score(song, &h) + 1000.0, h.song.url)).filter(|c| c.0 > 1000.0)
+    let same = |h: &Hit| (h.video.duration - song.duration).abs() < 10.0 && h.explicit == song.explicit;
+    hits.into_iter().filter(same).map(|h| (score(song, &h) + 1000.0, h.video.url)).filter(|c| c.0 > 1000.0)
 }
 
 /// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
@@ -436,19 +459,24 @@ pub(crate) fn find(song: &Song) -> R<Vec<String>> {
     };
     for provider in settings().audio_providers.iter().map(String::as_str) {
         let mut hits = match provider {
-            "youtube-music" => note(ytm(&query, true, false)),
+            "youtube-music" => {
+                // The search by ISRC runs while the search by text does.
+                let (text, isrc) = std::thread::scope(|scope| {
+                    let isrc = song.isrc.as_deref().map(|isrc| scope.spawn(move || ytm(isrc, true, true)));
+                    (ytm(&query, true, false), isrc.and_then(|isrc| isrc.join().ok()))
+                });
+                let text = note(text);
+                found.extend(isrc_picks(song, note(isrc.unwrap_or_else(|| Ok(Vec::new())))));
+                text
+            }
             "youtube" => note(ytdlp(&format!("ytsearch10:{query}"))),
             _ => note(ytdlp(&format!("scsearch10:{query}"))),
         };
-        if provider == "youtube-music" {
-            let isrc = song.isrc.as_deref().map_or_else(|| Ok(Vec::new()), |isrc| ytm(isrc, true, true));
-            found.extend(isrc_picks(song, note(isrc)));
-            if !verified && hits.iter().map(rank).fold(0.0, f64::max) < 80.0 {
-                hits.extend(note(ytm(&query, false, false)));
-            }
+        if provider == "youtube-music" && !verified && hits.iter().map(rank).fold(0.0, f64::max) < 80.0 {
+            hits.extend(note(ytm(&query, false, false)));
         }
         let hits = hits.into_iter().filter(|hit| !verified || hit.verified);
-        found.extend(hits.map(|hit| (rank(&hit), hit.song.url)).filter(|candidate| candidate.0 > 0.0));
+        found.extend(hits.map(|hit| (rank(&hit), hit.video.url)).filter(|candidate| candidate.0 > 0.0));
     }
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut seen = HashSet::new();
@@ -461,33 +489,45 @@ pub(crate) fn find(song: &Song) -> R<Vec<String>> {
 }
 
 /// The Spotify song with a video's URL, and with its title, artists and length when `ytm_data` is on.
-pub(crate) fn with_video(song: Song, video: Song) -> Song {
+pub(crate) fn with_video(song: Song, video: Video) -> Song {
     let song = match settings().ytm_data {
         true => Song {
             name: video.name,
-            artist: video.artist,
+            artist: video.artists.first().cloned().unwrap_or_default(),
             artists: video.artists,
             duration: video.duration,
-            album_name: video.album_name,
+            album_name: video.album,
             ..song
         },
         false => song,
     };
-    Song { download_url: video.download_url, ..song }
+    Song { download_url: Some(video.url), ..song }
+}
+
+/// The videos at a YouTube or SoundCloud URL: the one of a video, or all of a playlist.
+pub(crate) fn videos(url: &str) -> R<Vec<Video>> {
+    let single = url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?"));
+    Ok(ytdlp(url)?.into_iter().take(if single { 1 } else { usize::MAX }).map(|hit| hit.video).collect())
 }
 
 /// Songs for a YouTube or SoundCloud URL; YouTube Music songs get Spotify metadata when `lookup` is set.
 pub(crate) fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
-    let single = url.contains("youtu") && !(url.contains("list=") && !url.contains("watch?"));
     let lookup = lookup && url.contains("music.youtube.com");
-    let song = |hit: Hit| match lookup {
-        false => Some(hit.song),
+    let song = |video: Video| match lookup {
+        false => Some(video.song()),
         true => {
-            let found = spotify::resolve(&format!("{} - {}", hit.song.artists.join(", "), hit.song.name)).ok()?;
-            Some(with_video(found.into_iter().next()?, hit.song))
+            let found = spotify::resolve(&format!("{} - {}", video.artists.join(", "), video.name)).ok()?;
+            Some(with_video(found.into_iter().next()?, video))
         }
     };
-    Ok(ytdlp(url)?.into_iter().take(if single { 1 } else { usize::MAX }).filter_map(song).collect())
+    Ok(videos(url)?.into_iter().filter_map(song).collect())
+}
+
+#[cfg(test)]
+impl From<Song> for Video {
+    fn from(song: Song) -> Self {
+        Self { url: song.url, name: song.name, artists: song.artists, album: song.album_name, duration: song.duration }
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +553,7 @@ mod tests {
 
     fn atv(name: &str, duration: f64, explicit: bool) -> Hit {
         let song = song(name, "Until The End Of Time", duration, explicit);
-        Hit { song, verified: true, isrc: false, kind: Kind::Atv, explicit }
+        Hit { video: song.into(), verified: true, isrc: false, kind: Kind::Atv, explicit }
     }
 
     #[test]
@@ -550,7 +590,8 @@ mod tests {
     }
 
     fn result(name: &str, artists: &[&str], album: &str, duration: f64, isrc: bool) -> Hit {
-        Hit { song: track(name, artists, album, duration), verified: true, isrc, kind: Kind::Atv, explicit: false }
+        let video = track(name, artists, album, duration).into();
+        Hit { video, verified: true, isrc, kind: Kind::Atv, explicit: false }
     }
 
     #[test]
@@ -613,7 +654,7 @@ mod tests {
         let skins = track("Side 2, Pt. 2: Skins", &["Pink Floyd"], "The Endless River", 157.8);
         let video = |name: &str, artist: &str, duration, kind| {
             let song = track(name, &[artist], "", duration);
-            Hit { song, verified: false, isrc: false, kind, explicit: false }
+            Hit { video: song.into(), verified: false, isrc: false, kind, explicit: false }
         };
         let surfacing = video("Pink Floyd   Side 4, Pt  3 Surfacing", "Gabriele Cordovani", 167.0, Kind::Other);
         assert_eq!(score(&skins, &surfacing), 0.0);

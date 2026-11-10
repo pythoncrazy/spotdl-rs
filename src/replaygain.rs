@@ -1,8 +1,8 @@
 //! ReplayGain: loudness measured by FFmpeg or taken from Deezer, as track and album gains.
 
-use crate::files::{temp_file, AUDIO};
+use crate::files::is_audio;
 use crate::settings::settings;
-use crate::tags::{audio, save};
+use crate::tags::{peek, Tags};
 use crate::{log, search, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use rayon::prelude::*;
@@ -67,27 +67,34 @@ fn album_dirs(files: &[PathBuf]) -> HashSet<&Path> {
         .collect()
 }
 
+/// A song of an album: its measured gain and peak, its length, and the album gain and peak in its tags.
+struct Track {
+    file: PathBuf,
+    loud: Option<(f64, f64)>,
+    length: f64,
+    album: [Option<String>; 2],
+}
+
 fn album_gain(dir: &Path) -> R<()> {
-    type Track = (PathBuf, Option<(f64, f64)>, f64);
     let mut albums: HashMap<String, Vec<Track>> = HashMap::new();
     for entry in fs::read_dir(dir)? {
         let file = entry?.path();
-        let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !AUDIO.contains(&extension.as_str()) || temp_file(&file) {
+        if !is_audio(&file) {
             continue;
         }
-        let audio = audio(&file)?;
+        let audio = peek(&file)?;
         let Some(tag) = audio.primary_tag() else {
             continue;
         };
         let number = |key: ItemKey| tag.get_string(&key)?.split_whitespace().next()?.parse::<f64>().ok();
         let loud = number(ItemKey::ReplayGainTrackGain).zip(number(ItemKey::ReplayGainTrackPeak));
         let length = audio.properties().duration().as_secs_f64();
-        albums.entry(tag.album().unwrap_or_default().into()).or_default().push((file, loud, length));
+        let album = [ItemKey::ReplayGainAlbumGain, ItemKey::ReplayGainAlbumPeak]
+            .map(|key| tag.get_string(&key).map(String::from));
+        albums.entry(tag.album().unwrap_or_default().into()).or_default().push(Track { file, loud, length, album });
     }
     for tracks in albums.values() {
-        let Some(measured) =
-            tracks.iter().map(|(_, loud, length)| loud.map(|loud| (loud, *length))).collect::<Option<Vec<_>>>()
+        let Some(measured) = tracks.iter().map(|track| Some((track.loud?, track.length))).collect::<Option<Vec<_>>>()
         else {
             continue;
         };
@@ -99,33 +106,15 @@ fn album_gain(dir: &Path) -> R<()> {
             measured.iter().map(|((gain, _), length)| length * 10f64.powf((RG_REFERENCE - gain) / 10.0)).sum();
         let gain = format!("{:.2} dB", RG_REFERENCE - 10.0 * (energy / total).log10());
         let peak = format!("{:.6}", measured.iter().map(|((_, peak), _)| *peak).fold(0.0, f64::max));
-        for (file, _, _) in tracks {
-            let mut audio = audio(file)?;
-            let tag = audio.primary_tag_mut().ok_or("no tags")?;
-            if tag.get_string(&ItemKey::ReplayGainAlbumGain) == Some(gain.as_str())
-                && tag.get_string(&ItemKey::ReplayGainAlbumPeak) == Some(peak.as_str())
-            {
-                continue;
-            }
-            tag.insert_text(ItemKey::ReplayGainAlbumGain, gain.clone());
-            tag.insert_text(ItemKey::ReplayGainAlbumPeak, peak.clone());
-            save(&audio, file)?;
+        // Only the files whose album gain changes are read whole and written.
+        for track in tracks.iter().filter(|track| track.album != [Some(gain.clone()), Some(peak.clone())]) {
+            let mut tags = Tags::open(&track.file)?;
+            tags.set(ItemKey::ReplayGainAlbumGain, gain.clone())?;
+            tags.set(ItemKey::ReplayGainAlbumPeak, peak.clone())?;
+            tags.save()?;
         }
     }
     Ok(())
-}
-
-/// The track gain and peak written into a file that has its other tags: `--replaygain` on a song from before it.
-pub(crate) fn write_track_gain(file: &Path) -> R<()> {
-    let (gain, peak) = track_gain(file, &Song::default());
-    if gain.is_empty() {
-        return Err("could not measure the loudness".into());
-    }
-    let mut audio = audio(file)?;
-    let tag = audio.primary_tag_mut().ok_or("no tags")?;
-    tag.insert_text(ItemKey::ReplayGainTrackGain, gain);
-    tag.insert_text(ItemKey::ReplayGainTrackPeak, peak);
-    save(&audio, file)
 }
 
 #[cfg(test)]

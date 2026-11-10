@@ -1,9 +1,9 @@
 //! Downloading songs: fetching the audio, tagging it, and putting it where the output template says.
 
 use crate::files::{audio_files, output_root, path, skip_path, write_folder_art};
-use crate::lyrics::{find_lyrics, write_lrc};
+use crate::lyrics::{find_lyrics, none_found, write_lrc, Answers};
 use crate::settings::{settings, Op, Overwrite};
-use crate::tags::{audio, source_url, write_tags};
+use crate::tags::{peek, source_url, write_tags};
 use crate::{deezer, log, search, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use sha1::{Digest, Sha1};
@@ -164,7 +164,7 @@ fn temp_id(song: &Song) -> String {
 
 /// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the downloaded
 /// (untagged) temporary file.
-fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
+fn download_audio(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     let id = temp_id(song);
     remove_temp_files(out, &id);
     let mut failure = None;
@@ -209,7 +209,7 @@ fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
             enrich(s);
             s.download_url = search::find(s).ok().and_then(|urls| urls.into_iter().next());
         }
-        s.lyrics = find_lyrics(s);
+        s.lyrics = find_lyrics(s, &Answers::default());
         return Ok(path(s));
     }
     if s.name.trim().is_empty() {
@@ -232,7 +232,7 @@ fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
         let root = output_root();
         let mut files = Vec::new();
         audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
-        let tagged = files.into_iter().filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
+        let tagged = files.into_iter().filter_map(|file| Some((source_url(peek(&file).ok()?.primary_tag()?)?, file)));
         tagged.collect()
     };
     let scanned = settings().scan_for_songs.then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
@@ -268,38 +268,43 @@ fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
     }
     // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
     if moved && s.lyrics.is_none() {
-        let tag = audio(&target).ok();
+        let tag = peek(&target).ok();
         let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
         s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
     // Lyrics sites are paced, so fetch them while the audio downloads.
-    let song = s.clone();
+    let (song, answers) = (&*s, Answers::default());
     let (lyrics, downloaded) = std::thread::scope(|scope| {
-        let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(&song)));
-        let downloaded =
-            (!exists || overwrite == Overwrite::Force || op == Op::Redownload).then(|| download(&song, &out));
-        (lyrics.join().ok().flatten(), downloaded)
+        let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(song, &answers)));
+        let download = !exists || overwrite == Overwrite::Force || op == Op::Redownload;
+        (lyrics.join().ok().flatten(), download.then(|| download_audio(song, &out)))
     });
     s.lyrics = lyrics;
-    match downloaded.transpose()? {
+    let none_found = none_found(s, &answers);
+    let length = match downloaded.transpose()? {
         // The audio is tagged before it gets its name: a file at `out` is a finished song, which later runs skip and
         // archive, so a failed or interrupted tagging must not leave an untagged one there.
         Some((url, temp)) => {
             s.download_url = Some(url);
-            if let Err(error) = write_tags(&temp, s).and_then(|()| Ok(fs::rename(&temp, &out)?)) {
+            let tagged = write_tags(&temp, s, none_found).and_then(|length| {
+                fs::rename(&temp, &out)?;
+                Ok(length)
+            });
+            if tagged.is_err() {
                 let _ = fs::remove_file(&temp);
-                return Err(error);
             }
+            let length = tagged?;
             if target != out && target.is_file() {
                 fs::remove_file(&target)?;
                 let _ = fs::remove_file(skip_path(&target));
             }
             target = out;
+            length
         }
-        None => write_tags(&target, s)?,
-    }
+        None => write_tags(&target, s, none_found)?,
+    };
     write_folder_art(&target, s)?;
-    write_lrc(&target, s)?;
+    write_lrc(&target, s, length, &answers)?;
     if settings().create_skip_file {
         fs::write(skip_path(&target), "")?;
     }
