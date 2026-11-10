@@ -8,11 +8,11 @@ use crate::gen::{json, runs, song, text};
 fn replies_of_any_shape_never_panic() {
     runs("replies", |rng| {
         let reply = json(rng, 5);
-        let _ = (release_date(&reply), cover(&reply), complete(&reply), Track::parse(&reply));
+        let _ = (release_date(&reply), cover(&reply), complete(&reply), track_song(&reply));
         let _ = Album::parse(&reply).disc_tracks(rng.below(5) as u64);
         // What is kept of a reply is read back as it was written.
-        let kept = serde_json::to_value((Album::parse(&reply), [Track::parse(&reply)])).unwrap();
-        let (album, _): (Album, Vec<Track>) = serde_json::from_value(kept.clone()).unwrap();
+        let kept = serde_json::to_value((Album::parse(&reply), [track_song(&reply)])).unwrap();
+        let (album, _): (Album, Vec<Song>) = serde_json::from_value(kept.clone()).unwrap();
         assert_eq!(serde_json::to_value(album).unwrap(), kept[0]);
     });
 }

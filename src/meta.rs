@@ -27,7 +27,7 @@ struct Mode {
 
 impl Mode {
     fn current() -> Self {
-        let replace = settings().overwrite.replaces();
+        let replace = settings().overwrite != "skip";
         Self { force: settings().force_update_metadata, redownload: settings().redownload, replace }
     }
 }

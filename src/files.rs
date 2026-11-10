@@ -140,10 +140,11 @@ fn artist_folder(file: &Path, s: &Song) -> Option<PathBuf> {
 }
 
 type Image = Arc<Vec<u8>>;
+type Slot = Arc<Mutex<Option<Image>>>;
 
 /// The last images, by URL: every song of an album gets the album's cover, so it is downloaded once, by the first
 /// song that asks, while the others wait for it. Only a few are kept: a cover is up to some megabytes.
-static IMAGES: Mutex<VecDeque<(String, Arc<Mutex<Option<Image>>>)>> = Mutex::new(VecDeque::new());
+static IMAGES: Mutex<VecDeque<(String, Slot)>> = Mutex::new(VecDeque::new());
 
 const IMAGES_KEPT: usize = 16;
 

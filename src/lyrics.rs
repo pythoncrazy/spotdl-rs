@@ -397,7 +397,7 @@ pub(crate) fn recheck(song: &Song, answers: &Answers) -> Check {
 /// nothing can be checked: no `.lrc` is written and none is removed.
 pub(crate) fn write_lrc(file: &Path, song: &Song, length: f64, answers: &Answers) -> R<()> {
     let sidecar = file.with_extension("lrc");
-    let replace = settings().overwrite.replaces();
+    let replace = settings().overwrite != "skip";
     if !settings().generate_lrc || (sidecar.exists() && !replace) {
         return Ok(());
     }

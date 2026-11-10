@@ -28,9 +28,12 @@ const ALIASES: [(&str, &str); 4] = [
     ("genius_access_token", "genius_token"),
     ("dont_filter_results", "filter_results"),
 ];
-const PROVIDERS: [(&str, &[&str]); 2] = [
+/// The settings that take only these values; another is an error, not a silent default.
+const CHOICES: [(&str, &[&str]); 4] = [
     ("audio_providers", &["youtube-music", "youtube", "soundcloud"]),
     ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
+    ("format", &["mp3", "flac", "ogg", "opus", "m4a", "wav"]),
+    ("overwrite", &["skip", "force", "metadata"]),
 ];
 
 /// What a run does. `Redownload` is the download of `meta --redownload`, which replaces the local file.
@@ -48,54 +51,15 @@ pub(crate) enum Op {
 const OPS: [(&str, Op); 5] =
     [("download", Op::Download), ("save", Op::Save), ("sync", Op::Sync), ("url", Op::Url), ("meta", Op::Meta)];
 
-/// What happens to a song whose file is there: it is left, downloaded again, or only tagged again.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Overwrite {
-    Skip,
-    Force,
-    Metadata,
-}
-
-impl Overwrite {
-    /// Whether the tags, lyrics and `.lrc` of a file that is there are written again.
-    pub fn replaces(self) -> bool {
-        self != Self::Skip
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Format {
-    Mp3,
-    Flac,
-    Ogg,
-    Opus,
-    M4a,
-    Wav,
-}
-
-impl Format {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mp3 => "mp3",
-            Self::Flac => "flac",
-            Self::Ogg => "ogg",
-            Self::Opus => "opus",
-            Self::M4a => "m4a",
-            Self::Wav => "wav",
-        }
-    }
-}
-
 /// Every setting. A key that is not a setting is an error on the command line and ignored in `config.json`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Settings {
     // Where songs go and how they are encoded.
     pub output: String,
-    pub format: Format,
+    pub format: String,
     pub bitrate: String,
-    pub overwrite: Overwrite,
+    /// `skip` leaves a song whose file is there, `force` downloads it again, `metadata` only tags it again.
+    pub overwrite: String,
     pub restrict: Option<String>,
     pub max_filename_length: u64,
     pub archive: Option<String>,
@@ -223,10 +187,10 @@ pub(crate) fn load(args: &[String]) -> R<(Op, Vec<String>)> {
         }
     }
     cli.into_iter().for_each(|(key, value)| cfg[key] = value);
-    for (key, known) in PROVIDERS {
-        let names = cfg[key].as_array().into_iter().flatten();
-        if let Some(name) = names.filter_map(Value::as_str).find(|name| !known.contains(name)) {
-            return Err(format!("unknown {} provider: {name}", key.trim_end_matches("_providers")).into());
+    for (key, known) in CHOICES {
+        let names = cfg[key].as_array().map_or(std::slice::from_ref(&cfg[key]), Vec::as_slice);
+        if let Some(name) = names.iter().filter_map(Value::as_str).find(|name| !known.contains(name)) {
+            return Err(format!("unknown {}: {name}", key.replace("_providers", " provider")).into());
         }
     }
     // `--m3u` as a flag, or `"m3u": true` in the file, is the default name.

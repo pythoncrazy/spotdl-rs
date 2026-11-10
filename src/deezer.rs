@@ -38,7 +38,8 @@ pub(crate) struct Track {
 
 /// Deezer's album of each Spotify album (none when Deezer does not have it), or how many times it failed and why.
 type Fetched<T> = Mutex<Result<T, (u8, String)>>;
-static ALBUMS: LazyLock<Mutex<HashMap<String, Arc<Fetched<Arc<Option<Album>>>>>>> = LazyLock::new(Default::default);
+type Found = Arc<Fetched<Arc<Option<Album>>>>;
+static ALBUMS: LazyLock<Mutex<HashMap<String, Found>>> = LazyLock::new(Default::default);
 /// Deezer allows 50 requests in 5 seconds.
 static DEEZER: Pace = Pace::new(110);
 
@@ -145,10 +146,7 @@ fn album(song: &Song) -> R<Option<Album>> {
         let spotify = spotify::album(&format!("spotify:album:{}", song.album_id))?;
         let lengths: HashMap<String, f64> = spotify
             .iter()
-            .map(|track| {
-                let position = format!("{}:{}", track.disc.unwrap_or(1), track.number.unwrap_or(0));
-                (position, track.length.unwrap_or_default() / 1000.0)
-            })
+            .map(|track| (format!("{}:{}", track.disc_number, track.track_number), track.duration))
             .collect();
         let explicit = spotify.iter().any(|track| track.explicit);
         let kind = if song.album_type == "compilation" { "compile" } else { &song.album_type };

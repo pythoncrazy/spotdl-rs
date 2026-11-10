@@ -241,50 +241,40 @@ impl Album {
     }
 }
 
-/// A web-player track, as far as a song is built from it.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct Track {
-    uri: String,
-    name: String,
-    artists: Vec<String>,
-    album_uri: String,
-    pub disc: Option<u64>,
-    pub number: Option<u64>,
-    /// In milliseconds.
-    pub length: Option<f64>,
-    pub explicit: bool,
-    playcount: Option<u64>,
-}
-
-impl Track {
-    fn parse(track: &Value) -> Self {
-        let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
-        let credits = [&track["firstArtist"]["items"], &track["otherArtists"]["items"], &track["artists"]["items"]];
-        let artists = credits.into_iter().flat_map(|items| items.as_array().into_iter().flatten());
-        Self {
-            uri: text(&track["uri"]),
-            name: text(&track["name"]),
-            artists: artists.filter_map(|artist| artist["profile"]["name"].as_str().map(String::from)).collect(),
-            album_uri: text(&track["albumOfTrack"]["uri"]),
-            disc: track["discNumber"].as_u64(),
-            number: track["trackNumber"].as_u64(),
-            length: ["duration", "trackDuration"].iter().find_map(|key| track[key]["totalMilliseconds"].as_f64()),
-            explicit: track["contentRating"]["label"] == "EXPLICIT",
-            playcount: track["playcount"].as_str().and_then(|count| count.parse().ok()),
-        }
+/// The song of a web-player track, without its album's fields but for the album's id. A track that cannot be played
+/// (a podcast episode, a local file) has no id.
+fn track_song(track: &Value) -> Song {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let credits = [&track["firstArtist"]["items"], &track["otherArtists"]["items"], &track["artists"]["items"]];
+    let artists = credits.into_iter().flat_map(|items| items.as_array().into_iter().flatten());
+    let artists: Vec<String> = artists.filter_map(|a| a["profile"]["name"].as_str().map(String::from)).collect();
+    let duration = ["duration", "trackDuration"].iter().find_map(|key| track[key]["totalMilliseconds"].as_f64());
+    let song_id = text(&track["uri"]).strip_prefix("spotify:track:").unwrap_or_default().to_string();
+    Song {
+        name: text(&track["name"]),
+        artist: artists.first().cloned().unwrap_or_default(),
+        artists,
+        disc_number: track["discNumber"].as_u64().unwrap_or(1) as u32,
+        duration: duration.unwrap_or_default() / 1000.0,
+        track_number: track["trackNumber"].as_u64().unwrap_or(1) as u32,
+        url: format!("https://open.spotify.com/track/{song_id}"),
+        song_id,
+        explicit: track["contentRating"]["label"] == "EXPLICIT",
+        popularity: track["playcount"].as_str().and_then(|count| count.parse().ok()),
+        album_id: id(track["albumOfTrack"]["uri"].as_str().unwrap_or_default()),
+        ..Song::default()
     }
 }
 
 /// An album and its tracks, asked once a week: every song's tags need its album, and Deezer's album is matched by the
 /// tracks.
-fn fetch_album(uri: &str) -> R<(Album, Vec<Track>)> {
-    cached(&format!("album:{uri}"), 7, || {
+fn fetch_album(uri: &str) -> R<(Album, Vec<Song>)> {
+    cached(&format!("songs:{uri}"), 7, || {
         let (meta, items) = pages("getAlbum", uri, "/data/albumUnion/tracksV2", 343)?;
         if !meta.is_object() {
             return Err("Spotify album metadata is missing".into());
         }
-        let track = |item: &Value| Track { album_uri: uri.into(), ..Track::parse(&item["track"]) };
+        let track = |item: &Value| Song { album_id: id(uri), ..track_song(&item["track"]) };
         Ok((Album::parse(&meta), items.unwrap_or_default().iter().map(track).collect()))
     })
 }
@@ -309,62 +299,53 @@ fn release_date(date: &Value) -> String {
     date["isoString"].as_str().and_then(|iso| iso.get(..known)).unwrap_or_default().into()
 }
 
-/// Songs from web-player tracks; `list` carries the playlist fields that every song shares.
-fn build(tracks: Vec<Track>, list: Song) -> R<Vec<Song>> {
-    let uris: HashSet<&str> =
-        tracks.iter().map(|track| track.album_uri.as_str()).filter(|uri| !uri.is_empty()).collect();
+/// The songs of web-player tracks with their albums' fields; `list` carries the playlist fields that every song shares.
+fn build(tracks: Vec<Song>, list: Song) -> R<Vec<Song>> {
+    let ids: HashSet<&str> = tracks.iter().map(|track| track.album_id.as_str()).filter(|id| !id.is_empty()).collect();
     let albums: HashMap<&str, Arc<Album>> =
-        uris.into_par_iter().map(|uri| Ok((uri, album_meta(uri)?))).collect::<R<_>>()?;
+        ids.into_par_iter().map(|id| Ok((id, album_meta(&format!("spotify:album:{id}"))?))).collect::<R<_>>()?;
     let (length, listed, unknown) = (tracks.len(), list.list_name.is_some(), Album::default());
-    let playable = tracks.iter().enumerate().filter(|(_, track)| track.uri.starts_with("spotify:track:"));
-    let song = |(index, track): (usize, &Track)| {
-        let album = albums.get(track.album_uri.as_str()).map_or(&unknown, |album| album.as_ref());
-        let song_id = id(&track.uri);
+    let playable = tracks.iter().enumerate().filter(|(_, track)| !track.song_id.is_empty());
+    let song = |(index, track): (usize, &Song)| {
+        let album = albums.get(track.album_id.as_str()).map_or(&unknown, |album| album.as_ref());
         Song {
-            name: track.name.clone(),
-            artist: track.artists.first().cloned().unwrap_or_default(),
-            artists: track.artists.clone(),
             album_artist: album.artist.clone(),
             artist_id: album.artist_id.clone(),
-            disc_number: track.disc.unwrap_or(1) as u32,
             disc_count: album.discs.unwrap_or(1) as u32,
             album_name: album.name.clone(),
-            duration: track.length.unwrap_or_default() / 1000.0,
             year: album.date.get(..4).and_then(|year| year.parse().ok()).unwrap_or_default(),
             date: album.date.clone(),
-            track_number: track.number.unwrap_or(1) as u32,
-            tracks_count: album.disc_tracks(track.disc.unwrap_or(1)),
-            url: format!("https://open.spotify.com/track/{song_id}"),
-            song_id,
-            explicit: track.explicit,
+            tracks_count: album.disc_tracks(track.disc_number.into()),
             publisher: album.label.clone(),
             cover_url: album.cover.clone(),
             copyright_text: album.copyright.clone(),
-            popularity: track.playcount,
-            album_id: id(&track.album_uri),
             album_type: album.kind.clone(),
+            list_name: list.list_name.clone(),
+            list_url: list.list_url.clone(),
             list_position: listed.then_some(index + 1),
             list_length: listed.then_some(length),
-            ..list.clone()
+            extra: list.extra.clone(),
+            ..track.clone()
         }
     };
     Ok(playable.map(song).collect())
 }
 
 /// The tracks of an album.
-pub(crate) fn album(uri: &str) -> R<Vec<Track>> {
+pub(crate) fn album(uri: &str) -> R<Vec<Song>> {
     let (album, tracks) = fetch_album(uri)?;
     listed(remember(uri, album).tracks.map(|_| tracks), uri)
 }
 
 /// `getTrack` has no disc number; on multi-disc albums the album's track list has it.
-fn track(uri: &str) -> R<Track> {
+fn track(uri: &str) -> R<Song> {
     let days = if settings().use_cache_file { u64::MAX } else { 7 };
-    let fetch = || Ok(Track::parse(&query("getTrack", json!({"uri": uri}))?["data"]["trackUnion"]));
-    let mut track: Track = cached(&format!("track:{uri}"), days, fetch)?;
-    if !track.album_uri.is_empty() && album_meta(&track.album_uri)?.discs.unwrap_or(1) > 1 {
-        if let Some(listed) = album(&track.album_uri)?.into_iter().find(|listed| listed.uri == uri) {
-            track.disc = listed.disc;
+    let fetch = || Ok(track_song(&query("getTrack", json!({"uri": uri}))?["data"]["trackUnion"]));
+    let mut track: Song = cached(&format!("song:{uri}"), days, fetch)?;
+    let album_uri = format!("spotify:album:{}", track.album_id);
+    if !track.album_id.is_empty() && album_meta(&album_uri)?.discs.unwrap_or(1) > 1 {
+        if let Some(listed) = album(&album_uri)?.into_iter().find(|listed| listed.song_id == track.song_id) {
+            track.disc_number = listed.disc_number;
         }
     }
     Ok(track)
@@ -454,7 +435,7 @@ fn playlist(uri: &str) -> R<Vec<Song>> {
         },
         ..Song::default()
     };
-    build(items.iter().map(|item| Track::parse(&item["itemV2"]["data"])).collect(), list)
+    build(items.iter().map(|item| track_song(&item["itemV2"]["data"])).collect(), list)
 }
 
 /// The first Spotify result for free text; `album:`, `playlist:` and `artist:` pick the result type.

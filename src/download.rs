@@ -2,7 +2,7 @@
 
 use crate::files::{audio_files, output_root, path, skip_path, write_folder_art};
 use crate::lyrics::{find_lyrics, none_found, write_lrc, Answers};
-use crate::settings::{settings, Op, Overwrite};
+use crate::settings::{settings, Op};
 use crate::tags::{peek, source_url, write_tags};
 use crate::{deezer, log, search, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
@@ -253,10 +253,10 @@ fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
         ARCHIVED.get_or_init(read).contains(&s.url)
     });
     let skip = settings().respect_skip_file && skip_path(&target).exists();
-    let (exists, overwrite) = (target.is_file(), settings().overwrite);
+    let (exists, overwrite) = (target.is_file(), settings().overwrite.as_str());
     // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
     let moved = exists && run.moved.contains(&target);
-    let keep = archived || skip || exists && overwrite == Overwrite::Skip && !settings().force_update_metadata;
+    let keep = archived || skip || exists && overwrite == "skip" && !settings().force_update_metadata;
     if op != Op::Redownload && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
@@ -276,7 +276,7 @@ fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
     let (song, answers) = (&*s, Answers::default());
     let (lyrics, downloaded) = std::thread::scope(|scope| {
         let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(song, &answers)));
-        let download = !exists || overwrite == Overwrite::Force || op == Op::Redownload;
+        let download = !exists || overwrite == "force" || op == Op::Redownload;
         (lyrics.join().ok().flatten(), download.then(|| download_audio(song, &out)))
     });
     s.lyrics = lyrics;
