@@ -9,7 +9,10 @@ fn lrclib_replies_of_any_shape_give_lyrics_or_nothing() {
         let s = song(rng);
         let tracks: Vec<_> = (0..rng.below(4)).map(|_| json(rng, 3)).collect();
         let versions = lrclib_lyrics(&s, &tracks);
-        assert!(versions.lyrics.iter().all(|lyrics| !lyrics.trim().is_empty()));
+        assert!(versions
+            .lyrics
+            .iter()
+            .all(|lyrics| !lyrics.trim().is_empty()));
         let _ = versions.pick(Some(&lyrics(rng)));
     });
 }

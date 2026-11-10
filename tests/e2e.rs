@@ -1,6 +1,7 @@
-//! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer services.
-//! The download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to; enable it with
-//! `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the yt-dlp binary).
+//! End-to-end tests: each runs the built binary against the live Spotify, YouTube Music and Deezer
+//! services. The download test also needs yt-dlp, FFmpeg and a network YouTube serves audio to;
+//! enable it with `SPOTDL_E2E_DOWNLOAD=1` (and `SPOTDL_E2E_YT_DLP=/path/to/yt-dlp` to pick the
+//! yt-dlp binary).
 use lofty::{
     config::WriteOptions,
     picture::{MimeType, Picture, PictureType},
@@ -30,7 +31,11 @@ fn dir(name: &str) -> PathBuf {
 
 fn spotdl(dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_spotdl"));
-    command.current_dir(dir).env("HOME", dir).args(args).args(["--lyrics-providers="]);
+    command
+        .current_dir(dir)
+        .env("HOME", dir)
+        .args(args)
+        .args(["--lyrics-providers="]);
     if let Ok(path) = std::env::var("SPOTDL_E2E_YT_DLP") {
         command.args(["--yt-dlp", &path]);
     }
@@ -38,7 +43,11 @@ fn spotdl(dir: &Path, args: &[&str]) -> Output {
 }
 
 fn ok(output: Output) -> String {
-    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.status.success(), "{text}");
     text
 }
@@ -60,29 +69,55 @@ fn json_file(path: &Path) -> Value {
 fn save_keeps_pins_and_lists_every_song() {
     let dir = dir("save");
     let file = dir.join("donda.spotdl");
-    ok(spotdl(&dir, &["save", DONDA, "--save-file", file.to_str().unwrap()]));
+    ok(spotdl(
+        &dir,
+        &["save", DONDA, "--save-file", file.to_str().unwrap()],
+    ));
     let songs = json_file(&file);
     let songs = songs.as_array().unwrap();
     assert_eq!(songs.len(), 27);
-    let numbers: Vec<u64> = songs.iter().map(|song| song["track_number"].as_u64().unwrap()).collect();
+    let numbers: Vec<u64> = songs
+        .iter()
+        .map(|song| song["track_number"].as_u64().unwrap())
+        .collect();
     assert_eq!(numbers, (1..=27).collect::<Vec<_>>());
     for song in songs {
         assert_eq!(song["album_name"], "Donda");
-        assert!(!song["name"].as_str().unwrap().is_empty() && song["duration"].as_f64().unwrap() > 0.0);
-        assert!(!song["artists"].as_array().unwrap().is_empty() && song["artists"][0] == song["artist"]);
+        assert!(
+            !song["name"].as_str().unwrap().is_empty() && song["duration"].as_f64().unwrap() > 0.0
+        );
+        assert!(
+            !song["artists"].as_array().unwrap().is_empty() && song["artists"][0] == song["artist"]
+        );
     }
 
-    // The same song pinned to a video after the album: one entry, with the pin, but listed twice in the m3u.
+    // The same song pinned to a video after the album: one entry, with the pin, but listed twice in
+    // the m3u.
     let url = songs[4]["url"].as_str().unwrap();
     let pinned = format!("{VIDEO}|{url}");
-    ok(spotdl(&dir, &["save", DONDA, &pinned, "--save-file", file.to_str().unwrap(), "--m3u"]));
+    ok(spotdl(
+        &dir,
+        &[
+            "save",
+            DONDA,
+            &pinned,
+            "--save-file",
+            file.to_str().unwrap(),
+            "--m3u",
+        ],
+    ));
     let songs = json_file(&file);
     let songs = songs.as_array().unwrap();
     assert_eq!(songs.len(), 27);
     let song = songs.iter().find(|song| song["url"] == url).unwrap();
     assert_eq!(song["download_url"], VIDEO);
     let list = fs::read_to_string(dir.join("Donda.m3u8")).unwrap();
-    assert_eq!(list.lines().filter(|line| line.starts_with("#EXTINF")).count(), 28);
+    assert_eq!(
+        list.lines()
+            .filter(|line| line.starts_with("#EXTINF"))
+            .count(),
+        28
+    );
 }
 
 #[test]
@@ -90,37 +125,90 @@ fn artist_keeps_albums_and_eps_whole_and_prefers_deluxe_editions() {
     let dir = dir("artist");
     let file = dir.join("kendrick.spotdl");
     let kendrick = "https://open.spotify.com/artist/2YZyLoL8N0Wb9xBt1NhZWg";
-    ok(spotdl(&dir, &["save", kendrick, "--save-file", file.to_str().unwrap()]));
+    ok(spotdl(
+        &dir,
+        &["save", kendrick, "--save-file", file.to_str().unwrap()],
+    ));
     let songs = json_file(&file);
-    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
+    let album = |name: &str| {
+        songs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|song| song["album_name"] == name)
+            .count()
+    };
     // An album keeps all its songs; a reissue under another title adds only the songs that are new.
     assert_eq!(album("DAMN."), 14);
     assert_eq!(album("DAMN. COLLECTORS EDITION."), 0);
     // A deluxe edition that has the standard edition's songs replaces it and is kept whole.
     assert_eq!(album("good kid, m.A.A.d city (Deluxe)"), 17);
     assert_eq!(album("good kid, m.A.A.d city"), 0);
-    // Its track totals count each disc's tracks, as its track numbers do: 12 songs, then 5 bonus songs.
+    // Its track totals count each disc's tracks, as its track numbers do: 12 songs, then 5 bonus
+    // songs.
     let totals: HashSet<(u64, u64)> = (songs.as_array().unwrap().iter())
         .filter(|song| song["album_name"] == "good kid, m.A.A.d city (Deluxe)")
-        .map(|song| (song["disc_number"].as_u64().unwrap(), song["tracks_count"].as_u64().unwrap()))
+        .map(|song| {
+            (
+                song["disc_number"].as_u64().unwrap(),
+                song["tracks_count"].as_u64().unwrap(),
+            )
+        })
         .collect();
     assert_eq!(totals, HashSet::from([(1, 12), (2, 5)]));
 
-    // The anniversary edition is kept whole, with its "Intro": an "Intro" on another album is another song.
+    // The anniversary edition is kept whole, with its "Intro": an "Intro" on another album is
+    // another song.
     let file = dir.join("cole.spotdl");
     let cole = "https://open.spotify.com/artist/6l3HvQ5sa6mXTsMTB19rO5";
-    ok(spotdl(&dir, &["save", cole, "--save-file", file.to_str().unwrap(), "--audio-providers="]));
+    ok(spotdl(
+        &dir,
+        &[
+            "save",
+            cole,
+            "--save-file",
+            file.to_str().unwrap(),
+            "--audio-providers=",
+        ],
+    ));
     let songs = json_file(&file);
-    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
-    assert_eq!(album("2014 Forest Hills Drive (10 Year Anniversary Edition)"), 21);
+    let album = |name: &str| {
+        songs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|song| song["album_name"] == name)
+            .count()
+    };
+    assert_eq!(
+        album("2014 Forest Hills Drive (10 Year Anniversary Edition)"),
+        21
+    );
     assert_eq!(album("2014 Forest Hills Drive"), 0);
 
-    // An EP keeps the songs that are also on an album: "She's A Riot" is on the EP and on "Learn To Exist".
+    // An EP keeps the songs that are also on an album: "She's A Riot" is on the EP and on "Learn To
+    // Exist".
     let file = dir.join("giants.spotdl");
     let giants = "https://open.spotify.com/artist/6wFwvxJkurQPU2UdeD4qVt";
-    ok(spotdl(&dir, &["save", giants, "--save-file", file.to_str().unwrap(), "--audio-providers="]));
+    ok(spotdl(
+        &dir,
+        &[
+            "save",
+            giants,
+            "--save-file",
+            file.to_str().unwrap(),
+            "--audio-providers=",
+        ],
+    ));
     let songs = json_file(&file);
-    let album = |name: &str| songs.as_array().unwrap().iter().filter(|song| song["album_name"] == name).count();
+    let album = |name: &str| {
+        songs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|song| song["album_name"] == name)
+            .count()
+    };
     assert_eq!(album("She's A Riot"), 5);
     assert_eq!(album("Learn To Exist"), 12);
 }
@@ -132,19 +220,44 @@ fn url_finds_official_audio() {
         (ELEANOR, ""),
         ("https://open.spotify.com/track/3AfT3nmctE9nlndrFgshXH", ""),
         ("https://open.spotify.com/track/0u2P5u6lvoDfwTYjAADbn4", ""),
-        // "Lil' Homies - Album Version (Edited)": the suffix is a version note, not part of the title.
+        // "Lil' Homies - Album Version (Edited)": the suffix is a version note, not part of the
+        // title.
         ("https://open.spotify.com/track/1YTfq6avUGOxlJ1GluNIqj", ""),
-        // "Free As A Bird (2025 Mix)": only the search by Deezer's ISRC finds this mix, not the 1995 one.
-        ("https://open.spotify.com/track/0Btrmt27yXVTrcXbx1mTxG", "(2025 mix)"),
+        // "Free As A Bird (2025 Mix)": only the search by Deezer's ISRC finds this mix, not the
+        // 1995 one.
+        (
+            "https://open.spotify.com/track/0Btrmt27yXVTrcXbx1mTxG",
+            "(2025 mix)",
+        ),
     ] {
         let url = ok(spotdl(&dir, &["url", track]));
         let url = url.lines().next().unwrap();
-        assert!(url.starts_with("https://music.youtube.com/watch?v="), "{track}: {url}");
+        assert!(
+            url.starts_with("https://music.youtube.com/watch?v="),
+            "{track}: {url}"
+        );
         let oembed = format!("https://www.youtube.com/oembed?format=json&url={url}");
-        let video: Value = ureq::get(&oembed).call().unwrap().into_body().read_json().unwrap();
+        let video: Value = ureq::get(&oembed)
+            .call()
+            .unwrap()
+            .into_body()
+            .read_json()
+            .unwrap();
         let title = video["title"].as_str().unwrap().to_lowercase();
-        let altered = ["karaoke", "cover", "live", "nightcore", "slowed", "sped up", "8d", "instrumental"];
-        assert!(!altered.iter().any(|word| title.contains(word)) && title.contains(version), "{track}: {title}");
+        let altered = [
+            "karaoke",
+            "cover",
+            "live",
+            "nightcore",
+            "slowed",
+            "sped up",
+            "8d",
+            "instrumental",
+        ];
+        assert!(
+            !altered.iter().any(|word| title.contains(word)) && title.contains(version),
+            "{track}: {title}"
+        );
     }
 }
 
@@ -160,7 +273,18 @@ fn sync_moves_and_removes_files() {
     }
     let state = dir.join("s.spotdl");
     let state_path = state.to_str().unwrap();
-    ok(spotdl(&dir, &["sync", ELEANOR, TAXMAN, "--save-file", state_path, "--output", &output]));
+    ok(spotdl(
+        &dir,
+        &[
+            "sync",
+            ELEANOR,
+            TAXMAN,
+            "--save-file",
+            state_path,
+            "--output",
+            &output,
+        ],
+    ));
     let mut saved = json_file(&state);
     assert_eq!(saved["songs"].as_array().unwrap().len(), 2);
     saved["query"] = json!([ELEANOR]);
@@ -170,8 +294,9 @@ fn sync_moves_and_removes_files() {
     assert!(!file(TAXMAN).exists() && !file(TAXMAN).with_extension("opus.skip").exists());
 }
 
-/// A song whose Spotify URL changed (a re-released album gives its songs new IDs) but whose file did not keeps
-/// its file: it is not deleted before a download that can fail. Needs no network: the songs come from files.
+/// A song whose Spotify URL changed (a re-released album gives its songs new IDs) but whose file
+/// did not keeps its file: it is not deleted before a download that can fail. Needs no network: the
+/// songs come from files.
 #[test]
 fn sync_keeps_the_files_of_songs_whose_url_changed() {
     let dir = dir("relink");
@@ -186,17 +311,25 @@ fn sync_keeps_the_files_of_songs_whose_url_changed() {
     };
     fs::write(dir.join("new.spotdl"), songs("2").to_string()).unwrap();
     let state = dir.join("s.spotdl");
-    fs::write(&state, json!({"type": "sync", "query": ["new.spotdl"], "songs": songs("1")}).to_string()).unwrap();
+    fs::write(
+        &state,
+        json!({"type": "sync", "query": ["new.spotdl"], "songs": songs("1")}).to_string(),
+    )
+    .unwrap();
     for name in ["A", "B"] {
         fs::write(dir.join(format!("Art - {name}.opus")), "").unwrap();
     }
     // A download would fail.
-    ok(spotdl(&dir, &["sync", state.to_str().unwrap(), "--yt-dlp", "false"]));
+    ok(spotdl(
+        &dir,
+        &["sync", state.to_str().unwrap(), "--yt-dlp", "false"],
+    ));
     assert!(dir.join("Art - A.opus").exists() && dir.join("Art - B.opus").exists());
 }
 
-/// A renamed album's songs move with their `.lrc` files into its new folder, which does not exist yet, and get
-/// its name in their tags; the old folder, left with only its cover, goes. Needs no download.
+/// A renamed album's songs move with their `.lrc` files into its new folder, which does not exist
+/// yet, and get its name in their tags; the old folder, left with only its cover, goes. Needs no
+/// download.
 #[test]
 fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
     let dir = dir("move");
@@ -205,7 +338,11 @@ fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
             "duration": 10, "year": 2020, "date": "2020", "track_number": 1, "tracks_count": 1,
             "url": format!("https://open.spotify.com/track/{name}"), "download_url": VIDEO})
     };
-    fs::write(dir.join("new.spotdl"), json!([song("A", "Alb (Remastered)")]).to_string()).unwrap();
+    fs::write(
+        dir.join("new.spotdl"),
+        json!([song("A", "Alb (Remastered)")]).to_string(),
+    )
+    .unwrap();
     let state = dir.join("s.spotdl");
     let old = json!({"type": "sync", "query": ["new.spotdl"], "songs": [song("A", "Alb"), song("B", "Alb")]});
     fs::write(&state, old.to_string()).unwrap();
@@ -216,22 +353,41 @@ fn sync_moves_songs_into_a_new_folder_and_tags_them_again() {
     }
     // The lyrics in its tags stay: they are not looked for again.
     let mut tagged = lofty::read_from_path(old.join("01 - A.opus")).unwrap();
-    tagged.primary_tag_mut().unwrap().insert_text(ItemKey::Lyrics, "la".into());
-    tagged.save_to_path(old.join("01 - A.opus"), WriteOptions::default()).unwrap();
+    tagged
+        .primary_tag_mut()
+        .unwrap()
+        .insert_text(ItemKey::Lyrics, "la".into());
+    tagged
+        .save_to_path(old.join("01 - A.opus"), WriteOptions::default())
+        .unwrap();
     fs::write(old.join("01 - A.lrc"), "[00:01.00]la").unwrap();
     fs::write(old.join("cover.jpg"), "").unwrap();
     let output = "{album-artist}/{album}/{track-number} - {title}.{output-ext}";
     // A download would fail.
-    ok(spotdl(&dir, &["sync", state.to_str().unwrap(), "--yt-dlp", "false", "--output", output]));
+    ok(spotdl(
+        &dir,
+        &[
+            "sync",
+            state.to_str().unwrap(),
+            "--yt-dlp",
+            "false",
+            "--output",
+            output,
+        ],
+    ));
     assert!(new.join("01 - A.lrc").exists() && !old.exists());
     assert_eq!(lyrics(&new.join("01 - A.opus")).as_deref(), Some("la"));
     let tagged = lofty::read_from_path(new.join("01 - A.opus")).unwrap();
-    assert_eq!(tagged.primary_tag().unwrap().album().as_deref(), Some("Alb (Remastered)"));
+    assert_eq!(
+        tagged.primary_tag().unwrap().album().as_deref(),
+        Some("Alb (Remastered)")
+    );
 }
 
-/// A song whose tags cannot be written leaves no file at its path, which a later run would skip and archive as
-/// done, and an interrupted download's temporary files go when the song is downloaded again. Needs no download:
-/// a fake yt-dlp gives first audio that cannot be tagged, then a silent song.
+/// A song whose tags cannot be written leaves no file at its path, which a later run would skip and
+/// archive as done, and an interrupted download's temporary files go when the song is downloaded
+/// again. Needs no download: a fake yt-dlp gives first audio that cannot be tagged, then a silent
+/// song.
 #[test]
 fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
     let dir = dir("untagged");
@@ -244,14 +400,28 @@ fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
     let fake = |audio: &str| {
         let script = format!("#!/bin/sh\nfor a; do o=$t; t=$a; done\n{audio}\n");
         fs::write(&yt_dlp, script).unwrap();
-        Command::new("chmod").arg("+x").arg(&yt_dlp).status().unwrap();
+        Command::new("chmod")
+            .arg("+x")
+            .arg(&yt_dlp)
+            .status()
+            .unwrap();
     };
     let (file, archive) = (dir.join("Art - A.opus"), dir.join("archive.txt"));
-    let stale = [dir.join("Art - A.A.converted.opus"), dir.join("Art - A.A.webm.part")];
+    let stale = [
+        dir.join("Art - A.A.converted.opus"),
+        dir.join("Art - A.A.webm.part"),
+    ];
     for stale in &stale {
         fs::write(stale, "").unwrap();
     }
-    let args = ["download", "a.spotdl", "--yt-dlp", yt_dlp.to_str().unwrap(), "--archive", "archive.txt"];
+    let args = [
+        "download",
+        "a.spotdl",
+        "--yt-dlp",
+        yt_dlp.to_str().unwrap(),
+        "--archive",
+        "archive.txt",
+    ];
     fake(r#"f=$(echo "$o" | sed 's/%(ext)s/opus/'); echo garbage > "$f"; echo "NA $f""#);
     for _ in 0..2 {
         fails_with(spotdl(&dir, &args), "1 failed");
@@ -265,13 +435,33 @@ fn a_song_that_cannot_be_tagged_is_not_left_untagged() {
     ok(spotdl(&dir, &args));
     let tagged = lofty::read_from_path(&file).unwrap();
     assert_eq!(tagged.primary_tag().unwrap().title().as_deref(), Some("A"));
-    assert_eq!(fs::read_to_string(&archive).unwrap().trim(), "https://open.spotify.com/track/A");
-    let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-    assert!(left.iter().all(|name| !name.to_string_lossy().starts_with("Art - A.A.")), "{left:?}");
-    // `--bitrate auto` encodes at the source's bitrate, not LAME's default (64k for this mono song).
+    assert_eq!(
+        fs::read_to_string(&archive).unwrap().trim(),
+        "https://open.spotify.com/track/A"
+    );
+    let left: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        left.iter()
+            .all(|name| !name.to_string_lossy().starts_with("Art - A.A.")),
+        "{left:?}"
+    );
+    // `--bitrate auto` encodes at the source's bitrate, not LAME's default (64k for this mono
+    // song).
     ok(spotdl(
         &dir,
-        &["download", "a.spotdl", "--yt-dlp", yt_dlp.to_str().unwrap(), "--format", "mp3", "--bitrate", "auto"],
+        &[
+            "download",
+            "a.spotdl",
+            "--yt-dlp",
+            yt_dlp.to_str().unwrap(),
+            "--format",
+            "mp3",
+            "--bitrate",
+            "auto",
+        ],
     ));
     let mp3 = lofty::read_from_path(dir.join("Art - A.mp3")).unwrap();
     assert_eq!(mp3.properties().audio_bitrate(), Some(160));
@@ -291,30 +481,64 @@ fn a_missing_yt_dlp_is_named_and_failed_songs_leave_no_folders() {
         "--output",
         "{artist}/{album}/{title}.{output-ext}",
     ];
-    fails_with(spotdl(&dir, &args), "cannot run /nonexistent/yt-dlp: no such file");
+    fails_with(
+        spotdl(&dir, &args),
+        "cannot run /nonexistent/yt-dlp: no such file",
+    );
     assert!(!dir.join("Art").exists());
 }
 
 #[test]
 fn rejects_bad_options_and_unsafe_paths() {
     let dir = dir("errors");
-    fails_with(spotdl(&dir, &["--not-an-option"]), "unknown option --not-an-option");
-    fails_with(spotdl(&dir, &["x", "--config", "/nonexistent"]), "config file not found");
-    fails_with(spotdl(&dir, &["x", "--format"]), "missing value for --format");
-    fails_with(spotdl(&dir, &["x", "--audio", "napster"]), "unknown audio provider");
+    fails_with(
+        spotdl(&dir, &["--not-an-option"]),
+        "unknown option --not-an-option",
+    );
+    fails_with(
+        spotdl(&dir, &["x", "--config", "/nonexistent"]),
+        "config file not found",
+    );
+    fails_with(
+        spotdl(&dir, &["x", "--format"]),
+        "missing value for --format",
+    );
+    fails_with(
+        spotdl(&dir, &["x", "--audio", "napster"]),
+        "unknown audio provider",
+    );
 
     let songs = json!([{"name": "．．／．．／etc", "artist": "A", "artists": ["A"], "album_name": "Album", "url": "https://open.spotify.com/track/0123456789012345678901"}]);
     fs::write(dir.join("local.spotdl"), songs.to_string()).unwrap();
     let output = format!("{}/safe/{{title}}.{{output-ext}}", dir.display());
     let text = ok(spotdl(
         &dir,
-        &["save", "local.spotdl", "--save-file", "-", "--restrict", "ascii", "--output", &output, "--m3u"],
+        &[
+            "save",
+            "local.spotdl",
+            "--save-file",
+            "-",
+            "--restrict",
+            "ascii",
+            "--output",
+            &output,
+            "--m3u",
+        ],
     ));
-    assert!(text.contains(&format!("{}/safe/....etc.opus", dir.display())), "{text}");
+    assert!(
+        text.contains(&format!("{}/safe/....etc.opus", dir.display())),
+        "{text}"
+    );
     let list = fs::read_to_string(dir.join("Album.m3u8")).unwrap();
     assert!(list.contains("\nsafe/....etc.opus\n"), "{list}");
-    let text = ok(spotdl(&dir, &["save", "local.spotdl", "--save-file", "-", "--output", ""]));
-    assert!(text.contains("A - ．．／．．／etc: A - ．．／．．／etc.opus"), "{text}");
+    let text = ok(spotdl(
+        &dir,
+        &["save", "local.spotdl", "--save-file", "-", "--output", ""],
+    ));
+    assert!(
+        text.contains("A - ．．／．．／etc: A - ．．／．．／etc.opus"),
+        "{text}"
+    );
 
     // Multi-disc albums number tracks "2-07", so two discs' track 7 do not share a path.
     let song = |disc: u32, count: u32| {
@@ -322,10 +546,21 @@ fn rejects_bad_options_and_unsafe_paths() {
         "album_name": "Album", "track_number": 7, "disc_number": disc, "disc_count": count,
         "url": format!("https://open.spotify.com/track/01234567890123456789{disc}{count}")})
     };
-    fs::write(dir.join("discs.spotdl"), json!([song(1, 2), song(2, 2), song(1, 1)]).to_string()).unwrap();
+    fs::write(
+        dir.join("discs.spotdl"),
+        json!([song(1, 2), song(2, 2), song(1, 1)]).to_string(),
+    )
+    .unwrap();
     let text = ok(spotdl(
         &dir,
-        &["save", "discs.spotdl", "--save-file", "-", "--output", "{title} {disc-track-number}.{output-ext}"],
+        &[
+            "save",
+            "discs.spotdl",
+            "--save-file",
+            "-",
+            "--output",
+            "{title} {disc-track-number}.{output-ext}",
+        ],
     ));
     for line in ["S12 1-07.opus", "S22 2-07.opus", "S11 07.opus"] {
         assert!(text.contains(line), "{line} not in {text}");
@@ -338,17 +573,45 @@ fn downloads_tags_and_repairs_metadata() {
         return eprintln!("skipped: set SPOTDL_E2E_DOWNLOAD=1 to download from YouTube");
     }
     let dir = dir("download");
-    let output = format!("{}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}", dir.display());
+    let output = format!(
+        "{}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}",
+        dir.display()
+    );
     let (archive, list) = (dir.join("archive.txt"), dir.join("list.m3u8"));
     let pinned = format!("{VIDEO}|{ELEANOR}");
-    let args = ["download", &pinned, TAXMAN, "--output", &output, "--archive", archive.to_str().unwrap()];
-    let args = [&args[..], &["--m3u", list.to_str().unwrap(), "--create-skip-file"]].concat();
+    let args = [
+        "download",
+        &pinned,
+        TAXMAN,
+        "--output",
+        &output,
+        "--archive",
+        archive.to_str().unwrap(),
+    ];
+    let args = [
+        &args[..],
+        &["--m3u", list.to_str().unwrap(), "--create-skip-file"],
+    ]
+    .concat();
     ok(spotdl(&dir, &args));
-    let albums = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.is_dir());
-    let files: Vec<PathBuf> =
-        albums.flat_map(|album| fs::read_dir(album).unwrap().map(|entry| entry.unwrap().path())).collect();
-    let audio: Vec<&PathBuf> =
-        files.iter().filter(|file| file.extension().is_some_and(|extension| extension == "opus")).collect();
+    let albums = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir());
+    let files: Vec<PathBuf> = albums
+        .flat_map(|album| {
+            fs::read_dir(album)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+        })
+        .collect();
+    let audio: Vec<&PathBuf> = files
+        .iter()
+        .filter(|file| {
+            file.extension()
+                .is_some_and(|extension| extension == "opus")
+        })
+        .collect();
     assert_eq!(audio.len(), 2, "{files:?}");
     for file in &audio {
         let tagged = lofty::read_from_path(file).unwrap();
@@ -358,13 +621,25 @@ fn downloads_tags_and_repairs_metadata() {
         if url == ELEANOR {
             assert_eq!(tag.comment().as_deref(), Some(VIDEO));
         }
-        assert!(tag.title().is_some() && tag.album().is_some_and(|album| album.contains("Revolver")));
+        assert!(
+            tag.title().is_some() && tag.album().is_some_and(|album| album.contains("Revolver"))
+        );
         assert!(!tag.pictures().is_empty() && skip(file).exists());
-        assert!(tag.genre().is_some_and(|genre| !genre.is_empty()), "{file:?} has no genre");
+        assert!(
+            tag.genre().is_some_and(|genre| !genre.is_empty()),
+            "{file:?} has no genre"
+        );
         assert!(tagged.properties().duration().as_secs() > 100);
     }
     assert_eq!(fs::read_to_string(&archive).unwrap().lines().count(), 2);
-    assert_eq!(fs::read_to_string(&list).unwrap().lines().filter(|line| line.ends_with(".opus")).count(), 2);
+    assert_eq!(
+        fs::read_to_string(&list)
+            .unwrap()
+            .lines()
+            .filter(|line| line.ends_with(".opus"))
+            .count(),
+        2
+    );
 
     let modified = |file: &Path| fs::metadata(file).unwrap().modified().unwrap();
     let before = modified(audio[0]);
@@ -373,17 +648,46 @@ fn downloads_tags_and_repairs_metadata() {
 
     let mut tagged = lofty::read_from_path(audio[0]).unwrap();
     let title = tagged.primary_tag().unwrap().title().unwrap().to_string();
-    tagged.primary_tag_mut().unwrap().remove_key(&ItemKey::TrackTitle);
-    tagged.save_to_path(audio[0], WriteOptions::default()).unwrap();
+    tagged
+        .primary_tag_mut()
+        .unwrap()
+        .remove_key(&ItemKey::TrackTitle);
+    tagged
+        .save_to_path(audio[0], WriteOptions::default())
+        .unwrap();
     ok(spotdl(&dir, &["meta", audio[0].to_str().unwrap()]));
-    assert_eq!(lofty::read_from_path(audio[0]).unwrap().primary_tag().unwrap().title().unwrap(), title);
+    assert_eq!(
+        lofty::read_from_path(audio[0])
+            .unwrap()
+            .primary_tag()
+            .unwrap()
+            .title()
+            .unwrap(),
+        title
+    );
 }
 
-/// A 10-second silent song with only a title, an artist and an album: no Spotify song is that short.
+/// A 10-second silent song with only a title, an artist and an album: no Spotify song is that
+/// short.
 fn local_song(dir: &Path) -> PathBuf {
     let file = dir.join("song.opus");
-    let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "10"];
-    let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+    let ffmpeg = [
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=mono",
+        "-t",
+        "10",
+    ];
+    let status = Command::new("ffmpeg")
+        .args(ffmpeg)
+        .args(["-c:a", "libopus"])
+        .arg(&file)
+        .status()
+        .unwrap();
     assert!(status.success());
     let mut tagged = lofty::read_from_path(&file).unwrap();
     let mut tag = Tag::new(tagged.primary_tag_type());
@@ -397,12 +701,31 @@ fn local_song(dir: &Path) -> PathBuf {
 
 fn meta(dir: &Path, file: &Path, args: &[&str]) -> String {
     let mut meta = Command::new(env!("CARGO_BIN_EXE_spotdl"));
-    let args = [&["meta", file.to_str().unwrap(), "--lyrics-providers", "genius"], args].concat();
-    ok(meta.current_dir(dir).env("HOME", dir).args(args).output().unwrap())
+    let args = [
+        &[
+            "meta",
+            file.to_str().unwrap(),
+            "--lyrics-providers",
+            "genius",
+        ],
+        args,
+    ]
+    .concat();
+    ok(meta
+        .current_dir(dir)
+        .env("HOME", dir)
+        .args(args)
+        .output()
+        .unwrap())
 }
 
 fn lyrics(file: &Path) -> Option<String> {
-    lofty::read_from_path(file).unwrap().primary_tag().unwrap().get_string(&ItemKey::Lyrics).map(String::from)
+    lofty::read_from_path(file)
+        .unwrap()
+        .primary_tag()
+        .unwrap()
+        .get_string(&ItemKey::Lyrics)
+        .map(String::from)
 }
 
 #[test]
@@ -415,20 +738,44 @@ fn meta_keeps_tags_of_songs_not_on_spotify_and_reads_only_genius_lyrics() {
     assert_eq!(tag.album().as_deref(), Some("Demos"));
     assert!(tag.pictures().is_empty());
     let lyrics = lyrics(&file).unwrap();
-    assert!(lyrics.contains("[Verse 1]") && lyrics.lines().count() > 20, "{lyrics}");
-    for junk in ["You might also like", "Contributors", "Embed", "Translations"] {
+    assert!(
+        lyrics.contains("[Verse 1]") && lyrics.lines().count() > 20,
+        "{lyrics}"
+    );
+    for junk in [
+        "You might also like",
+        "Contributors",
+        "Embed",
+        "Translations",
+    ] {
         assert!(!lyrics.contains(junk), "{junk}: {lyrics}");
     }
 }
 
-/// A 3-minute Exodus song as another tool tags it: Spotify's track search finds the song on Legend, a compilation.
+/// A 3-minute Exodus song as another tool tags it: Spotify's track search finds the song on Legend,
+/// a compilation.
 #[test]
 fn meta_tags_songs_without_a_spotify_url_from_their_own_album_and_keeps_other_tags() {
     let dir = dir("meta-album");
     let tagged = |album: &str| {
         let file = dir.join(format!("{album}.opus"));
-        let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "180"];
-        let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+        let ffmpeg = [
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "180",
+        ];
+        let status = Command::new("ffmpeg")
+            .args(ffmpeg)
+            .args(["-c:a", "libopus"])
+            .arg(&file)
+            .status()
+            .unwrap();
         assert!(status.success());
         let mut tagged = lofty::read_from_path(&file).unwrap();
         let mut tag = Tag::new(tagged.primary_tag_type());
@@ -448,30 +795,67 @@ fn meta_tags_songs_without_a_spotify_url_from_their_own_album_and_keeps_other_ta
     for file in [&exodus, &rip] {
         ok(spotdl(&dir, &["meta", file.to_str().unwrap()]));
     }
-    let read = |file: &Path| lofty::read_from_path(file).unwrap().primary_tag().unwrap().clone();
+    let read = |file: &Path| {
+        lofty::read_from_path(file)
+            .unwrap()
+            .primary_tag()
+            .unwrap()
+            .clone()
+    };
     let (exodus, rip) = (read(&exodus), read(&rip));
-    assert!(exodus.get_string(&ItemKey::Unknown("WOAS".into())).is_some_and(|url| url.contains("spotify")));
+    assert!(exodus
+        .get_string(&ItemKey::Unknown("WOAS".into()))
+        .is_some_and(|url| url.contains("spotify")));
     assert!(!exodus.pictures().is_empty());
     // A song on no Spotify release of that title keeps its tags.
     assert!(rip.get_string(&ItemKey::Unknown("WOAS".into())).is_none());
     for (tag, album) in [(exodus, "Exodus"), (rip, "Live at Somewhere")] {
-        assert_eq!((tag.album().as_deref(), tag.track()), (Some(album), Some(9)));
-        assert_eq!(tag.get_string(&ItemKey::MusicBrainzRecordingId), Some("abc-123"));
+        assert_eq!(
+            (tag.album().as_deref(), tag.track()),
+            (Some(album), Some(9))
+        );
+        assert_eq!(
+            tag.get_string(&ItemKey::MusicBrainzRecordingId),
+            Some("abc-123")
+        );
         assert_eq!(tag.get_string(&ItemKey::Composer), Some("Bob Marley"));
         // The measured gain stays: Deezer's is only an estimate.
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackGain), Some("-2.00 dB"));
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackPeak), Some("0.900000"));
+        assert_eq!(
+            tag.get_string(&ItemKey::ReplayGainTrackGain),
+            Some("-2.00 dB")
+        );
+        assert_eq!(
+            tag.get_string(&ItemKey::ReplayGainTrackPeak),
+            Some("0.900000")
+        );
     }
 }
 
-/// An instrumental, tagged by spotdl but without lyrics. Its title is not Spotify's, so that tags written again show.
+/// An instrumental, tagged by spotdl but without lyrics. Its title is not Spotify's, so that tags
+/// written again show.
 #[test]
-fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyrics_that_were_not_found() {
+fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyrics_that_were_not_found(
+) {
     let dir = dir("meta-instrumental");
     let song = |name: &str, looked: bool| {
         let file = dir.join(format!("{name}.opus"));
-        let ffmpeg = ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "10"];
-        let status = Command::new("ffmpeg").args(ffmpeg).args(["-c:a", "libopus"]).arg(&file).status().unwrap();
+        let ffmpeg = [
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "10",
+        ];
+        let status = Command::new("ffmpeg")
+            .args(ffmpeg)
+            .args(["-c:a", "libopus"])
+            .arg(&file)
+            .status()
+            .unwrap();
         assert!(status.success());
         let mut tagged = lofty::read_from_path(&file).unwrap();
         let mut tag = Tag::new(tagged.primary_tag_type());
@@ -479,10 +863,21 @@ fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyric
         tag.set_artist("The Glitch Mob".into());
         tag.insert_text(ItemKey::TrackArtists, "The Glitch Mob".into());
         let keys = [("WOAS", FORTUNE_DAYS), ("ITUNESADVISORY", "0")];
-        for (key, value) in keys.into_iter().chain(looked.then_some(("SPOTDL_NOLYRICS", "1"))) {
-            tag.push_unchecked(TagItem::new(ItemKey::Unknown(key.into()), ItemValue::Text(value.into())));
+        for (key, value) in keys
+            .into_iter()
+            .chain(looked.then_some(("SPOTDL_NOLYRICS", "1")))
+        {
+            tag.push_unchecked(TagItem::new(
+                ItemKey::Unknown(key.into()),
+                ItemValue::Text(value.into()),
+            ));
         }
-        tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, vec![0xff, 0xd8]));
+        tag.push_picture(Picture::new_unchecked(
+            PictureType::CoverFront,
+            Some(MimeType::Jpeg),
+            None,
+            vec![0xff, 0xd8],
+        ));
         tagged.insert_tag(tag);
         tagged.save_to_path(&file, WriteOptions::default()).unwrap();
         file
@@ -491,10 +886,18 @@ fn meta_writes_only_the_lyrics_of_tagged_songs_and_does_not_look_again_for_lyric
     // Lyrics that were looked for and not found are not looked for again, and nothing is written.
     let before = fs::read(&looked).unwrap();
     meta(&dir, &looked, &[]);
-    assert!(fs::read(&looked).unwrap() == before, "the tags were written again");
-    // Missing lyrics alone write only the lyrics (or, when Genius answers without any, the key that says so).
+    assert!(
+        fs::read(&looked).unwrap() == before,
+        "the tags were written again"
+    );
+    // Missing lyrics alone write only the lyrics (or, when Genius answers without any, the key that
+    // says so).
     meta(&dir, &new, &[]);
-    let tag = lofty::read_from_path(&new).unwrap().primary_tag().unwrap().clone();
+    let tag = lofty::read_from_path(&new)
+        .unwrap()
+        .primary_tag()
+        .unwrap()
+        .clone();
     assert_eq!(tag.title().as_deref(), Some("Fortune Days (local)"));
     assert_eq!(tag.pictures()[0].data(), [0xff, 0xd8]);
 }
@@ -505,11 +908,24 @@ fn synced_lyrics_timed_past_the_end_of_the_song_lose_their_times_and_their_lrc()
     let file = local_song(&dir);
     let lrc = file.with_extension("lrc");
     meta(&dir, &file, &[]);
-    let words: Vec<String> = lyrics(&file).unwrap().lines().filter(|l| !l.starts_with('[')).map(String::from).collect();
+    let words: Vec<String> = lyrics(&file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('['))
+        .map(String::from)
+        .collect();
     // The song's own words, timed to the 10-second recording, or with lines up to a minute in.
     let timed = |step: usize| -> String {
-        let line = |(i, l): (usize, &String)| format!("[00:{:05.2}]{l}", (i * step) as f64 / 10.0 % 60.0);
-        words.iter().take(9).enumerate().map(line).collect::<Vec<_>>().join("\n") + "\n"
+        let line =
+            |(i, l): (usize, &String)| format!("[00:{:05.2}]{l}", (i * step) as f64 / 10.0 % 60.0);
+        words
+            .iter()
+            .take(9)
+            .enumerate()
+            .map(line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
     };
     let (fits, longer) = (timed(10), timed(70));
     let args = ["--generate-lrc", "--overwrite", "metadata"];
@@ -524,9 +940,15 @@ fn synced_lyrics_timed_past_the_end_of_the_song_lose_their_times_and_their_lrc()
 
     // Synced lyrics in the tags with lines after the end keep their words, without the times.
     let mut tagged = lofty::read_from_path(&file).unwrap();
-    tagged.primary_tag_mut().unwrap().insert_text(ItemKey::Lyrics, longer.clone());
+    tagged
+        .primary_tag_mut()
+        .unwrap()
+        .insert_text(ItemKey::Lyrics, longer.clone());
     tagged.save_to_path(&file, WriteOptions::default()).unwrap();
     meta(&dir, &file, &[]);
     let plain = lyrics(&file).unwrap();
-    assert!(!plain.contains("[00:") && plain.contains(words[0].as_str()), "{plain}");
+    assert!(
+        !plain.contains("[00:") && plain.contains(words[0].as_str()),
+        "{plain}"
+    );
 }

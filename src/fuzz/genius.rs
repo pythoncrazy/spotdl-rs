@@ -7,6 +7,9 @@ use crate::gen::{runs, song};
 fn artist_matching_never_panics() {
     runs("artists", |rng| {
         let s = song(rng);
-        let _ = (among(&s.name, &s.album_name), genius_account(&s.name, &s.album_name));
+        let _ = (
+            among(&s.name, &s.album_name),
+            genius_account(&s.name, &s.album_name),
+        );
     });
 }
