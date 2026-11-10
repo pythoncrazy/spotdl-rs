@@ -130,10 +130,14 @@ impl Pace {
         std::thread::sleep(slot.saturating_duration_since(Instant::now()));
     }
 
-    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down.
-    pub fn hold(&self, pause: Duration) {
+    /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down. Whether
+    /// this lengthened the wait: a thread that was told the same moment finds it held already.
+    pub fn hold(&self, pause: Duration) -> bool {
         let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        *next = Some(next.unwrap_or_else(Instant::now).max(Instant::now() + pause));
+        let until = next.unwrap_or_else(Instant::now).max(Instant::now() + pause);
+        let longer = next.is_none_or(|slot| until > slot);
+        *next = Some(until);
+        longer
     }
 }
 
@@ -189,7 +193,7 @@ pub fn http_paced(
             let after = reply.as_ref().ok().and_then(|reply| reply.headers().get("retry-after"));
             let pause = backoff(attempt, after.and_then(|after| after.to_str().ok()?.trim().parse().ok()));
             match pace {
-                Some(pace) if status.is_some_and(|status| status == 429) => pace.hold(pause),
+                Some(pace) if status.is_some_and(|status| status == 429) => drop(pace.hold(pause)),
                 _ => std::thread::sleep(pause),
             }
             continue;
@@ -527,6 +531,14 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+#[path = "fuzz/gen.rs"]
+mod gen;
+
+#[cfg(test)]
+#[path = "fuzz/main.rs"]
+mod fuzz;
 
 #[cfg(test)]
 mod tests {
