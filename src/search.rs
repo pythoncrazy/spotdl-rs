@@ -1,4 +1,4 @@
-use crate::{cached, download, http, list, log, now, number, on, spotify, text, Song, R};
+use crate::{cached, files, http, list, log, now, number, on, spotify, text, Song, R};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -413,7 +413,7 @@ fn isrc_picks(song: &Song, hits: Vec<Hit>) -> impl Iterator<Item = (f64, String)
 
 /// Up to three URLs to try, best first: YouTube Music's ISRC match, then the text search of each provider.
 pub fn find(song: &Song) -> R<Vec<String>> {
-    let query = download::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
+    let query = files::fill(text("search_query").unwrap_or("{artists} - {title}"), song);
     let filter = crate::cfg()["filter_results"] != false;
     let rank = |hit: &Hit| if filter { score(song, hit) } else { 100.0 };
     let verified = on("only_verified_results");

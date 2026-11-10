@@ -1,7 +1,14 @@
 mod download;
+mod files;
+mod genius;
+mod html;
 mod http;
+mod lrclib;
+mod lyrics;
+mod replaygain;
 mod search;
 mod spotify;
+mod tags;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -305,15 +312,15 @@ fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
         name if name.ends_with(".m3u") || name.ends_with(".m3u8") => name.into(),
         name => format!("{name}.m3u8"),
     };
-    let first = listed.first().map_or_else(|| "playlist".into(), |(song, _)| download::fill("{list}", song));
+    let first = listed.first().map_or_else(|| "playlist".into(), |(song, _)| files::fill("{list}", song));
     let mut files = BTreeMap::<String, String>::new();
     for (song, result) in listed {
         if !(op == "save" || on("add_unavailable") || result.as_ref().is_ok_and(|path| path.is_file())) {
             continue;
         }
-        let path = result.as_ref().map_or_else(|_| download::path(song), Clone::clone);
-        let name = download::fill(&pattern, song).replace("{list[0]}", &first);
-        let line = download::fill("#EXTINF:{duration},{album-artist} - {title}", song);
+        let path = result.as_ref().map_or_else(|_| files::path(song), Clone::clone);
+        let name = files::fill(&pattern, song).replace("{list[0]}", &first);
+        let line = files::fill("#EXTINF:{duration},{album-artist} - {title}", song);
         let entry = relative(&path, Path::new(&name))?;
         files.entry(name).or_insert_with(|| "#EXTM3U\n".into()).push_str(&format!("{line}\n{entry}\n"));
     }
@@ -394,7 +401,7 @@ fn run() -> R<()> {
     // One job per output file (per URL when nothing is written); a pinned YouTube URL beats a search.
     let (mut jobs, mut slots, mut index) = (Vec::<Song>::new(), HashMap::new(), Vec::new());
     for song in &songs {
-        let key = if downloads { download::path(song) } else { PathBuf::from(&song.url) };
+        let key = if downloads { files::path(song) } else { PathBuf::from(&song.url) };
         let slot = *slots.entry(key).or_insert_with(|| {
             jobs.push(song.clone());
             jobs.len() - 1
@@ -408,8 +415,8 @@ fn run() -> R<()> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let done: Vec<(Song, R<PathBuf>)> =
         pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
-    download::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
-    download::report_unchecked();
+    replaygain::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
+    lyrics::report_unchecked();
     let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
     let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
     if let Some(path) = sync_path {
