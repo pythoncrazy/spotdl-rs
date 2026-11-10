@@ -34,6 +34,22 @@ static GENIUS: Pace = Pace::new(500);
 /// azlyrics and musixmatch are asked by every thread of a run at once otherwise: such bursts get a client blocked.
 static AZLYRICS: Pace = Pace::new(1500);
 static MUSIXMATCH: Pace = Pace::new(1500);
+/// The file's audio and tags. `lofty` panics on some damaged files (an Opus header with no channels, an M4A whose
+/// atoms end early); that fails the song, as an unreadable file does, and does not end the run.
+fn audio(file: &Path) -> R<lofty::file::TaggedFile> {
+    damaged(file, || Ok(lofty::read_from_path(file)?))
+}
+
+/// Writes the tags of `audio` to the file; see [`audio`].
+fn save(audio: &lofty::file::TaggedFile, file: &Path) -> R<()> {
+    damaged(file, || Ok(audio.save_to_path(file, WriteOptions::default())?))
+}
+
+fn damaged<T>(file: &Path, work: impl FnOnce() -> R<T>) -> R<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(format!("{}: damaged audio file", file.display()).into()))
+}
+
 fn path_safe(value: &str) -> String {
     value.chars().filter(|c| !"/\\?%*:|\"<>".contains(*c) && !c.is_control()).collect()
 }
@@ -247,6 +263,20 @@ fn plain_title(title: &str) -> String {
     search::slug(&title[..end], "")
 }
 
+/// How many times a request waits out "too many requests" before it gives up: 15, 30, 60 and 120 seconds, so a
+/// banned run fails each song within four minutes and says so, instead of waiting silently for most of an hour.
+const BUSY_TRIES: u64 = 4;
+
+/// Holds `pace` for a service that answered "too many requests" for the `attempt`th time, and says so once for all
+/// threads. Whether the request has had its [`BUSY_TRIES`].
+fn gave_up(pace: &Pace, service: &str, attempt: u64) -> bool {
+    let pause = std::time::Duration::from_secs(15 << attempt.min(BUSY_TRIES));
+    if attempt < BUSY_TRIES && pace.hold(pause) {
+        log("WARNING", &format!("{service}: too many requests, waiting {} s", pause.as_secs()));
+    }
+    attempt >= BUSY_TRIES
+}
+
 /// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy, so that a busy moment does not
 /// replace synced lyrics with plain ones, all threads wait and then try again: long after 429 (too many requests
 /// from us), and briefly after 503 (LRCLIB is overloaded and refuses some of everyone's requests). Only this loop
@@ -257,7 +287,9 @@ fn lrclib_search(url: &str) -> Option<Vec<Value>> {
         match http_retrying(url, &[], None, 0) {
             Ok(bytes) => return serde_json::from_slice(&bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
-                LRCLIB.hold(std::time::Duration::from_secs(15 << attempt.min(3)));
+                if gave_up(&LRCLIB, "LRCLIB", attempt) {
+                    break;
+                }
             }
             Err(error) if error.to_string().contains("HTTP 503") => {
                 LRCLIB.hold(std::time::Duration::from_secs(2 + 2 * attempt.min(10)));
@@ -490,7 +522,9 @@ fn genius_get(url: &str, headers: &[(&str, &str)]) -> Option<String> {
         match http_retrying(url, headers, None, 0) {
             Ok(bytes) => return String::from_utf8(bytes).ok(),
             Err(error) if error.to_string().contains("HTTP 429") => {
-                GENIUS.hold(std::time::Duration::from_secs(30 << attempt.min(3)));
+                if gave_up(&GENIUS, "Genius", attempt) {
+                    break;
+                }
             }
             Err(error) if error.to_string().contains("HTTP 403") => {
                 if !GENIUS_BLOCKED.swap(true, Relaxed) {
@@ -894,7 +928,7 @@ fn write_lrc(file: &Path, song: &Song) -> R<()> {
     if !on("generate_lrc") || (sidecar.exists() && !replace) {
         return Ok(());
     }
-    let length = lofty::read_from_path(file)?.properties().duration().as_secs_f64();
+    let length = audio(file)?.properties().duration().as_secs_f64();
     let recording = Song { duration: length, ..song.clone() };
     let fits = (length - song.duration).abs() < 4.0;
     let own = song.lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
@@ -940,7 +974,10 @@ fn last_time(lyrics: &str) -> Option<f64> {
     let time = |line: &str| {
         let (stamp, _) = line.trim_start().strip_prefix('[')?.split_once(']')?;
         let (minutes, seconds) = stamp.split_once(':')?;
-        Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?)
+        // Digits only: `parse` also reads "inf", "nan" and "1e999", which no `.lrc` file has as a time.
+        let number =
+            |text: &str| text.bytes().all(|b| b.is_ascii_digit() || b == b'.').then(|| text.parse::<f64>().ok())?;
+        Some(number(minutes)? * 60.0 + number(seconds)?)
     };
     lyrics.lines().filter_map(time).reduce(f64::max)
 }
@@ -966,7 +1003,7 @@ fn no_lyrics_key(format: TagType) -> ItemKey {
 /// Writes only the lyrics into the tags, or without them (none found, or an instrumental's removed), the key that
 /// says that none were found.
 fn write_lyrics(file: &Path, lyrics: Option<String>) -> R<()> {
-    let mut audio = lofty::read_from_path(file)?;
+    let mut audio = audio(file)?;
     let tag = audio.primary_tag_mut().ok_or("no tags")?;
     let marker = no_lyrics_key(tag.tag_type());
     tag.retain(|item| item.key() != &marker);
@@ -977,7 +1014,7 @@ fn write_lyrics(file: &Path, lyrics: Option<String>) -> R<()> {
             tag.push_unchecked(TagItem::new(marker, ItemValue::Text("1".into())));
         }
     }
-    Ok(audio.save_to_path(file, WriteOptions::default())?)
+    save(&audio, file)
 }
 
 /// The Spotify URL of a tagged file, also from the `WWWAUDIOFILE` keys that earlier spotdl-rs versions wrote.
@@ -1049,7 +1086,7 @@ fn compilation(s: &Song) -> bool {
 }
 
 fn write_tags(file: &Path, s: &Song) -> R<()> {
-    let mut audio = lofty::read_from_path(file)?;
+    let mut audio = audio(file)?;
     let format = audio.primary_tag_type();
     let id3 = format == TagType::Id3v2;
     // spotdl's keys go into the file's own tag, so that the keys of other tools (MusicBrainz IDs, composers,
@@ -1133,7 +1170,7 @@ fn write_tags(file: &Path, s: &Song) -> R<()> {
         audio.insert_tag(lofty::iff::wav::RiffInfoList::from(tag.clone()).into());
     }
     audio.insert_tag(tag);
-    Ok(audio.save_to_path(file, WriteOptions::default())?)
+    save(&audio, file)
 }
 
 /// With `--replaygain`, the album gain and peak of each album in the folders of `files`, from the track gains and
@@ -1169,7 +1206,7 @@ fn album_gain(dir: &Path) -> R<()> {
         if !AUDIO.contains(&extension.as_str()) || temp_file(&file) {
             continue;
         }
-        let audio = lofty::read_from_path(&file)?;
+        let audio = audio(&file)?;
         let Some(tag) = audio.primary_tag() else { continue };
         let number = |key: ItemKey| tag.get_string(&key)?.split_whitespace().next()?.parse::<f64>().ok();
         let loud = number(ItemKey::ReplayGainTrackGain).zip(number(ItemKey::ReplayGainTrackPeak));
@@ -1191,7 +1228,7 @@ fn album_gain(dir: &Path) -> R<()> {
         let gain = format!("{:.2} dB", RG_REFERENCE - 10.0 * (energy / total).log10());
         let peak = format!("{:.6}", measured.iter().map(|((_, peak), _)| *peak).fold(0.0, f64::max));
         for (file, _, _) in tracks {
-            let mut audio = lofty::read_from_path(file)?;
+            let mut audio = audio(file)?;
             let tag = audio.primary_tag_mut().ok_or("no tags")?;
             if tag.get_string(&ItemKey::ReplayGainAlbumGain) == Some(gain.as_str())
                 && tag.get_string(&ItemKey::ReplayGainAlbumPeak) == Some(peak.as_str())
@@ -1200,7 +1237,7 @@ fn album_gain(dir: &Path) -> R<()> {
             }
             tag.insert_text(ItemKey::ReplayGainAlbumGain, gain.clone());
             tag.insert_text(ItemKey::ReplayGainAlbumPeak, peak.clone());
-            audio.save_to_path(file, WriteOptions::default())?;
+            save(&audio, file)?;
         }
     }
     Ok(())
@@ -1212,11 +1249,11 @@ fn write_track_gain(file: &Path) -> R<()> {
     if gain.is_empty() {
         return Err("could not measure the loudness".into());
     }
-    let mut audio = lofty::read_from_path(file)?;
+    let mut audio = audio(file)?;
     let tag = audio.primary_tag_mut().ok_or("no tags")?;
     tag.insert_text(ItemKey::ReplayGainTrackGain, gain);
     tag.insert_text(ItemKey::ReplayGainTrackPeak, peak);
-    Ok(audio.save_to_path(file, WriteOptions::default())?)
+    save(&audio, file)
 }
 
 /// The folder of an album artist: the folder above the song's when it is named after the album artist, as with
@@ -1439,9 +1476,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
         let root = output_root();
         let mut files = Vec::new();
         audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
-        let tagged = files
-            .into_iter()
-            .filter_map(|file| Some((source_url(lofty::read_from_path(&file).ok()?.primary_tag()?)?, file)));
+        let tagged = files.into_iter().filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
         tagged.collect()
     };
     let scanned = on("scan_for_songs").then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
@@ -1472,7 +1507,7 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
     if moved && s.lyrics.is_none() {
-        let tag = lofty::read_from_path(&target).ok();
+        let tag = audio(&target).ok();
         let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
         s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
@@ -1603,7 +1638,7 @@ fn remove_empty(file: &Path) {
 /// Fills in missing tags, lyrics and `.lrc` files of a local song, and returns it when `redownload` is to download
 /// it again.
 fn meta_file(file: &Path) -> R<Option<Song>> {
-    let audio = lofty::read_from_path(file)?;
+    let audio = audio(file)?;
     let tag = audio.primary_tag().ok_or("no tags")?;
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
     // A Spotify song written before the explicit flag reached Vorbis comments has its tags written again.
@@ -1865,9 +1900,13 @@ pub fn meta(paths: &[String]) -> R<()> {
 }
 
 #[cfg(test)]
+#[path = "fuzz/download.rs"]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        album_dirs, among, art, azlyrics, compilation, folder_images, genius_account, genius_lyrics,
+        album_dirs, among, art, azlyrics, compilation, folder_images, gave_up, genius_account, genius_lyrics,
         instrumental_title, is_synced, lrclib_agrees, lrclib_lyrics, lrclib_search, lrclib_tracks, out_path, path,
         provider, rate_args, redownload_jobs, reference, release_type_key, same_lyrics, synced_first, temp_id,
         template_path, timed_for, track_gain, unlisted, write_tags, Relaxed, Song, AZLYRICS_BLOCKED, GENIUS_BLOCKED,
@@ -2165,6 +2204,7 @@ mod tests {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/api/search", server.local_addr().unwrap());
         let (sent, asked) = std::sync::mpsc::channel();
+        let (go, held) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for (n, stream) in server.incoming().take(2).enumerate() {
                 let mut stream = stream.unwrap();
@@ -2174,6 +2214,8 @@ mod tests {
                     request.push(byte[0]);
                 }
                 sent.send(Instant::now()).unwrap();
+                // The reply waits for the other thread's hold: a busy machine otherwise lets the 503's own short hold run out first.
+                held.recv().unwrap();
                 let (status, body) = if n == 0 { ("503 Service Unavailable", "") } else { ("200 OK", "[]") };
                 let reply =
                     format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -2184,6 +2226,8 @@ mod tests {
         let first = asked.recv().unwrap();
         // Another thread was told to slow down.
         super::LRCLIB.hold(Duration::from_secs(5));
+        go.send(()).unwrap();
+        go.send(()).unwrap();
         assert_eq!(search.join().unwrap(), Some(Vec::new()));
         assert!(asked.recv().unwrap() - first >= Duration::from_secs(4));
     }
@@ -2304,5 +2348,15 @@ mod tests {
         }
         // Short ids stay as they were, so earlier runs' temporary files are still found and removed.
         assert_eq!(temp_id(&song("4uLU6hMCjMI75M1A2tKUQC", "")), "4uLU6hMCjMI75M1A2tKUQC");
+    }
+
+    /// A banned run waited about 40 minutes for each Genius request, saying nothing: a request waits four times,
+    /// 15 seconds and doubling, and then gives up.
+    #[test]
+    fn a_service_that_stays_busy_is_waited_out_four_times_and_then_given_up() {
+        let _ = crate::CONFIG.set(serde_json::from_str(crate::DEFAULTS).unwrap());
+        let pace = crate::Pace::new(0);
+        assert!((0..4).all(|attempt| !gave_up(&pace, "Test", attempt)));
+        assert!(gave_up(&pace, "Test", 4) && gave_up(&pace, "Test", 99));
     }
 }

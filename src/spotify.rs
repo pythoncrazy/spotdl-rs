@@ -704,6 +704,10 @@ pub fn enrich(song: &mut Song) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "fuzz/spotify.rs"]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::{
         agrees, complete, dates, deezer_error, disc_tracks, editions, enrich, fetch_once, query, ranked, release_date,

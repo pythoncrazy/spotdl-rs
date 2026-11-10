@@ -481,6 +481,10 @@ pub fn source(url: &str, lookup: bool) -> R<Vec<Song>> {
 }
 
 #[cfg(test)]
+#[path = "fuzz/search.rs"]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::{edition_title, isrc_picks, score, versionless, Hit, Kind, Song};
 
