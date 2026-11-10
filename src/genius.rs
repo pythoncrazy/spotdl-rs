@@ -5,14 +5,14 @@ use crate::lyrics::{instrumental_title, lyrics_title, page, plain_title, words};
 use crate::settings::settings;
 use crate::{
     http::{self, HttpError, Service},
-    search, url_encode, Song,
+    lock, search, url_encode, Song,
 };
 use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Mutex, PoisonError,
+        Mutex,
     },
 };
 
@@ -94,11 +94,11 @@ pub(crate) fn genius_key(song: &Song, artist: &str, max: usize) -> String {
 /// several pages: "Everybody", "Everybody (Original)", "Everybody (Demo 3)").
 pub(crate) fn genius_titled(song: &Song, artist: &str, max: usize) -> Asked<Vec<Page>> {
     let key = genius_key(song, artist, max);
-    if let Some(pages) = GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+    if let Some(pages) = lock(&GENIUS_FOUND).get(&key) {
         return Ok(pages.clone());
     }
     let pages = genius_pages(song, artist, max)?;
-    GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).insert(key, pages.clone());
+    lock(&GENIUS_FOUND).insert(key, pages.clone());
     Ok(pages)
 }
 

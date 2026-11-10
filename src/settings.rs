@@ -33,14 +33,69 @@ const PROVIDERS: [(&str, &[&str]); 2] = [
     ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
 ];
 
+/// What a run does. `Redownload` is the download of `meta --redownload`, which replaces the local file.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum Op {
+    #[default]
+    Download,
+    Save,
+    Sync,
+    Url,
+    Meta,
+    Redownload,
+}
+
+const OPS: [(&str, Op); 5] =
+    [("download", Op::Download), ("save", Op::Save), ("sync", Op::Sync), ("url", Op::Url), ("meta", Op::Meta)];
+
+/// What happens to a song whose file is there: it is left, downloaded again, or only tagged again.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Overwrite {
+    Skip,
+    Force,
+    Metadata,
+}
+
+impl Overwrite {
+    /// Whether the tags, lyrics and `.lrc` of a file that is there are written again.
+    pub fn replaces(self) -> bool {
+        self != Self::Skip
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Format {
+    Mp3,
+    Flac,
+    Ogg,
+    Opus,
+    M4a,
+    Wav,
+}
+
+impl Format {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Flac => "flac",
+            Self::Ogg => "ogg",
+            Self::Opus => "opus",
+            Self::M4a => "m4a",
+            Self::Wav => "wav",
+        }
+    }
+}
+
 /// Every setting. A key that is not a setting is an error on the command line and ignored in `config.json`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Settings {
     // Where songs go and how they are encoded.
     pub output: String,
-    pub format: String,
+    pub format: Format,
     pub bitrate: String,
-    pub overwrite: String,
+    pub overwrite: Overwrite,
     pub restrict: Option<String>,
     pub max_filename_length: u64,
     pub archive: Option<String>,
@@ -116,7 +171,7 @@ pub(crate) fn use_defaults() {
 }
 
 /// Loads the settings and returns the operation and its queries.
-pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
+pub(crate) fn load(args: &[String]) -> R<(Op, Vec<String>)> {
     let mut cfg: Value = serde_json::from_str(DEFAULTS)?;
     let (mut cli, mut queries, mut config) = (serde_json::Map::new(), Vec::new(), None);
     let mut i = 0;
@@ -181,9 +236,11 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
         _ => {}
     }
     SETTINGS.set(serde_json::from_value(cfg)?).map_err(|_| "settings were already loaded")?;
-    let op =
-        ["download", "save", "sync", "url", "meta"].into_iter().find(|op| queries.first().is_some_and(|q| q == op));
-    Ok((op.map_or_else(|| "download".into(), |_| queries.remove(0)), queries))
+    let op = OPS.iter().find(|(name, _)| queries.first().is_some_and(|query| query == name)).map(|(_, op)| *op);
+    if op.is_some() {
+        queries.remove(0);
+    }
+    Ok((op.unwrap_or_default(), queries))
 }
 
 #[cfg(test)]

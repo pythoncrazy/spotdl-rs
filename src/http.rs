@@ -1,14 +1,14 @@
 //! HTTP: requests that retry and pace themselves, and [`Service`], a website that is asked politely.
 
 use crate::settings::settings;
-use crate::{log, R};
+use crate::{lock, log, R};
 use serde::de::DeserializeOwned;
 use std::{
     error::Error,
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        LazyLock, Mutex, PoisonError,
+        LazyLock, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -53,7 +53,7 @@ impl Pace {
 
     pub fn wait(&self) {
         let slot = {
-            let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut next = lock(&self.0);
             let slot = next.map_or(Instant::now(), |next| next.max(Instant::now()));
             *next = Some(slot + Duration::from_millis(self.1));
             slot
@@ -64,7 +64,7 @@ impl Pace {
     /// Makes every caller wait `pause` before the next request, for a service that asked us to slow down. Returns
     /// whether this lengthened the wait: a thread that was told the same moment finds it held already.
     pub fn hold(&self, pause: Duration) -> bool {
-        let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = lock(&self.0);
         let until = next.unwrap_or_else(Instant::now).max(Instant::now() + pause);
         let longer = next.is_none_or(|slot| until > slot);
         *next = Some(until);

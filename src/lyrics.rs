@@ -7,7 +7,7 @@ use crate::html::html;
 use crate::lrclib::lrclib;
 use crate::settings::settings;
 use crate::tags::audio;
-use crate::{http::Service, log, search, Song, R};
+use crate::{http::Service, lock, log, search, Song, R};
 use lofty::prelude::*;
 use std::{
     collections::HashSet,
@@ -15,7 +15,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Mutex, PoisonError,
+        Mutex,
     },
 };
 
@@ -47,7 +47,7 @@ pub(crate) fn plain_title(title: &str) -> String {
 static UNCHECKED: std::sync::LazyLock<Mutex<HashSet<String>>> = std::sync::LazyLock::new(Default::default);
 
 pub(crate) fn unchecked(song: &Song) {
-    let mut songs = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut songs = lock(&UNCHECKED);
     if songs.is_empty() {
         log("WARNING", "Genius cannot be asked: LRCLIB lyrics, which it must check, are left for a later run");
     }
@@ -56,7 +56,7 @@ pub(crate) fn unchecked(song: &Song) {
 
 /// Says at the end of a run how many songs got no checked synced lyrics, so that a `meta` run adds them later.
 pub(crate) fn report_unchecked() {
-    let count = UNCHECKED.lock().unwrap_or_else(PoisonError::into_inner).len();
+    let count = lock(&UNCHECKED).len();
     if count > 0 {
         log("WARNING", &format!("{count} songs without LRCLIB lyrics or .lrc files: Genius could not be asked"));
     }
@@ -71,8 +71,7 @@ pub(crate) fn genius_answered(song: &Song) -> bool {
     }
     // Only the song's own page without words is "no lyrics": a search with no such page, or one that found nothing,
     // leaves a vocal song to be looked up again later.
-    let pages =
-        GENIUS_FOUND.lock().unwrap_or_else(PoisonError::into_inner).get(&genius_key(song, &song.artist, 1)).cloned();
+    let pages = lock(&GENIUS_FOUND).get(&genius_key(song, &song.artist, 1)).cloned();
     pages.is_some_and(|pages| {
         pages.iter().any(|page| instrumental(song, page))
             || (instrumental_title(&song.name) && pages.iter().all(|page| words(&page.lyrics).is_empty()))
@@ -383,7 +382,7 @@ pub(crate) fn recheck(song: &Song) -> Check {
 /// nothing can be checked: no `.lrc` is written and none is removed.
 pub(crate) fn write_lrc(file: &Path, song: &Song) -> R<()> {
     let sidecar = file.with_extension("lrc");
-    let replace = matches!(settings().overwrite.as_str(), "force" | "metadata");
+    let replace = settings().overwrite.replaces();
     if !settings().generate_lrc || (sidecar.exists() && !replace) {
         return Ok(());
     }

@@ -1,25 +1,18 @@
 //! `meta`: tags the audio files that are already there, and downloads again the songs that are asked for.
 
-use crate::download::{enrich, out_path, process};
+use crate::download::{enrich, jobs, out_path, process, Run};
 use crate::files::{audio_files, folder_images, write_folder_art};
 use crate::lyrics::{
     clean_lrc, find_lyrics, found_lyrics, genius_answered, is_synced, plain_lyrics, recheck, report_unchecked,
     timed_for, unlisted, write_lrc, Check, Lyrics,
 };
 use crate::replaygain::{album_gains, write_track_gain};
-use crate::settings::settings;
+use crate::settings::{settings, Op};
 use crate::tags::{advisory_key, audio, no_lyrics_key, source_url, write_lyrics, write_tags};
 use crate::{log, search, spotify, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use rayon::prelude::*;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
-
-/// The files `meta --redownload` downloads again, by song URL.
-pub(crate) static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+use std::path::{Path, PathBuf};
 
 /// What the settings ask `meta` to do about files that already have their tags.
 #[derive(Clone, Copy)]
@@ -34,7 +27,7 @@ struct Mode {
 
 impl Mode {
     fn current() -> Self {
-        let replace = matches!(settings().overwrite.as_str(), "force" | "metadata");
+        let replace = settings().overwrite.replaces();
         Self { force: settings().force_update_metadata, redownload: settings().redownload, replace }
     }
 }
@@ -267,22 +260,6 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
     Ok((mode.redownload && on_spotify).then_some(song))
 }
 
-/// One download per output file, local songs first: a song is downloaded once, also when it is on the album of several
-/// files (`--fetch-albums`), and the threads do not write the same file. A pinned video is kept.
-fn redownload_jobs(songs: Vec<Song>) -> Vec<Song> {
-    let (mut jobs, mut slots) = (Vec::<Song>::new(), HashMap::new());
-    for song in songs {
-        let slot = *slots.entry(out_path(&song, "redownload").0).or_insert_with(|| {
-            jobs.push(song.clone());
-            jobs.len() - 1
-        });
-        if jobs[slot].download_url.is_none() {
-            jobs[slot].download_url = song.download_url;
-        }
-    }
-    jobs
-}
-
 pub(crate) fn meta(paths: &[String]) -> R<()> {
     let mut files = Vec::new();
     for path in paths.iter().map(Path::new) {
@@ -312,17 +289,12 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
     // The songs are downloaded again after all files are done, as a download, so that each is downloaded once.
     let local: Vec<(PathBuf, Song)> =
         files.iter().zip(results).filter_map(|(file, result)| Some((file.clone(), result.ok()??))).collect();
-    let _ = REDOWNLOADS.set(local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect());
+    let redownloads = local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect();
+    let run = Run { op: Op::Redownload, redownloads, ..Run::default() };
     let mut songs: Vec<Song> = local.into_iter().map(|(_, song)| song).collect();
     let mut lost = 0;
     if settings().fetch_albums {
-        let mut albums: Vec<String> = songs
-            .iter()
-            .filter(|song| !song.album_id.is_empty())
-            .map(|song| format!("https://open.spotify.com/album/{}", song.album_id))
-            .collect();
-        albums.sort();
-        albums.dedup();
+        let albums = crate::album_queries(&songs);
         let resolved: Vec<_> =
             pool.install(|| albums.par_iter().map(|album| (album, spotify::resolve(album))).collect());
         for (album, result) in resolved {
@@ -335,9 +307,10 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
             }
         }
     }
-    let jobs = redownload_jobs(songs);
+    // Local songs first: an album's song that is also a local file replaces that file.
+    let jobs = jobs(&songs, |song| out_path(song, &run).0).0;
     let done: Vec<R<PathBuf>> =
-        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, "redownload").1).collect());
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, &run).1).collect());
     lost += done.iter().filter(|result| result.is_err()).count();
     album_gains(&files.into_iter().chain(done.into_iter().flatten()).collect::<Vec<_>>());
     report_unchecked();
@@ -359,7 +332,8 @@ mod tests {
     fn redownloads_replace_local_files_and_download_each_song_once() {
         crate::settings::use_defaults();
         let file = PathBuf::from("/music/Artist/Album (2020)/Artist - Album (2020) - 01 - One.mp3");
-        let _ = REDOWNLOADS.set([("https://open.spotify.com/track/1".into(), file.clone())].into());
+        let redownloads = [("https://open.spotify.com/track/1".to_string(), file.clone())].into();
+        let run = Run { op: Op::Redownload, redownloads, ..Run::default() };
         let song = |id: &str, name: &str| Song {
             url: format!("https://open.spotify.com/track/{id}"),
             name: name.into(),
@@ -370,12 +344,12 @@ mod tests {
         // The local song, then the album's songs of each of two files of the album.
         let album = [song("1", "One"), song("2", "Two")];
         let songs = [vec![local], album.to_vec(), album.to_vec()].concat();
-        let jobs = redownload_jobs(songs);
+        let jobs = jobs(&songs, |song| out_path(song, &run).0).0;
         assert_eq!(jobs.iter().map(|song| song.name.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
         assert_eq!(jobs[0].download_url.as_deref(), Some("https://music.youtube.com/watch?v=pinned"));
-        assert_eq!(out_path(&jobs[0], "redownload"), (file.with_extension("opus"), Some(&file)));
-        assert_eq!(out_path(&jobs[1], "redownload"), (path(&jobs[1]), None));
+        assert_eq!(out_path(&jobs[0], &run), (file.with_extension("opus"), Some(&file)));
+        assert_eq!(out_path(&jobs[1], &run), (path(&jobs[1]), None));
         // Only `meta --redownload` writes to the local file; a download goes by the output template.
-        assert_eq!(out_path(&jobs[0], "download").0, PathBuf::from("Artist - One.opus"));
+        assert_eq!(out_path(&jobs[0], &Run::default()).0, PathBuf::from("Artist - One.opus"));
     }
 }

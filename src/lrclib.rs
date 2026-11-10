@@ -1,12 +1,9 @@
 //! LRCLIB, a crowd's uploads of lyrics, and the synced lyrics among them.
 
 use crate::lyrics::{is_synced, lyrics_title, plain_title, same_lyrics, timed_for, Lyrics};
-use crate::{http::Service, url_encode, Song};
+use crate::{http::Service, lock, url_encode, Song};
 use serde_json::Value;
-use std::{
-    collections::HashSet,
-    sync::{Mutex, PoisonError},
-};
+use std::{collections::HashSet, sync::Mutex};
 
 pub(crate) static LRCLIB: Service = Service::new("LRCLIB", 750, false);
 
@@ -90,7 +87,7 @@ const LRCLIB_KEPT: usize = 256;
 /// newer ones come: once kept by everyone, they filled gigabytes over a library.
 fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Option<Vec<Value>> {
     let taken = {
-        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut found = lock(&LRCLIB_FOUND);
         found.iter().position(|(key, _)| key == url).and_then(|at| found.remove(at)).map(|(_, tracks)| tracks)
     };
     if taken.is_some() {
@@ -98,7 +95,7 @@ fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) 
     }
     let tracks = search(url)?;
     if keep {
-        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut found = lock(&LRCLIB_FOUND);
         if found.len() >= LRCLIB_KEPT {
             found.pop_front();
         }
