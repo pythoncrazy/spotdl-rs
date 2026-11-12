@@ -148,7 +148,7 @@ fn synced(song: &Song) -> Option<Lyrics> {
         return Some(Lyrics::Instrumental);
     }
     let checks = page.map(|page| page.lyrics).filter(|lyrics| !words(lyrics).is_empty());
-    lrclib(song, true).pick(checks.as_deref())
+    lrclib(song, true).find_map(|versions| versions.pick(checks.as_deref()))
 }
 
 /// Genius's lyrics. A page without words is the song's answer that it has none, or else another song's.
@@ -400,7 +400,7 @@ pub(crate) fn write_lrc(file: &Path, song: &Song) -> R<()> {
     // The old `.lrc` goes before LRCLIB, which is often busy.
     let own_synced = own.filter(|lyrics| fits && timed(lyrics));
     let old = fs::read_to_string(&sidecar).ok();
-    let found = std::iter::once_with(|| lrclib(&recording, false).lyrics).flatten().filter(timed);
+    let found = lrclib(&recording, false).flat_map(|versions| versions.lyrics).filter(timed);
     let kept = old.clone().filter(timed);
     if let Some(lrc) = own_synced.into_iter().chain(kept).chain(found).find(agrees) {
         if old.as_ref() != Some(&lrc) {
