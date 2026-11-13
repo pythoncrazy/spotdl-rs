@@ -47,27 +47,30 @@ impl Versions {
     }
 }
 
-/// LRCLIB's lyrics for versions as long as the song. `keep`: the `.lrc` writer will search again (see
-/// [`lrclib_tracks`]).
-pub(crate) fn lrclib(song: &Song, keep: bool) -> Versions {
-    // LRCLIB files a song under one of its artists ("KING" of ¥$ is under Kanye West).
-    let mut artists = vec![&song.artist];
-    artists.extend(song.artists.iter().filter(|artist| **artist != song.artist));
-    artists
-        .into_iter()
-        .filter(|artist| !artist.is_empty())
-        .map(|artist| lrclib_by(song, artist, keep))
-        .find(|found| !found.is_empty())
-        .unwrap_or_default()
+/// LRCLIB's lyrics for versions as long as the song, one [`Versions`] for each of the song's artists that LRCLIB has
+/// any for, found one artist at a time as the caller asks for more. LRCLIB files a song under one of its artists
+/// ("KING" of ¥$ is under Kanye West), and the first artist's versions can be wrong: under Jack Harlow, the only
+/// version as long as his WHATS POPPIN remix has the words of the original, and the 20 right ones are under Tory Lanez.
+/// `keep`: the `.lrc` writer will search again (see [`lrclib_tracks`]).
+pub(crate) fn lrclib(song: &Song, keep: bool) -> impl Iterator<Item = Versions> + '_ {
+    lrclib_with(song, keep, lrclib_search)
 }
 
-fn lrclib_by(song: &Song, artist: &str, keep: bool) -> Versions {
+fn lrclib_with(song: &Song, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> impl Iterator<Item = Versions> + '_ {
+    let artists = std::iter::once(&song.artist).chain(song.artists.iter().filter(|artist| **artist != song.artist));
+    artists
+        .filter(|artist| !artist.is_empty())
+        .map(move |artist| lrclib_by(song, artist, keep, search))
+        .filter(|found| !found.is_empty())
+}
+
+fn lrclib_by(song: &Song, artist: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Versions {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         url_encode(artist),
         url_encode(lyrics_title(song))
     );
-    let Some(tracks) = lrclib_tracks(&url, keep, lrclib_search) else {
+    let Some(tracks) = lrclib_tracks(&url, keep, search) else {
         return Versions::default();
     };
     lrclib_lyrics(song, &tracks)
@@ -142,6 +145,7 @@ mod fuzz;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lyrics::plain_lyrics;
 
     const BULLY_KING: &str =
         "[Intro]\nThe time is now, right now\nThis is the hour, this is the new dawn, this is the new day\n\
@@ -187,6 +191,34 @@ mod tests {
         let agreeing = Versions { instrumental: false, lyrics: vec![BULLY_KING.into()] };
         assert_eq!(agreeing.pick(Some(BULLY_KING)), Some(Lyrics::Words(BULLY_KING.into())));
         assert_eq!(Versions { instrumental: true, lyrics: vec![] }.pick(Some(BULLY_KING)), None);
+    }
+
+    /// LRCLIB's first artist's only version as long as the song was another song's words, and the search stopped
+    /// there: Jack Harlow's WHATS POPPIN remix got no `.lrc` file, as the 20 right versions are under Tory Lanez.
+    #[test]
+    fn a_later_artists_versions_are_asked_when_the_first_artists_are_not_the_songs() {
+        let song = Song {
+            name: "WHATS POPPIN - Remix".into(),
+            artist: "Jack Harlow".into(),
+            artists: vec!["Jack Harlow".into(), "Tory Lanez".into()],
+            duration: 227.5,
+            ..Song::default()
+        };
+        // Thirty lines of words that only one of the two songs has: fewer say nothing (see `same_lyrics`).
+        fn lyrics(word: &str, end: u32) -> String {
+            let lines = (0..30).map(|i| format!("[00:{i:02}.00] {word}{i} {word}{}", i + 1));
+            lines.chain([format!("[{end}:00.00] {word}end")]).collect::<Vec<_>>().join("\n")
+        }
+        fn search(url: &str) -> Option<Vec<Value>> {
+            let (words, album) = match url.contains("artist_name=Jack%20Harlow") {
+                true => (lyrics("original", 2), "Sweet Action"),
+                false => (lyrics("remix", 3), "WHATS POPPIN"),
+            };
+            Some(vec![serde_json::json!({"duration": 227.5, "syncedLyrics": words, "albumName": album})])
+        }
+        let plain = plain_lyrics(&lyrics("remix", 3));
+        let found = lrclib_with(&song, false, search).find_map(|versions| versions.pick(Some(&plain)));
+        assert_eq!(found, Some(Lyrics::Words(lyrics("remix", 3))));
     }
 
     /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while: every
