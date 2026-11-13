@@ -1,15 +1,14 @@
 //! Where songs and their cover images go: the `--output` template, and the folder images.
 
 use crate::settings::settings;
-use crate::{
-    http::{self},
-    search, spotify, Song, R,
-};
+use crate::{http, lock, search, spotify, Song, R};
 use lofty::picture::PictureInformation;
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 fn path_safe(value: &str) -> String {
@@ -117,13 +116,18 @@ pub(crate) fn skip_path(file: &Path) -> PathBuf {
 
 pub(crate) fn audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
     for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()) {
-        let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if path.is_dir() {
             audio_files(&path, files);
-        } else if AUDIO.contains(&extension.as_str()) && !temp_file(&path) {
+        } else if is_audio(&path) {
             files.push(path);
         }
     }
+}
+
+/// Whether `file` is a song of the library by its name: an audio file, and not a download's temporary file.
+pub(crate) fn is_audio(file: &Path) -> bool {
+    let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    AUDIO.contains(&extension.as_str()) && !temp_file(file)
 }
 
 /// The folder of an album artist: the folder above the song's when it is named after the album artist, as with
@@ -135,10 +139,39 @@ fn artist_folder(file: &Path, s: &Song) -> Option<PathBuf> {
         .then(|| folder.to_path_buf())
 }
 
-/// The image at `url`. Spotify lists album covers (`ab67616d<size><hash>`) at most 640 px wide, but serves the same
-/// cover in its uploaded size (up to 2000 px) with the size `000082c1`; that one is taken when it is a JPEG wider than
-/// 640 px, as old uploads may lack it or be smaller. Artist pictures are taken as listed.
-pub(crate) fn art(url: &str) -> Option<Vec<u8>> {
+type Image = Arc<Vec<u8>>;
+type Slot = Arc<Mutex<Option<Image>>>;
+
+/// The last images, by URL: every song of an album gets the album's cover, so it is downloaded once, by the first
+/// song that asks, while the others wait for it. Only a few are kept: a cover is up to some megabytes.
+static IMAGES: Mutex<VecDeque<(String, Slot)>> = Mutex::new(VecDeque::new());
+
+const IMAGES_KEPT: usize = 16;
+
+/// The image at `url`; a failed download is not kept, so the next song asks again.
+pub(crate) fn art(url: &str) -> Option<Image> {
+    let image = {
+        let mut images = lock(&IMAGES);
+        let known = images.iter().find(|(known, _)| known == url).map(|(_, image)| image.clone());
+        known.unwrap_or_else(|| {
+            if images.len() >= IMAGES_KEPT {
+                images.pop_front();
+            }
+            images.push_back((url.into(), Arc::default()));
+            images[images.len() - 1].1.clone()
+        })
+    };
+    let mut image = lock(&image);
+    if image.is_none() {
+        *image = download_art(url).map(Arc::new);
+    }
+    image.clone()
+}
+
+/// Downloads the image at `url`. Spotify lists album covers (`ab67616d<size><hash>`) at most 640 px wide, but serves
+/// the same cover in its uploaded size (up to 2000 px) with the size `000082c1`; that one is taken when it is a JPEG
+/// wider than 640 px, as old uploads may lack it or be smaller. Artist pictures are taken as listed.
+fn download_art(url: &str) -> Option<Vec<u8>> {
     let hash = url.strip_prefix("https://i.scdn.co/image/ab67616d").and_then(|rest| rest.get(8..));
     let original = hash.map(|hash| format!("https://i.scdn.co/image/ab67616d000082c1{hash}"));
     let larger = |bytes: &Vec<u8>| PictureInformation::from_jpeg(bytes).is_ok_and(|info| info.width > 640);
@@ -167,17 +200,17 @@ pub(crate) fn write_folder_art(file: &Path, s: &Song) -> R<()> {
         };
         // Songs of one album are written at the same time: each writes its own part file and renames it.
         let part = image.with_extension(format!("{}.part", file.file_stem().unwrap_or_default().to_string_lossy()));
-        fs::write(&part, bytes)?;
+        fs::write(&part, &*bytes)?;
         fs::rename(&part, &image)?;
     }
     Ok(())
 }
 
-pub(crate) const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
+const AUDIO: [&str; 6] = ["mp3", "flac", "ogg", "opus", "m4a", "wav"];
 
 /// Whether `file` is one of `fetch`'s temporary files (`<stem>.<id>.converted.<format>`), which an interrupted run can
 /// leave behind: it is no song of the library.
-pub(crate) fn temp_file(file: &Path) -> bool {
+fn temp_file(file: &Path) -> bool {
     file.file_stem().map(Path::new).and_then(Path::extension).is_some_and(|extension| extension == "converted")
 }
 
@@ -195,6 +228,38 @@ mod tests {
         crate::settings::use_defaults();
         let cover = art("https://i.scdn.co/image/ab67616d0000b273b694e89ba937dd2631ff584c").unwrap();
         assert_eq!(lofty::picture::PictureInformation::from_jpeg(&cover).unwrap().width, 1500);
+    }
+
+    /// Every song of an album downloaded the album's cover again.
+    #[test]
+    fn a_cover_is_downloaded_once_for_the_songs_of_an_album() {
+        use std::io::{Read, Write};
+        crate::settings::use_defaults();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cover.jpg", server.local_addr().unwrap());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        std::thread::spawn(move || {
+            for stream in server.incoming() {
+                let mut stream = stream.unwrap();
+                let _ = stream.read(&mut [0; 4096]);
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\njpg");
+            }
+        });
+        let songs: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn({
+                    let url = url.clone();
+                    move || art(&url)
+                })
+            })
+            .collect();
+        for song in songs {
+            assert_eq!(song.join().unwrap().unwrap().as_slice(), b"jpg");
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// An album without a cover URL got its artist's picture as `cover.jpg`, which servers show as its cover.

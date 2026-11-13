@@ -28,10 +28,28 @@ const ALIASES: [(&str, &str); 4] = [
     ("genius_access_token", "genius_token"),
     ("dont_filter_results", "filter_results"),
 ];
-const PROVIDERS: [(&str, &[&str]); 2] = [
+/// The settings that take only these values; another is an error, not a silent default.
+const CHOICES: [(&str, &[&str]); 4] = [
     ("audio_providers", &["youtube-music", "youtube", "soundcloud"]),
     ("lyrics_providers", &["genius", "synced", "azlyrics", "musixmatch"]),
+    ("format", &["mp3", "flac", "ogg", "opus", "m4a", "wav"]),
+    ("overwrite", &["skip", "force", "metadata"]),
 ];
+
+/// What a run does. `Redownload` is the download of `meta --redownload`, which replaces the local file.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum Op {
+    #[default]
+    Download,
+    Save,
+    Sync,
+    Url,
+    Meta,
+    Redownload,
+}
+
+const OPS: [(&str, Op); 5] =
+    [("download", Op::Download), ("save", Op::Save), ("sync", Op::Sync), ("url", Op::Url), ("meta", Op::Meta)];
 
 /// Every setting. A key that is not a setting is an error on the command line and ignored in `config.json`.
 #[derive(Debug, Deserialize)]
@@ -40,6 +58,7 @@ pub(crate) struct Settings {
     pub output: String,
     pub format: String,
     pub bitrate: String,
+    /// `skip` leaves a song whose file is there, `force` downloads it again, `metadata` only tags it again.
     pub overwrite: String,
     pub restrict: Option<String>,
     pub max_filename_length: u64,
@@ -116,7 +135,7 @@ pub(crate) fn use_defaults() {
 }
 
 /// Loads the settings and returns the operation and its queries.
-pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
+pub(crate) fn load(args: &[String]) -> R<(Op, Vec<String>)> {
     let mut cfg: Value = serde_json::from_str(DEFAULTS)?;
     let (mut cli, mut queries, mut config) = (serde_json::Map::new(), Vec::new(), None);
     let mut i = 0;
@@ -168,10 +187,10 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
         }
     }
     cli.into_iter().for_each(|(key, value)| cfg[key] = value);
-    for (key, known) in PROVIDERS {
-        let names = cfg[key].as_array().into_iter().flatten();
-        if let Some(name) = names.filter_map(Value::as_str).find(|name| !known.contains(name)) {
-            return Err(format!("unknown {} provider: {name}", key.trim_end_matches("_providers")).into());
+    for (key, known) in CHOICES {
+        let names = cfg[key].as_array().map_or(std::slice::from_ref(&cfg[key]), Vec::as_slice);
+        if let Some(name) = names.iter().filter_map(Value::as_str).find(|name| !known.contains(name)) {
+            return Err(format!("unknown {}: {name}", key.replace("_providers", " provider")).into());
         }
     }
     // `--m3u` as a flag, or `"m3u": true` in the file, is the default name.
@@ -181,9 +200,11 @@ pub(crate) fn load(args: &[String]) -> R<(String, Vec<String>)> {
         _ => {}
     }
     SETTINGS.set(serde_json::from_value(cfg)?).map_err(|_| "settings were already loaded")?;
-    let op =
-        ["download", "save", "sync", "url", "meta"].into_iter().find(|op| queries.first().is_some_and(|q| q == op));
-    Ok((op.map_or_else(|| "download".into(), |_| queries.remove(0)), queries))
+    let op = OPS.iter().find(|(name, _)| queries.first().is_some_and(|query| query == name)).map(|(_, op)| *op);
+    if op.is_some() {
+        queries.remove(0);
+    }
+    Ok((op.unwrap_or_default(), queries))
 }
 
 #[cfg(test)]

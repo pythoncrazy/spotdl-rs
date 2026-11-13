@@ -1,25 +1,18 @@
 //! `meta`: tags the audio files that are already there, and downloads again the songs that are asked for.
 
-use crate::download::{enrich, out_path, process};
+use crate::download::{enrich, jobs, out_path, process, Run};
 use crate::files::{audio_files, folder_images, write_folder_art};
 use crate::lyrics::{
-    clean_lrc, find_lyrics, found_lyrics, genius_answered, is_synced, plain_lyrics, recheck, report_unchecked,
-    timed_for, unlisted, write_lrc, Check, Lyrics,
+    asks_genius, clean_lrc, find_lyrics, found_lyrics, genius_answered, is_synced, none_found, plain_lyrics, recheck,
+    report_unchecked, timed_for, unlisted, write_lrc, Answers, Check, Lyrics,
 };
-use crate::replaygain::{album_gains, write_track_gain};
-use crate::settings::settings;
-use crate::tags::{advisory_key, audio, no_lyrics_key, source_url, write_lyrics, write_tags};
+use crate::replaygain::album_gains;
+use crate::settings::{settings, Op};
+use crate::tags::{advisory_key, no_lyrics_key, source_url, Tags};
 use crate::{log, search, spotify, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use rayon::prelude::*;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
-
-/// The files `meta --redownload` downloads again, by song URL.
-pub(crate) static REDOWNLOADS: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+use std::path::{Path, PathBuf};
 
 /// What the settings ask `meta` to do about files that already have their tags.
 #[derive(Clone, Copy)]
@@ -34,7 +27,7 @@ struct Mode {
 
 impl Mode {
     fn current() -> Self {
-        let replace = matches!(settings().overwrite.as_str(), "force" | "metadata");
+        let replace = settings().overwrite != "skip";
         Self { force: settings().force_update_metadata, redownload: settings().redownload, replace }
     }
 }
@@ -67,9 +60,8 @@ struct Tagged {
     folder_art_missing: bool,
 }
 
-fn read_tags(file: &Path) -> R<Tagged> {
-    let audio = audio(file)?;
-    let tag = audio.primary_tag().ok_or("no tags")?;
+fn read_tags(file: &Path, tags: &Tags) -> R<Tagged> {
+    let tag = tags.tag().ok_or("no tags")?;
     let has = |key: ItemKey| tag.get_string(&key).is_some_and(|value| !value.is_empty());
     let spotify_url = source_url(tag).filter(|url| url.contains("spotify"));
     let tagged = has(ItemKey::TrackTitle)
@@ -78,14 +70,11 @@ fn read_tags(file: &Path) -> R<Tagged> {
         && (settings().skip_album_art || !tag.pictures().is_empty())
         && (spotify_url.is_none() || has(advisory_key(tag.tag_type())));
     let no_lyrics = has(no_lyrics_key(tag.tag_type()));
-    let complete = tagged
-        && (settings().lyrics_providers.iter().map(String::as_str).next().is_none()
-            || has(ItemKey::Lyrics)
-            || no_lyrics);
+    let complete = tagged && (settings().lyrics_providers.is_empty() || has(ItemKey::Lyrics) || no_lyrics);
     let album_artist = tag.get_string(&ItemKey::AlbumArtist).unwrap_or_default().to_string();
     let wanted = Song { album_artist, artist_id: "-".into(), cover_url: Some(String::new()), ..Song::default() };
     let stored = tag.get_string(&ItemKey::Lyrics).filter(|lyrics| !lyrics.is_empty()).map(String::from);
-    let length = audio.properties().duration().as_secs_f64();
+    let length = tags.length();
     let untimed = |lyrics: String| match timed_for(&lyrics, length) {
         true => lyrics,
         false => plain_lyrics(&lyrics).trim().to_string(),
@@ -123,19 +112,20 @@ fn read_tags(file: &Path) -> R<Tagged> {
 
 /// What a file that has all its tags still needs: its ReplayGain measured, its lyrics cleaned, an `.lrc` file written.
 /// Whether that is all, and `meta` is done with the file.
-fn tidy(file: &Path, state: &Tagged) -> R<bool> {
-    if state.measure {
-        write_track_gain(file)?;
+fn tidy(file: &Path, tags: &mut Tags, state: &mut Tagged, answers: &Answers) -> R<bool> {
+    if std::mem::take(&mut state.measure) {
+        tags.set_track_gain()?;
     }
     // Lyrics with Genius's song list or ticket ad in them are cleaned, also when nothing else is written.
     if state.stored.is_some() && state.lyrics != state.stored {
-        write_lyrics(file, state.lyrics.clone())?;
+        tags.set_lyrics(state.lyrics.clone())?;
     }
+    tags.save()?;
     if !settings().generate_lrc || file.with_extension("lrc").exists() || (state.lyrics.is_none() && state.no_lyrics) {
         return Ok(true);
     }
     if state.lyrics.as_deref().is_some_and(is_synced) {
-        write_lrc(file, &state.local)?;
+        write_lrc(file, &state.local, tags.length(), answers)?;
         return Ok(true);
     }
     Ok(false)
@@ -167,10 +157,10 @@ fn find_on_spotify(local: &Song) -> Option<Song> {
 /// synced lyrics that were not available before; so does `--overwrite metadata` for a song whose lyrics were not found
 /// before. With `--overwrite metadata`, lyrics in the tags that are another song's (LRCLIB's "KING" of VULTURES 1 under
 /// BULLY's) are replaced by the song's Genius lyrics.
-fn look_up_lyrics(file: &Path, song: &mut Song, state: &Tagged, mode: Mode) -> bool {
+fn look_up_lyrics(file: &Path, song: &mut Song, state: &Tagged, mode: Mode, answers: &Answers) -> bool {
     let mut cleared = false;
     song.lyrics = if mode.force {
-        match found_lyrics(song) {
+        match found_lyrics(song, answers) {
             Some(Lyrics::Instrumental) => {
                 cleared = state.lyrics.is_some();
                 None
@@ -179,12 +169,10 @@ fn look_up_lyrics(file: &Path, song: &mut Song, state: &Tagged, mode: Mode) -> b
         }
     } else {
         let look = !state.no_lyrics || mode.replace;
-        state.lyrics.clone().or_else(|| look.then(|| find_lyrics(song)).flatten())
+        state.lyrics.clone().or_else(|| look.then(|| find_lyrics(song, answers)).flatten())
     };
-    let genius =
-        settings().lyrics_providers.iter().map(String::as_str).any(|name| name == "genius" || name == "synced");
-    if mode.replace && !mode.force && genius {
-        match recheck(song) {
+    if mode.replace && !mode.force && asks_genius() {
+        match recheck(song, answers) {
             Check::Keep => {}
             Check::Replace(Some(words)) => {
                 log("WARNING", &format!("{}: lyrics replaced, they were another song's", file.display()));
@@ -204,14 +192,22 @@ fn look_up_lyrics(file: &Path, song: &mut Song, state: &Tagged, mode: Mode) -> b
 
 /// Writes what `meta` found: for a Spotify song, the tags, the lyrics, the folder art and the `.lrc` file; for another,
 /// only its lyrics, since it keeps its own tags.
-fn write(file: &Path, song: &Song, state: &Tagged, mode: Mode, cleared: bool) -> R<()> {
+fn write(
+    file: &Path,
+    tags: &mut Tags,
+    song: &Song,
+    state: &Tagged,
+    mode: Mode,
+    cleared: bool,
+    answers: &Answers,
+) -> R<()> {
     let on_spotify = !song.song_id.is_empty();
     if on_spotify {
         write_folder_art(file, song)?;
     }
     // A song whose tags are not written again (tagged, or not on Spotify) is measured on its own.
     if state.measure && (!on_spotify || (state.tagged && !mode.force)) {
-        write_track_gain(file)?;
+        tags.set_track_gain()?;
     }
     if on_spotify {
         // Missing lyrics alone do not write the tags again: only the lyrics, or the key that none were found. Tags
@@ -219,31 +215,31 @@ fn write(file: &Path, song: &Song, state: &Tagged, mode: Mode, cleared: bool) ->
         // `--overwrite metadata` writes the tags again from Spotify and Deezer (fixed track totals, dates and flags
         // reach files tagged before), keeping the file's lyrics, source URL and measured gain.
         if !state.tagged || mode.force || mode.replace {
-            write_tags(file, song)?;
+            tags.set_song(song, none_found(song, answers));
         }
-        let changed = song.lyrics != state.stored || (!state.complete && genius_answered(song));
+        let changed = song.lyrics != state.stored || (!state.complete && genius_answered(song, answers));
         if cleared || (state.tagged && !mode.force && changed) {
-            write_lyrics(file, song.lyrics.clone())?;
+            tags.set_lyrics(song.lyrics.clone())?;
         }
-        write_lrc(file, song)
     } else {
         let new = song.lyrics.clone().filter(|_| song.lyrics != state.stored);
-        let none_found = song.lyrics.is_none() && (cleared || !state.no_lyrics && genius_answered(song));
-        write_lrc(file, song)?;
+        let none_found = song.lyrics.is_none() && (cleared || !state.no_lyrics && genius_answered(song, answers));
         if new.is_some() || none_found {
-            write_lyrics(file, new)?;
+            tags.set_lyrics(new)?;
         }
-        Ok(())
     }
+    tags.save()?;
+    write_lrc(file, song, tags.length(), answers)
 }
 
 /// Tags one file. The song to download again, when `--redownload` asks for it.
 fn meta_file(file: &Path) -> R<Option<Song>> {
-    let state = read_tags(file)?;
-    let mode = Mode::current();
+    let mut tags = Tags::open(file)?;
+    let mut state = read_tags(file, &tags)?;
+    let (mode, answers) = (Mode::current(), Answers::default());
     clean_lrc(file)?;
     let tidy_only = state.complete && !mode.force && !mode.redownload && !mode.replace && !state.folder_art_missing;
-    if tidy_only && tidy(file, &state)? {
+    if tidy_only && tidy(file, &mut tags, &mut state, &answers)? {
         return Ok(None);
     }
     let found = match &state.spotify_url {
@@ -262,25 +258,9 @@ fn meta_file(file: &Path) -> R<Option<Song>> {
             song.date = date.into();
         }
     }
-    let cleared = look_up_lyrics(file, &mut song, &state, mode);
-    write(file, &song, &state, mode, cleared)?;
+    let cleared = look_up_lyrics(file, &mut song, &state, mode, &answers);
+    write(file, &mut tags, &song, &state, mode, cleared, &answers)?;
     Ok((mode.redownload && on_spotify).then_some(song))
-}
-
-/// One download per output file, local songs first: a song is downloaded once, also when it is on the album of several
-/// files (`--fetch-albums`), and the threads do not write the same file. A pinned video is kept.
-fn redownload_jobs(songs: Vec<Song>) -> Vec<Song> {
-    let (mut jobs, mut slots) = (Vec::<Song>::new(), HashMap::new());
-    for song in songs {
-        let slot = *slots.entry(out_path(&song, "redownload").0).or_insert_with(|| {
-            jobs.push(song.clone());
-            jobs.len() - 1
-        });
-        if jobs[slot].download_url.is_none() {
-            jobs[slot].download_url = song.download_url;
-        }
-    }
-    jobs
 }
 
 pub(crate) fn meta(paths: &[String]) -> R<()> {
@@ -312,17 +292,12 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
     // The songs are downloaded again after all files are done, as a download, so that each is downloaded once.
     let local: Vec<(PathBuf, Song)> =
         files.iter().zip(results).filter_map(|(file, result)| Some((file.clone(), result.ok()??))).collect();
-    let _ = REDOWNLOADS.set(local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect());
+    let redownloads = local.iter().rev().map(|(file, song)| (song.url.clone(), file.clone())).collect();
+    let run = Run { op: Op::Redownload, redownloads, ..Run::default() };
     let mut songs: Vec<Song> = local.into_iter().map(|(_, song)| song).collect();
     let mut lost = 0;
     if settings().fetch_albums {
-        let mut albums: Vec<String> = songs
-            .iter()
-            .filter(|song| !song.album_id.is_empty())
-            .map(|song| format!("https://open.spotify.com/album/{}", song.album_id))
-            .collect();
-        albums.sort();
-        albums.dedup();
+        let albums = crate::album_queries(&songs);
         let resolved: Vec<_> =
             pool.install(|| albums.par_iter().map(|album| (album, spotify::resolve(album))).collect());
         for (album, result) in resolved {
@@ -335,9 +310,10 @@ pub(crate) fn meta(paths: &[String]) -> R<()> {
             }
         }
     }
-    let jobs = redownload_jobs(songs);
+    // Local songs first: an album's song that is also a local file replaces that file.
+    let jobs = jobs(&songs, |song| out_path(song, &run).0).0;
     let done: Vec<R<PathBuf>> =
-        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, "redownload").1).collect());
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| process(song, &run).1).collect());
     lost += done.iter().filter(|result| result.is_err()).count();
     album_gains(&files.into_iter().chain(done.into_iter().flatten()).collect::<Vec<_>>());
     report_unchecked();
@@ -359,7 +335,8 @@ mod tests {
     fn redownloads_replace_local_files_and_download_each_song_once() {
         crate::settings::use_defaults();
         let file = PathBuf::from("/music/Artist/Album (2020)/Artist - Album (2020) - 01 - One.mp3");
-        let _ = REDOWNLOADS.set([("https://open.spotify.com/track/1".into(), file.clone())].into());
+        let redownloads = [("https://open.spotify.com/track/1".to_string(), file.clone())].into();
+        let run = Run { op: Op::Redownload, redownloads, ..Run::default() };
         let song = |id: &str, name: &str| Song {
             url: format!("https://open.spotify.com/track/{id}"),
             name: name.into(),
@@ -370,12 +347,12 @@ mod tests {
         // The local song, then the album's songs of each of two files of the album.
         let album = [song("1", "One"), song("2", "Two")];
         let songs = [vec![local], album.to_vec(), album.to_vec()].concat();
-        let jobs = redownload_jobs(songs);
+        let jobs = jobs(&songs, |song| out_path(song, &run).0).0;
         assert_eq!(jobs.iter().map(|song| song.name.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
         assert_eq!(jobs[0].download_url.as_deref(), Some("https://music.youtube.com/watch?v=pinned"));
-        assert_eq!(out_path(&jobs[0], "redownload"), (file.with_extension("opus"), Some(&file)));
-        assert_eq!(out_path(&jobs[1], "redownload"), (path(&jobs[1]), None));
+        assert_eq!(out_path(&jobs[0], &run), (file.with_extension("opus"), Some(&file)));
+        assert_eq!(out_path(&jobs[1], &run), (path(&jobs[1]), None));
         // Only `meta --redownload` writes to the local file; a download goes by the output template.
-        assert_eq!(out_path(&jobs[0], "download").0, PathBuf::from("Artist - One.opus"));
+        assert_eq!(out_path(&jobs[0], &Run::default()).0, PathBuf::from("Artist - One.opus"));
     }
 }

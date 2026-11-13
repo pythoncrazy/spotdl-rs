@@ -1,11 +1,10 @@
 //! Downloading songs: fetching the audio, tagging it, and putting it where the output template says.
 
 use crate::files::{audio_files, output_root, path, skip_path, write_folder_art};
-use crate::lyrics::{find_lyrics, write_lrc};
-use crate::meta::REDOWNLOADS;
-use crate::settings::settings;
-use crate::tags::{audio, source_url, write_tags};
-use crate::{log, search, spotify, Song, R};
+use crate::lyrics::{find_lyrics, none_found, write_lrc, Answers};
+use crate::settings::{settings, Op};
+use crate::tags::{peek, source_url, write_tags};
+use crate::{deezer, log, search, Song, R};
 use lofty::{prelude::*, tag::ItemKey};
 use sha1::{Digest, Sha1};
 use std::{
@@ -23,8 +22,32 @@ static ARCHIVED: OnceLock<HashSet<String>> = OnceLock::new();
 
 static SCANNED: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
 
-/// The files `sync` moved to a new path, whose tags are written again.
-static MOVED: OnceLock<HashSet<PathBuf>> = OnceLock::new();
+/// What a run does, and what it found out before its downloads.
+#[derive(Default)]
+pub(crate) struct Run {
+    pub op: Op,
+    /// The files `sync` moved to a new path, whose tags are written again.
+    pub moved: HashSet<PathBuf>,
+    /// The files `meta --redownload` downloads again, by song URL.
+    pub redownloads: HashMap<String, PathBuf>,
+}
+
+/// One job per output file (`key`): a song is downloaded once, also when several queries or albums have it, and no two
+/// threads write the same file. A pinned YouTube URL beats a search. Returns the jobs, and the job of each song.
+pub(crate) fn jobs(songs: &[Song], key: impl Fn(&Song) -> PathBuf) -> (Vec<Song>, Vec<usize>) {
+    let (mut jobs, mut slots, mut index) = (Vec::<Song>::new(), HashMap::new(), Vec::new());
+    for song in songs {
+        let slot = *slots.entry(key(song)).or_insert_with(|| {
+            jobs.push(song.clone());
+            jobs.len() - 1
+        });
+        if jobs[slot].download_url.is_none() {
+            jobs[slot].download_url.clone_from(&song.download_url);
+        }
+        index.push(slot);
+    }
+    (jobs, index)
+}
 
 fn archive(url: &str) -> R<()> {
     if let Some(path) = settings().archive.as_deref() {
@@ -141,7 +164,7 @@ fn temp_id(song: &Song) -> String {
 
 /// Downloads the pinned URL, else the search candidates in order; returns the URL that worked and the downloaded
 /// (untagged) temporary file.
-fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
+fn download_audio(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     let id = temp_id(song);
     remove_temp_files(out, &id);
     let mut failure = None;
@@ -167,31 +190,32 @@ fn download(song: &Song, out: &Path) -> R<(String, PathBuf)> {
     Err(failure.unwrap_or_else(|| "no match".into()))
 }
 
-/// The file `op` writes a song to: `meta --redownload` replaces a local song's own file (its name with the selected
+/// The file a run writes a song to: `meta --redownload` replaces a local song's own file (its name with the selected
 /// format's extension), not a file at the output template's path, which would leave the old file as a duplicate.
-pub(crate) fn out_path(s: &Song, op: &str) -> (PathBuf, Option<&'static PathBuf>) {
-    match REDOWNLOADS.get().filter(|_| op == "redownload").and_then(|files| files.get(&s.url)) {
+pub(crate) fn out_path<'a>(s: &Song, run: &'a Run) -> (PathBuf, Option<&'a PathBuf>) {
+    match run.redownloads.get(&s.url) {
         Some(file) => (file.with_extension(settings().format.as_str()), Some(file)),
         None => (path(s), None),
     }
 }
 
 /// Saves, prints or downloads one song; `redownload` is a download that replaces the file.
-fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
-    if op == "save" {
+fn finish(s: &mut Song, run: &Run) -> R<PathBuf> {
+    let op = run.op;
+    if op == Op::Save {
         if settings().preload && s.download_url.is_none() {
             // Spotify gives no ISRC; Deezer's is what lets the search find the release's own recording, as a download
             // does. The save file keeps it, so a later download searches by it too.
             enrich(s);
             s.download_url = search::find(s).ok().and_then(|urls| urls.into_iter().next());
         }
-        s.lyrics = find_lyrics(s);
+        s.lyrics = find_lyrics(s, &Answers::default());
         return Ok(path(s));
     }
     if s.name.trim().is_empty() {
         return Err(format!("Spotify has no metadata for {}", s.url).into());
     }
-    if op == "url" {
+    if op == Op::Url {
         if s.download_url.is_none() {
             // The same search as a download's: with Deezer's ISRC.
             enrich(s);
@@ -203,12 +227,12 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     if early {
         enrich(s);
     }
-    let (out, local) = out_path(s, op);
+    let (out, local) = out_path(s, run);
     let scan = || {
         let root = output_root();
         let mut files = Vec::new();
         audio_files(if root.as_os_str().is_empty() { Path::new(".") } else { &root }, &mut files);
-        let tagged = files.into_iter().filter_map(|file| Some((source_url(audio(&file).ok()?.primary_tag()?)?, file)));
+        let tagged = files.into_iter().filter_map(|file| Some((source_url(peek(&file).ok()?.primary_tag()?)?, file)));
         tagged.collect()
     };
     let scanned = settings().scan_for_songs.then(|| SCANNED.get_or_init(scan).get(&s.url).cloned()).flatten();
@@ -231,9 +255,9 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     let skip = settings().respect_skip_file && skip_path(&target).exists();
     let (exists, overwrite) = (target.is_file(), settings().overwrite.as_str());
     // A moved file is not downloaded again, but its tags are written again for its new title, album or year.
-    let moved = exists && MOVED.get().is_some_and(|moved| moved.contains(&target));
+    let moved = exists && run.moved.contains(&target);
     let keep = archived || skip || exists && overwrite == "skip" && !settings().force_update_metadata;
-    if op != "redownload" && !moved && keep {
+    if op != Op::Redownload && !moved && keep {
         if exists && !archived {
             archive(&s.url)?;
         }
@@ -244,37 +268,43 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
     }
     // A moved file's lyrics are the song's: they are kept rather than fetched again from paced sites.
     if moved && s.lyrics.is_none() {
-        let tag = audio(&target).ok();
+        let tag = peek(&target).ok();
         let lyrics = tag.as_ref().and_then(|audio| audio.primary_tag()?.get_string(&ItemKey::Lyrics).map(String::from));
         s.lyrics = lyrics.filter(|lyrics| !lyrics.is_empty());
     }
     // Lyrics sites are paced, so fetch them while the audio downloads.
-    let song = s.clone();
+    let (song, answers) = (&*s, Answers::default());
     let (lyrics, downloaded) = std::thread::scope(|scope| {
-        let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(&song)));
-        let downloaded = (!exists || overwrite == "force" || op == "redownload").then(|| download(&song, &out));
-        (lyrics.join().ok().flatten(), downloaded)
+        let lyrics = scope.spawn(|| song.lyrics.clone().or_else(|| find_lyrics(song, &answers)));
+        let download = !exists || overwrite == "force" || op == Op::Redownload;
+        (lyrics.join().ok().flatten(), download.then(|| download_audio(song, &out)))
     });
     s.lyrics = lyrics;
-    match downloaded.transpose()? {
+    let none_found = none_found(s, &answers);
+    let length = match downloaded.transpose()? {
         // The audio is tagged before it gets its name: a file at `out` is a finished song, which later runs skip and
         // archive, so a failed or interrupted tagging must not leave an untagged one there.
         Some((url, temp)) => {
             s.download_url = Some(url);
-            if let Err(error) = write_tags(&temp, s).and_then(|()| Ok(fs::rename(&temp, &out)?)) {
+            let tagged = write_tags(&temp, s, none_found).and_then(|length| {
+                fs::rename(&temp, &out)?;
+                Ok(length)
+            });
+            if tagged.is_err() {
                 let _ = fs::remove_file(&temp);
-                return Err(error);
             }
+            let length = tagged?;
             if target != out && target.is_file() {
                 fs::remove_file(&target)?;
                 let _ = fs::remove_file(skip_path(&target));
             }
             target = out;
+            length
         }
-        None => write_tags(&target, s)?,
-    }
+        None => write_tags(&target, s, none_found)?,
+    };
     write_folder_art(&target, s)?;
-    write_lrc(&target, s)?;
+    write_lrc(&target, s, length, &answers)?;
     if settings().create_skip_file {
         fs::write(skip_path(&target), "")?;
     }
@@ -284,18 +314,18 @@ fn finish(s: &mut Song, op: &str) -> R<PathBuf> {
 
 /// Adds Deezer's metadata, warning when Deezer failed: the song is then tagged without genres, ISRC or barcode.
 pub(crate) fn enrich(s: &mut Song) -> bool {
-    let result = spotify::enrich(s);
+    let result = deezer::enrich(s);
     if let Err(error) = &result {
         log("WARNING", &format!("{} - {}: no Deezer genres, ISRC or barcode: {error}", s.artists.join(", "), s.name));
     }
     result.is_ok()
 }
 
-pub(crate) fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
+pub(crate) fn process(mut song: Song, run: &Run) -> (Song, R<PathBuf>) {
     let label = format!("{} - {}", song.artists.join(", "), song.name);
-    let result = finish(&mut song, op);
+    let result = finish(&mut song, run);
     match &result {
-        Ok(_) if op == "url" => println!("{}", song.download_url.as_deref().unwrap_or_default()),
+        Ok(_) if run.op == Op::Url => println!("{}", song.download_url.as_deref().unwrap_or_default()),
         Ok(path) if settings().simple_tui => println!("{label}: {}", path.display()),
         Ok(path) => log("INFO", &format!("{label}: {}", path.display())),
         Err(error) => {
@@ -308,8 +338,9 @@ pub(crate) fn process(mut song: Song, op: &str) -> (Song, R<PathBuf>) {
     (song, result)
 }
 
-/// Moves (or, for songs no longer listed, deletes) the files of songs whose output path changed.
-pub(crate) fn prune(old: &[Song], new: &[Song]) {
+/// Moves (or, for songs no longer listed, deletes) the files of songs whose output path changed. Returns the files at
+/// their new paths.
+pub(crate) fn prune(old: &[Song], new: &[Song]) -> HashSet<PathBuf> {
     let next: HashMap<&str, &Song> = new.iter().rev().map(|song| (song.url.as_str(), song)).collect();
     // A file a listed song writes is that song's, also when its URL changed (Spotify gives re-released songs new IDs):
     // it is kept for the song's job, not deleted before a download that can fail.
@@ -346,7 +377,7 @@ pub(crate) fn prune(old: &[Song], new: &[Song]) {
         }
         remove_empty(&from);
     }
-    let _ = MOVED.set(moved);
+    moved
 }
 
 /// Removes the folders of `file` (up to the output's fixed folder) that hold nothing more than the folder images of
