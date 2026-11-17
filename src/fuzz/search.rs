@@ -23,14 +23,14 @@ fn scores_are_finite_and_never_negative() {
         let (wanted, found) = (song(rng), song(rng));
         let kind = *rng.pick(&[Kind::Atv, Kind::Omv, Kind::Other]);
         let hit = Hit {
-            song: found,
+            video: found.into(),
             verified: rng.below(2) == 0,
             isrc: rng.below(2) == 0,
             kind,
             explicit: rng.below(2) == 0,
         };
         let score = score(&wanted, &hit);
-        assert!(score.is_finite() && score >= 0.0, "{score} for {:?} and {:?}", wanted.name, hit.song.name);
+        assert!(score.is_finite() && score >= 0.0, "{score} for {:?} and {:?}", wanted.name, hit.video.name);
         let _ = isrc_picks(&wanted, vec![hit]).count();
     });
 }

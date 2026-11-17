@@ -1,19 +1,33 @@
 //! LRCLIB, a crowd's uploads of lyrics, and the synced lyrics among them.
 
-use crate::lyrics::{is_synced, lyrics_title, plain_title, same_lyrics, timed_for, Lyrics};
-use crate::{http::Service, url_encode, Song};
+use crate::lyrics::{is_synced, lyrics_title, same_album, same_lyrics, timed_for, Answers, Lyrics};
+use crate::{http::Service, lock, url_encode, Song};
+use serde::Deserialize;
 use serde_json::Value;
-use std::{
-    collections::HashSet,
-    sync::{Mutex, PoisonError},
-};
+use std::{collections::HashSet, sync::Arc};
 
 pub(crate) static LRCLIB: Service = Service::new("LRCLIB", 750, false);
 
+/// One upload of a song's lyrics.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct Upload {
+    duration: Option<f64>,
+    instrumental: Option<bool>,
+    album_name: Option<String>,
+    synced_lyrics: Option<String>,
+    plain_lyrics: Option<String>,
+}
+
+/// The uploads of a search reply; one that is not as LRCLIB writes them is left out.
+pub(crate) fn uploads(reply: Vec<Value>) -> Vec<Upload> {
+    reply.into_iter().filter_map(|upload| serde_json::from_value(upload).ok()).collect()
+}
+
 /// LRCLIB's search results for a URL. LRCLIB refuses requests when it is busy; [`Service::get`] waits and asks again,
 /// so that a busy moment does not replace synced lyrics with plain ones.
-fn lrclib_search(url: &str) -> Option<Vec<Value>> {
-    serde_json::from_slice(&LRCLIB.get(url, &[])?).ok()
+fn lrclib_search(url: &str) -> Option<Vec<Upload>> {
+    Some(uploads(serde_json::from_slice(&LRCLIB.get(url, &[])?).ok()?))
 }
 
 /// What LRCLIB has for a song, among the versions as long as it.
@@ -51,85 +65,60 @@ impl Versions {
 /// any for, found one artist at a time as the caller asks for more. LRCLIB files a song under one of its artists
 /// ("KING" of ¥$ is under Kanye West), and the first artist's versions can be wrong: under Jack Harlow, the only
 /// version as long as his WHATS POPPIN remix has the words of the original, and the 20 right ones are under Tory Lanez.
-/// `keep`: the `.lrc` writer will search again (see [`lrclib_tracks`]).
-pub(crate) fn lrclib(song: &Song, keep: bool) -> impl Iterator<Item = Versions> + '_ {
-    lrclib_with(song, keep, lrclib_search)
+pub(crate) fn lrclib<'a>(song: &'a Song, answers: &'a Answers) -> impl Iterator<Item = Versions> + 'a {
+    lrclib_with(song, answers, lrclib_search)
 }
 
-fn lrclib_with(song: &Song, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> impl Iterator<Item = Versions> + '_ {
+fn lrclib_with<'a>(
+    song: &'a Song,
+    answers: &'a Answers,
+    search: fn(&str) -> Option<Vec<Upload>>,
+) -> impl Iterator<Item = Versions> + 'a {
     let artists = std::iter::once(&song.artist).chain(song.artists.iter().filter(|artist| **artist != song.artist));
     artists
         .filter(|artist| !artist.is_empty())
-        .map(move |artist| lrclib_by(song, artist, keep, search))
+        .map(move |artist| lrclib_by(song, artist, answers, search))
         .filter(|found| !found.is_empty())
 }
 
-fn lrclib_by(song: &Song, artist: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Versions {
+fn lrclib_by(song: &Song, artist: &str, answers: &Answers, search: fn(&str) -> Option<Vec<Upload>>) -> Versions {
     let url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         url_encode(artist),
         url_encode(lyrics_title(song))
     );
-    let Some(tracks) = lrclib_tracks(&url, keep, search) else {
-        return Versions::default();
-    };
-    lrclib_lyrics(song, &tracks)
+    asked_once(&url, answers, search).map(|uploads| lrclib_lyrics(song, &uploads)).unwrap_or_default()
 }
 
-/// LRCLIB's search results kept for the `.lrc` writer, by URL, oldest first.
-type Kept = std::collections::VecDeque<(String, Vec<Value>)>;
-
-static LRCLIB_FOUND: std::sync::LazyLock<Mutex<Kept>> = std::sync::LazyLock::new(Default::default);
-
-/// A search reply can be over 100 KB; this is room for the songs in progress, not for a library.
-const LRCLIB_KEPT: usize = 256;
-
 /// `search`'s results for a URL. The lyrics provider and the `.lrc` writer search for the same song; LRCLIB is often
-/// busy, so it is asked once: the provider keeps its results (`keep`) and the writer takes them. The writer keeps
-/// nothing, since nothing searches after it, and results the writer does not take (no `.lrc` to write) are dropped when
-/// newer ones come: once kept by everyone, they filled gigabytes over a library.
-fn lrclib_tracks(url: &str, keep: bool, search: fn(&str) -> Option<Vec<Value>>) -> Option<Vec<Value>> {
-    let taken = {
-        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
-        found.iter().position(|(key, _)| key == url).and_then(|at| found.remove(at)).map(|(_, tracks)| tracks)
-    };
-    if taken.is_some() {
-        return taken;
-    }
-    let tracks = search(url)?;
-    if keep {
-        let mut found = LRCLIB_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
-        if found.len() >= LRCLIB_KEPT {
-            found.pop_front();
-        }
-        found.push_back((url.to_string(), tracks.clone()));
-    }
-    Some(tracks)
+/// busy, so it is asked once, and the results stay in the song's `answers`: kept for the run, they filled gigabytes
+/// over a library. A failed search is not kept.
+fn asked_once(url: &str, answers: &Answers, search: fn(&str) -> Option<Vec<Upload>>) -> Option<Arc<Vec<Upload>>> {
+    let known = lock(&answers.lrclib).get(url).cloned();
+    known.or_else(|| {
+        let uploads = Arc::new(search(url)?);
+        lock(&answers.lrclib).insert(url.into(), uploads.clone());
+        Some(uploads)
+    })
 }
 
 /// [`lrclib_by`]'s versions of LRCLIB's search results. When every version as long as the song is marked instrumental,
 /// LRCLIB answers that the song has no words, so that the lyrics providers stop and do not take another song's words
 /// from a site that goes by the title alone.
-pub(crate) fn lrclib_lyrics(song: &Song, tracks: &[Value]) -> Versions {
-    let near: Vec<&Value> = tracks
-        .iter()
-        .filter(|track| (track["duration"].as_f64().unwrap_or_default() - song.duration).abs() < 4.0)
-        .collect();
-    if !near.is_empty() && near.iter().all(|track| track["instrumental"].as_bool() == Some(true)) {
+pub(crate) fn lrclib_lyrics(song: &Song, uploads: &[Upload]) -> Versions {
+    let near: Vec<&Upload> =
+        uploads.iter().filter(|upload| (upload.duration.unwrap_or_default() - song.duration).abs() < 4.0).collect();
+    if !near.is_empty() && near.iter().all(|upload| upload.instrumental == Some(true)) {
         return Versions { instrumental: true, lyrics: vec![] };
     }
-    let album = plain_title(&song.album_name);
-    let text =
-        |track: &Value, key: &str| track[key].as_str().filter(|lyrics| !lyrics.trim().is_empty()).map(String::from);
+    let text = |lyrics: &Option<String>| lyrics.clone().filter(|lyrics| !lyrics.trim().is_empty());
     let mut found: Vec<(bool, bool, String)> = near
         .into_iter()
-        .filter_map(|track| {
-            let other = plain_title(track["albumName"].as_str().unwrap_or_default());
-            let same_album =
-                !album.is_empty() && !other.is_empty() && (other.starts_with(&album) || album.starts_with(&other));
+        .filter_map(|upload| {
+            let same_album = same_album(&song.album_name, upload.album_name.as_deref().unwrap_or_default());
             // Synced lyrics timed to a longer recording keep their words, as plain lyrics.
-            let synced = text(track, "syncedLyrics").filter(|lyrics| timed_for(lyrics, song.duration));
-            Some((!same_album, synced.is_none(), synced.or_else(|| text(track, "plainLyrics"))?))
+            let synced = text(&upload.synced_lyrics).filter(|lyrics| timed_for(lyrics, song.duration));
+            Some((!same_album, synced.is_none(), synced.or_else(|| text(&upload.plain_lyrics))?))
         })
         .collect();
     found.sort_by_key(|(other_album, plain, _)| (*other_album, *plain));
@@ -164,11 +153,11 @@ mod tests {
             ..Song::default()
         };
         let track = |album: &str, key: &str, text: &str| json!({"albumName": album, "duration": 224.0, key: text});
-        let tracks = [
+        let tracks = vec![
             track("Tonight: Franz Ferdinand", "syncedLyrics", "[00:12.00] Lucid dreams"),
             track("Hits To The Head", "plainLyrics", "Lucid dreams"),
         ];
-        let found = lrclib_lyrics(&song, &tracks);
+        let found = lrclib_lyrics(&song, &uploads(tracks));
         assert_eq!(found.lyrics[0], "Lucid dreams");
         let words = |text: &str| Some(Lyrics::Words(text.into()));
         // Genius's lyrics are those of the plain version: the synced one still agrees by its words.
@@ -181,9 +170,9 @@ mod tests {
     fn unchecked_lrclib_lyrics_must_be_synced() {
         let song = Song { name: "Funky Screw".into(), duration: 211.0, ..Song::default() };
         let plain = serde_json::json!({"duration": 210.6, "syncedLyrics": "", "plainLyrics": "半チャーハン 一升半"});
-        assert_eq!(lrclib_lyrics(&song, std::slice::from_ref(&plain)).pick(None), None);
+        assert_eq!(lrclib_lyrics(&song, &uploads(vec![plain.clone()])).pick(None), None);
         let synced = serde_json::json!({"duration": 211.0, "syncedLyrics": "[00:12.00] Screw"});
-        let found = lrclib_lyrics(&song, &[plain, synced]);
+        let found = lrclib_lyrics(&song, &uploads(vec![plain, synced]));
         assert_eq!(found.pick(None), Some(Lyrics::Words("[00:12.00] Screw".into())));
         let instrumental = Versions { instrumental: true, lyrics: vec![] };
         assert_eq!(instrumental.pick(None), Some(Lyrics::Instrumental));
@@ -209,38 +198,29 @@ mod tests {
             let lines = (0..30).map(|i| format!("[00:{i:02}.00] {word}{i} {word}{}", i + 1));
             lines.chain([format!("[{end}:00.00] {word}end")]).collect::<Vec<_>>().join("\n")
         }
-        fn search(url: &str) -> Option<Vec<Value>> {
+        fn search(url: &str) -> Option<Vec<Upload>> {
             let (words, album) = match url.contains("artist_name=Jack%20Harlow") {
                 true => (lyrics("original", 2), "Sweet Action"),
                 false => (lyrics("remix", 3), "WHATS POPPIN"),
             };
-            Some(vec![serde_json::json!({"duration": 227.5, "syncedLyrics": words, "albumName": album})])
+            Some(uploads(vec![serde_json::json!({"duration": 227.5, "syncedLyrics": words, "albumName": album})]))
         }
         let plain = plain_lyrics(&lyrics("remix", 3));
-        let found = lrclib_with(&song, false, search).find_map(|versions| versions.pick(Some(&plain)));
+        let found = lrclib_with(&song, &Answers::default(), search).find_map(|versions| versions.pick(Some(&plain)));
         assert_eq!(found, Some(Lyrics::Words(lyrics("remix", 3))));
     }
 
-    /// LRCLIB's results are kept only for the `.lrc` writer's search after the provider's, and only for a while: every
-    /// search's results, kept until the run ended, filled gigabytes over a library.
+    /// The lyrics provider and the `.lrc` writer of a song ask LRCLIB once between them; the next song asks again,
+    /// and a failed search is not an answer. Every search's results, kept until the run ended, filled gigabytes.
     #[test]
-    fn lrclib_results_are_not_kept_for_the_whole_run() {
-        let reply = |_: &str| Some(vec![serde_json::json!({"duration": 200.0, "plainLyrics": "Words"})]);
+    fn lrclib_is_asked_once_for_a_song() {
+        let reply = |_: &str| Some(uploads(vec![serde_json::json!({"duration": 200.0, "plainLyrics": "Words"})]));
         let none = |_: &str| None;
-        let kept = |url: &str| LRCLIB_FOUND.lock().unwrap().iter().any(|(key, _)| key == url);
-        // The writer's search, the only one when Genius answered, keeps nothing.
-        assert!(lrclib_tracks("test:writer", false, reply).is_some());
-        assert!(!kept("test:writer"));
-        // The provider's search is kept, and the writer takes it.
-        assert!(lrclib_tracks("test:provider", true, reply).is_some());
-        assert!(lrclib_tracks("test:provider", false, none).is_some());
-        assert!(!kept("test:provider"));
-        // Results nobody takes make room for newer ones.
-        for n in 0..=LRCLIB_KEPT {
-            lrclib_tracks(&format!("test:untaken {n}"), true, reply);
-        }
-        assert!(LRCLIB_FOUND.lock().unwrap().len() <= LRCLIB_KEPT);
-        assert!(!kept("test:untaken 0") && kept(&format!("test:untaken {LRCLIB_KEPT}")));
+        let answers = Answers::default();
+        assert!(asked_once("test:url", &answers, none).is_none());
+        assert_eq!(asked_once("test:url", &answers, reply).unwrap().len(), 1);
+        assert_eq!(asked_once("test:url", &answers, none).unwrap().len(), 1);
+        assert!(asked_once("test:url", &Answers::default(), none).is_none());
     }
 
     /// LRCLIB's word that a song is an instrumental is an answer, but only when every version as long as the song says
@@ -249,10 +229,10 @@ mod tests {
     fn lrclib_instrumentals_are_an_answer() {
         let song = Song { name: "Interstellar Overdrive".into(), duration: 581.0, ..Song::default() };
         let track = |d: f64, i: bool, p: &str| serde_json::json!({"duration": d, "instrumental": i, "plainLyrics": p});
-        let instrumental = [track(582.0, true, ""), track(580.0, true, ""), track(300.0, false, "Marigolds")];
-        assert_eq!(lrclib_lyrics(&song, &instrumental), Versions { instrumental: true, lyrics: vec![] });
-        let mixed = [track(582.0, true, ""), track(580.0, false, "Some words")];
-        assert_eq!(lrclib_lyrics(&song, &mixed).lyrics, vec!["Some words".to_string()]);
-        assert!(lrclib_lyrics(&song, &[track(300.0, true, "")]).is_empty());
+        let instrumental = vec![track(582.0, true, ""), track(580.0, true, ""), track(300.0, false, "Marigolds")];
+        assert_eq!(lrclib_lyrics(&song, &uploads(instrumental)), Versions { instrumental: true, lyrics: vec![] });
+        let mixed = vec![track(582.0, true, ""), track(580.0, false, "Some words")];
+        assert_eq!(lrclib_lyrics(&song, &uploads(mixed)).lyrics, vec!["Some words".to_string()]);
+        assert!(lrclib_lyrics(&song, &uploads(vec![track(300.0, true, "")])).is_empty());
     }
 }

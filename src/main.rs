@@ -1,3 +1,4 @@
+mod deezer;
 mod download;
 mod files;
 mod genius;
@@ -12,16 +13,17 @@ mod settings;
 mod spotify;
 mod tags;
 
-use crate::settings::settings;
+use crate::download::Run;
+use crate::settings::{settings, Op};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{LazyLock, Mutex, MutexGuard, PoisonError},
     time::UNIX_EPOCH,
 };
 
@@ -84,6 +86,11 @@ pub(crate) struct Extra {
     pub release: Option<Box<Song>>,
 }
 
+/// The value of `mutex`, also after a thread panicked while it held it: a failed song must not fail the others.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub(crate) fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
 }
@@ -92,7 +99,7 @@ pub(crate) fn now() -> u64 {
 const CACHE_DAYS: u64 = 7;
 
 /// `fetch()`, remembered in `~/.spotdl/cache` for `days` (0 means not at all, at most [`CACHE_DAYS`] or forever).
-pub(crate) fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> R<Value> {
+pub(crate) fn cached<T: Serialize + DeserializeOwned>(key: &str, days: u64, fetch: impl FnOnce() -> R<T>) -> R<T> {
     // Entries kept for good go to their own folder, which [`prune_cache`] leaves alone: the names are hashes.
     let dir = if days == u64::MAX { HOME.join("cache/keep") } else { HOME.join("cache") };
     let path = dir.join(&format!("{:x}", Sha1::digest(key))[..16]);
@@ -104,14 +111,14 @@ pub(crate) fn cached(key: &str, days: u64, fetch: impl FnOnce() -> R<Value>) -> 
         }
     }
     let value = fetch()?;
-    if days > 0 {
-        let _ = fs::create_dir_all(dir).and_then(|_| fs::write(&path, value.to_string()));
+    if let Some(bytes) = serde_json::to_vec(&value).ok().filter(|_| days > 0) {
+        let _ = fs::create_dir_all(dir).and_then(|_| fs::write(&path, bytes));
     }
     Ok(value)
 }
 
 /// Deletes the files in `dir` older than `days`. An expired entry is otherwise only replaced when its key is asked for
-/// again, so the cache (mostly YouTube Music replies of up to 300 KB) grew with every new query, without end.
+/// again, so the cache grew with every new query, without end.
 fn prune_cache(dir: &Path, days: u64) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let meta = entry.metadata().ok().filter(|meta| meta.is_file());
@@ -183,15 +190,20 @@ fn resolve(queries: &[String], albums: bool) -> (Vec<Song>, Vec<String>) {
         }
     }
     if albums {
-        let mut ids: Vec<String> = songs.iter().map(|song| format!("spotify:album:{}", song.album_id)).collect();
-        ids.retain(|id| id.len() > 14);
-        ids.sort();
-        ids.dedup();
-        let (more, failed) = resolve(&ids, false);
+        let (more, failed) = resolve(&album_queries(&songs), false);
         songs.extend(more);
         errors.extend(failed);
     }
     (songs, errors)
+}
+
+/// The albums of `songs`, each once, as queries: `--fetch-albums` downloads them whole.
+pub(crate) fn album_queries(songs: &[Song]) -> Vec<String> {
+    let ids = songs.iter().filter(|song| !song.album_id.is_empty());
+    let mut albums: Vec<String> = ids.map(|song| format!("spotify:album:{}", song.album_id)).collect();
+    albums.sort();
+    albums.dedup();
+    albums
 }
 
 fn relative(file: &Path, list: &Path) -> R<String> {
@@ -203,8 +215,8 @@ fn relative(file: &Path, list: &Path) -> R<String> {
 }
 
 /// One `.m3u8` per list name, with every song of every query, including duplicates that were downloaded once.
-fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
-    let Some(pattern) = settings().m3u.as_deref().filter(|_| op != "url") else {
+fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: Op) -> R<()> {
+    let Some(pattern) = settings().m3u.as_deref().filter(|_| op != Op::Url) else {
         return Ok(());
     };
     let pattern = match pattern {
@@ -216,7 +228,7 @@ fn write_m3u(listed: &[(&Song, &R<PathBuf>)], op: &str) -> R<()> {
     let first = listed.first().map_or_else(|| "playlist".into(), |(song, _)| files::fill("{list}", song));
     let mut files = BTreeMap::<String, String>::new();
     for (song, result) in listed {
-        if !(op == "save" || settings().add_unavailable || result.as_ref().is_ok_and(|path| path.is_file())) {
+        if !(op == Op::Save || settings().add_unavailable || result.as_ref().is_ok_and(|path| path.is_file())) {
             continue;
         }
         let path = result.as_ref().map_or_else(|_| files::path(song), Clone::clone);
@@ -277,16 +289,16 @@ fn run() -> R<()> {
     if save_file.is_some_and(|path| path != "-" && !path.ends_with(".spotdl")) {
         return Err("save file must end with .spotdl or be '-'".into());
     }
-    if op == "save" && save_file.is_none() {
+    if op == Op::Save && save_file.is_none() {
         return Err("save file is not specified".into());
     }
     let meta_threads = settings().meta_threads.max(1) as usize;
     rayon::ThreadPoolBuilder::new().num_threads(meta_threads).build_global()?;
     prune_cache(&HOME.join("cache"), CACHE_DAYS);
-    if op == "meta" {
+    if op == Op::Meta {
         return meta::meta(&queries);
     }
-    let sync_file = queries.first().filter(|query| op == "sync" && queries.len() == 1 && query.ends_with(".spotdl"));
+    let sync_file = queries.first().filter(|query| op == Op::Sync && queries.len() == 1 && query.ends_with(".spotdl"));
     let read = |path: &String| -> R<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
     let synced = sync_file.map(read).transpose()?;
     if synced.as_ref().is_some_and(|file| file["type"] != "sync" || !file["songs"].is_array()) {
@@ -297,36 +309,27 @@ fn run() -> R<()> {
         Some(file) => serde_json::from_value(file["query"].clone())?,
         None => queries,
     };
-    let downloads = matches!(op.as_str(), "download" | "sync");
+    let downloads = matches!(op, Op::Download | Op::Sync);
     let (songs, errors) = resolve(&queries, downloads && settings().fetch_albums);
+    let mut run = Run { op, ..Run::default() };
     if let Some(file) = synced.filter(|_| errors.is_empty() && !settings().sync_without_deleting) {
-        download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs);
+        run.moved = download::prune(&serde_json::from_value::<Vec<Song>>(file["songs"].clone())?, &songs);
     }
-    // One job per output file (per URL when nothing is written); a pinned YouTube URL beats a search.
-    let (mut jobs, mut slots, mut index) = (Vec::<Song>::new(), HashMap::new(), Vec::new());
-    for song in &songs {
-        let key = if downloads { files::path(song) } else { PathBuf::from(&song.url) };
-        let slot = *slots.entry(key).or_insert_with(|| {
-            jobs.push(song.clone());
-            jobs.len() - 1
-        });
-        if jobs[slot].download_url.is_none() {
-            jobs[slot].download_url.clone_from(&song.download_url);
-        }
-        index.push(slot);
-    }
-    let threads = if op == "save" { meta_threads } else { settings().threads.max(1) as usize };
+    // One job per output file (per URL when nothing is written).
+    let (jobs, index) =
+        download::jobs(&songs, |song| if downloads { files::path(song) } else { PathBuf::from(&song.url) });
+    let threads = if op == Op::Save { meta_threads } else { settings().threads.max(1) as usize };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let done: Vec<(Song, R<PathBuf>)> =
-        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &op)).collect());
+        pool.install(|| jobs.into_par_iter().with_max_len(1).map(|song| download::process(song, &run)).collect());
     replaygain::album_gains(&done.iter().filter_map(|(_, result)| result.as_ref().ok().cloned()).collect::<Vec<_>>());
     lyrics::report_unchecked();
     let saved: Vec<&Song> = done.iter().map(|(song, _)| song).collect();
-    let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == "sync" && errors.is_empty());
+    let sync_path = sync_file.as_deref().or(save_file).filter(|_| op == Op::Sync && errors.is_empty());
     if let Some(path) = sync_path {
         let file = json!({"type": "sync", "query": queries, "songs": saved});
         fs::write(path, serde_json::to_string_pretty(&file)?)?;
-    } else if let Some(path) = save_file.filter(|_| op == "save" || op == "download") {
+    } else if let Some(path) = save_file.filter(|_| matches!(op, Op::Save | Op::Download)) {
         let text = serde_json::to_string_pretty(&saved)?;
         if path == "-" {
             println!("{text}");
@@ -335,7 +338,7 @@ fn run() -> R<()> {
         }
     }
     let listed: Vec<_> = songs.iter().zip(index).map(|(song, slot)| (song, &done[slot].1)).collect();
-    write_m3u(&listed, &op)?;
+    write_m3u(&listed, op)?;
     report(&done, errors)
 }
 

@@ -49,10 +49,12 @@ fn damaged_audio_files_fail_or_work_but_never_panic() {
         let file = dir.join(format!("damaged.{}", ["opus", "mp3", "m4a", "flac", "ogg", "wav"][rng.below(6)]));
         fs::write(&file, damaged(rng, original)).unwrap();
         let s = song(rng);
-        let _ = (write_tags(&file, &s), write_lyrics(&file, s.lyrics.clone()), write_lyrics(&file, None));
-        if let Ok(audio) = audio(&file) {
-            let _ = audio.primary_tag().map(source_url);
+        let _ = write_tags(&file, &s, rng.below(2) == 0);
+        if let Ok(mut tags) = Tags::open(&file) {
+            let _ = (tags.set_lyrics(s.lyrics.clone()), tags.save(), tags.set_lyrics(None), tags.save());
+            let _ = (tags.length(), tags.tag().map(source_url));
         }
+        let _ = peek(&file).map(|audio| audio.primary_tag().map(source_url));
     });
     fs::remove_dir_all(&dir).unwrap();
 }
